@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -149,6 +150,34 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// AuthorizeWithPolicy performs all existing Authorize checks and additionally
+// evaluates a bucket policy (if provided) against the request context.
+// Deny in the policy always takes precedence.
+func (a *Auth) AuthorizeWithPolicy(token *meta.Token, action, bucketName, objectKey, clientIP string, policyJSON json.RawMessage) error {
+	// Run existing token-level authorization first.
+	if err := a.Authorize(token, action, bucketName, objectKey); err != nil {
+		return err
+	}
+
+	// If no policy is attached, token authorization alone is sufficient.
+	if len(policyJSON) == 0 {
+		return nil
+	}
+
+	var policy BucketPolicy
+	if err := json.Unmarshal(policyJSON, &policy); err != nil {
+		// Malformed policy should not silently grant access.
+		return ErrAccessDenied
+	}
+
+	_, denied := EvaluatePolicy(&policy, token.TokenID, action, objectKey, clientIP)
+	if denied {
+		return ErrAccessDenied
+	}
+
+	return nil
 }
 
 func hasMatchingPrefix(prefixes []string, key string) bool {
