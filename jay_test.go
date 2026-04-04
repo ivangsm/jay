@@ -2,15 +2,21 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"log/slog"
 
@@ -24,11 +30,14 @@ import (
 )
 
 type testEnv struct {
-	db         *meta.DB
-	store      *store.Store
-	s3Server   *httptest.Server
+	db          *meta.DB
+	store       *store.Store
+	s3Server    *httptest.Server
 	adminServer *httptest.Server
-	auth       string // Authorization header value
+	auth        string // Authorization header value
+	tokenID     string
+	secret      string
+	accountID   string
 }
 
 func setup(t *testing.T) *testEnv {
@@ -53,11 +62,11 @@ func setup(t *testing.T) *testEnv {
 
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
-	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "")
+	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "", nil)
 	s3Srv := httptest.NewServer(s3Handler)
 	t.Cleanup(s3Srv.Close)
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "")
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false)
 	adminSrv := httptest.NewServer(adminHandler)
 	t.Cleanup(adminSrv.Close)
 
@@ -71,6 +80,9 @@ func setup(t *testing.T) *testEnv {
 		s3Server:    s3Srv,
 		adminServer: adminSrv,
 		auth:        "Bearer " + tokenID + ":" + secret,
+		tokenID:     tokenID,
+		secret:      secret,
+		accountID:   account,
 	}
 }
 
@@ -321,8 +333,8 @@ func TestUnauthorized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 401 {
-		t.Fatalf("no auth: expected 401, got %d", resp.StatusCode)
+	if resp.StatusCode != 403 {
+		t.Fatalf("no auth: expected 403, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 
@@ -333,8 +345,8 @@ func TestUnauthorized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 401 {
-		t.Fatalf("bad auth: expected 401, got %d", resp.StatusCode)
+	if resp.StatusCode != 403 {
+		t.Fatalf("bad auth: expected 403, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -439,6 +451,720 @@ func TestChecksumOnWrite(t *testing.T) {
 		t.Fatal("checksum mismatch between put and head")
 	}
 	resp.Body.Close()
+}
+
+// setupWithSigning creates a test env with a signing secret configured.
+func setupWithSigning(t *testing.T) *testEnv {
+	t.Helper()
+	dir := t.TempDir()
+	log := slog.Default()
+
+	db, err := meta.Open(filepath.Join(dir, "meta", "jay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := recovery.Run(db, st, log); err != nil {
+		t.Fatal(err)
+	}
+
+	au := auth.New(db)
+	metrics := maintenance.NewMetrics()
+	signingSecret := "test-signing-secret"
+	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, signingSecret, nil)
+	s3Srv := httptest.NewServer(s3Handler)
+	t.Cleanup(s3Srv.Close)
+
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, signingSecret, s3Srv.Listener.Addr().String(), false)
+	adminSrv := httptest.NewServer(adminHandler)
+	t.Cleanup(adminSrv.Close)
+
+	account := createTestAccount(t, adminSrv.URL)
+	tokenID, secret := createTestToken(t, adminSrv.URL, account)
+
+	return &testEnv{
+		db:          db,
+		store:       st,
+		s3Server:    s3Srv,
+		adminServer: adminSrv,
+		auth:        "Bearer " + tokenID + ":" + secret,
+		tokenID:     tokenID,
+		secret:      secret,
+		accountID:   account,
+	}
+}
+
+// === Presigned URL Tests ===
+
+func computeTestSignature(signingSecret, tokenID, method, path, expires string) string {
+	mac := hmac.New(sha256.New, []byte(signingSecret))
+	mac.Write([]byte(tokenID + "\n" + method + "\n" + path + "\n" + expires))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func TestPresignedURLGet(t *testing.T) {
+	env := setupWithSigning(t)
+	signingSecret := "test-signing-secret"
+
+	// Create bucket and object
+	resp := env.s3Request(t, "PUT", "/presign-bucket", nil)
+	resp.Body.Close()
+	resp = env.s3Request(t, "PUT", "/presign-bucket/secret.txt", strings.NewReader("presigned content"))
+	resp.Body.Close()
+
+	// Generate presigned URL
+	expiresAt := time.Now().Add(5 * time.Minute).Unix()
+	expiresStr := strconv.FormatInt(expiresAt, 10)
+	path := "/presign-bucket/secret.txt"
+	sig := computeTestSignature(signingSecret, env.tokenID, "GET", path, expiresStr)
+
+	url := fmt.Sprintf("%s%s?X-Jay-Token=%s&X-Jay-Expires=%s&X-Jay-Signature=%s",
+		env.s3Server.URL, path, env.tokenID, expiresStr, sig)
+
+	// GET without auth header — presigned URL provides auth
+	req, _ := http.NewRequest("GET", url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("presigned GET: expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != "presigned content" {
+		t.Fatalf("presigned GET: got %q, want %q", got, "presigned content")
+	}
+}
+
+func TestPresignedURLExpired(t *testing.T) {
+	env := setupWithSigning(t)
+	signingSecret := "test-signing-secret"
+
+	resp := env.s3Request(t, "PUT", "/presign-bucket2", nil)
+	resp.Body.Close()
+	resp = env.s3Request(t, "PUT", "/presign-bucket2/file.txt", strings.NewReader("data"))
+	resp.Body.Close()
+
+	// Expired 1 minute ago
+	expiresAt := time.Now().Add(-1 * time.Minute).Unix()
+	expiresStr := strconv.FormatInt(expiresAt, 10)
+	path := "/presign-bucket2/file.txt"
+	sig := computeTestSignature(signingSecret, env.tokenID, "GET", path, expiresStr)
+
+	url := fmt.Sprintf("%s%s?X-Jay-Token=%s&X-Jay-Expires=%s&X-Jay-Signature=%s",
+		env.s3Server.URL, path, env.tokenID, expiresStr, sig)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp, _ = http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 403 {
+		t.Fatalf("expired presigned: expected 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestPresignedURLBadSignature(t *testing.T) {
+	env := setupWithSigning(t)
+
+	resp := env.s3Request(t, "PUT", "/presign-bucket3", nil)
+	resp.Body.Close()
+	resp = env.s3Request(t, "PUT", "/presign-bucket3/file.txt", strings.NewReader("data"))
+	resp.Body.Close()
+
+	expiresAt := time.Now().Add(5 * time.Minute).Unix()
+	expiresStr := strconv.FormatInt(expiresAt, 10)
+	path := "/presign-bucket3/file.txt"
+
+	url := fmt.Sprintf("%s%s?X-Jay-Token=%s&X-Jay-Expires=%s&X-Jay-Signature=%s",
+		env.s3Server.URL, path, env.tokenID, expiresStr, "badsignature")
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp, _ = http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 403 {
+		t.Fatalf("bad signature: expected 403, got %d", resp.StatusCode)
+	}
+}
+
+// === CopyObject Tests ===
+
+func TestCopyObject(t *testing.T) {
+	env := setup(t)
+
+	// Create source bucket and object
+	resp := env.s3Request(t, "PUT", "/src-bucket", nil)
+	resp.Body.Close()
+	resp = env.s3Request(t, "PUT", "/dst-bucket", nil)
+	resp.Body.Close()
+
+	content := "copy me!"
+	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/src-bucket/original.txt",
+		strings.NewReader(content))
+	req.Header.Set("Authorization", env.auth)
+	req.Header.Set("x-amz-meta-author", "test")
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	// Copy to different bucket
+	req, _ = http.NewRequest("PUT", env.s3Server.URL+"/dst-bucket/copied.txt", nil)
+	req.Header.Set("Authorization", env.auth)
+	req.Header.Set("x-amz-copy-source", "/src-bucket/original.txt")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("copy object: expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	// Verify copy result XML has xmlns
+	var copyResult jayapi.CopyObjectResult
+	if err := xml.Unmarshal(body, &copyResult); err != nil {
+		t.Fatalf("unmarshal copy result: %v", err)
+	}
+	if copyResult.ETag == "" {
+		t.Fatal("copy result missing ETag")
+	}
+
+	// Get copied object
+	resp = env.s3Request(t, "GET", "/dst-bucket/copied.txt", nil)
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != content {
+		t.Fatalf("copied content: got %q, want %q", got, content)
+	}
+
+	// Verify metadata preserved
+	resp = env.s3Request(t, "HEAD", "/dst-bucket/copied.txt", nil)
+	if resp.Header.Get("x-amz-meta-author") != "test" {
+		t.Fatalf("copy metadata not preserved: got %q", resp.Header.Get("x-amz-meta-author"))
+	}
+	resp.Body.Close()
+}
+
+func TestCopyObjectSameBucket(t *testing.T) {
+	env := setup(t)
+
+	resp := env.s3Request(t, "PUT", "/copybucket", nil)
+	resp.Body.Close()
+	resp = env.s3Request(t, "PUT", "/copybucket/a.txt", strings.NewReader("hello"))
+	resp.Body.Close()
+
+	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/copybucket/b.txt", nil)
+	req.Header.Set("Authorization", env.auth)
+	req.Header.Set("x-amz-copy-source", "/copybucket/a.txt")
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("copy same bucket: expected 200, got %d", resp.StatusCode)
+	}
+
+	resp = env.s3Request(t, "GET", "/copybucket/b.txt", nil)
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "hello" {
+		t.Fatalf("copy same bucket content: got %q", got)
+	}
+}
+
+func TestCopyObjectNonExistentSource(t *testing.T) {
+	env := setup(t)
+
+	resp := env.s3Request(t, "PUT", "/copybucket2", nil)
+	resp.Body.Close()
+
+	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/copybucket2/dest.txt", nil)
+	req.Header.Set("Authorization", env.auth)
+	req.Header.Set("x-amz-copy-source", "/copybucket2/nonexistent.txt")
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	if resp.StatusCode != 404 {
+		t.Fatalf("copy non-existent: expected 404, got %d", resp.StatusCode)
+	}
+}
+
+// === Range Request Tests ===
+
+func TestRangeRequests(t *testing.T) {
+	env := setup(t)
+
+	resp := env.s3Request(t, "PUT", "/rangebucket", nil)
+	resp.Body.Close()
+
+	// Upload a known content
+	content := "0123456789abcdefghij" // 20 bytes
+	resp = env.s3Request(t, "PUT", "/rangebucket/data.txt", strings.NewReader(content))
+	resp.Body.Close()
+
+	tests := []struct {
+		name       string
+		rangeHdr   string
+		wantStatus int
+		wantBody   string
+	}{
+		{"first 5 bytes", "bytes=0-4", 206, "01234"},
+		{"middle range", "bytes=5-9", 206, "56789"},
+		{"suffix range", "bytes=-5", 206, "fghij"},
+		{"open-ended", "bytes=15-", 206, "fghij"},
+		{"single byte", "bytes=0-0", 206, "0"},
+		{"entire file", "bytes=0-19", 206, content},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", env.s3Server.URL+"/rangebucket/data.txt", nil)
+			req.Header.Set("Authorization", env.auth)
+			req.Header.Set("Range", tt.rangeHdr)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status: got %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			got, _ := io.ReadAll(resp.Body)
+			if string(got) != tt.wantBody {
+				t.Fatalf("body: got %q, want %q", got, tt.wantBody)
+			}
+			if tt.wantStatus == 206 {
+				if resp.Header.Get("Content-Range") == "" {
+					t.Fatal("missing Content-Range header")
+				}
+			}
+		})
+	}
+}
+
+func TestRangeRequestInvalid(t *testing.T) {
+	env := setup(t)
+
+	resp := env.s3Request(t, "PUT", "/rangebucket2", nil)
+	resp.Body.Close()
+	resp = env.s3Request(t, "PUT", "/rangebucket2/small.txt", strings.NewReader("tiny"))
+	resp.Body.Close()
+
+	// Range beyond file size
+	req, _ := http.NewRequest("GET", env.s3Server.URL+"/rangebucket2/small.txt", nil)
+	req.Header.Set("Authorization", env.auth)
+	req.Header.Set("Range", "bytes=100-200")
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	if resp.StatusCode != 416 {
+		t.Fatalf("invalid range: expected 416, got %d", resp.StatusCode)
+	}
+}
+
+// === Multipart Upload Extended Tests ===
+
+func TestMultipartUploadComplete(t *testing.T) {
+	env := setup(t)
+
+	resp := env.s3Request(t, "PUT", "/mpbucket", nil)
+	resp.Body.Close()
+
+	// Create multipart upload
+	resp = env.s3Request(t, "POST", "/mpbucket/bigfile.bin?uploads", nil)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var initResult jayapi.InitiateMultipartUploadResult
+	xml.Unmarshal(body, &initResult)
+	uploadID := initResult.UploadId
+	if uploadID == "" {
+		t.Fatal("missing upload ID")
+	}
+
+	// Upload two parts
+	part1 := strings.Repeat("A", 1024)
+	part2 := strings.Repeat("B", 1024)
+
+	resp = env.s3Request(t, "PUT",
+		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader(part1))
+	etag1 := resp.Header.Get("ETag")
+	resp.Body.Close()
+
+	resp = env.s3Request(t, "PUT",
+		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s&partNumber=2", uploadID),
+		strings.NewReader(part2))
+	etag2 := resp.Header.Get("ETag")
+	resp.Body.Close()
+
+	// List parts
+	resp = env.s3Request(t, "GET",
+		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s", uploadID), nil)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var listParts jayapi.ListPartsResult
+	xml.Unmarshal(body, &listParts)
+	if len(listParts.Parts) != 2 {
+		t.Fatalf("list parts: got %d, want 2", len(listParts.Parts))
+	}
+
+	// Complete
+	completeXML := fmt.Sprintf(`<CompleteMultipartUpload>
+		<Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part>
+		<Part><PartNumber>2</PartNumber><ETag>%s</ETag></Part>
+	</CompleteMultipartUpload>`, etag1, etag2)
+
+	resp = env.s3Request(t, "POST",
+		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s", uploadID),
+		strings.NewReader(completeXML))
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("complete: expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	// Verify assembled object
+	resp = env.s3Request(t, "GET", "/mpbucket/bigfile.bin", nil)
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	expected := part1 + part2
+	if string(got) != expected {
+		t.Fatalf("assembled object: got %d bytes, want %d", len(got), len(expected))
+	}
+}
+
+func TestMultipartUploadAbort(t *testing.T) {
+	env := setup(t)
+
+	resp := env.s3Request(t, "PUT", "/mpabortbucket", nil)
+	resp.Body.Close()
+
+	// Create multipart upload
+	resp = env.s3Request(t, "POST", "/mpabortbucket/file.bin?uploads", nil)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var initResult jayapi.InitiateMultipartUploadResult
+	xml.Unmarshal(body, &initResult)
+	uploadID := initResult.UploadId
+
+	// Upload a part
+	resp = env.s3Request(t, "PUT",
+		fmt.Sprintf("/mpabortbucket/file.bin?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader("partial data"))
+	resp.Body.Close()
+
+	// Abort
+	resp = env.s3Request(t, "DELETE",
+		fmt.Sprintf("/mpabortbucket/file.bin?uploadId=%s", uploadID), nil)
+	if resp.StatusCode != 204 {
+		t.Fatalf("abort: expected 204, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Object should not exist
+	resp = env.s3Request(t, "GET", "/mpabortbucket/file.bin", nil)
+	if resp.StatusCode != 404 {
+		t.Fatalf("after abort: expected 404, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// === Bucket Policy Tests ===
+
+func TestBucketPolicyDenyOverridesAllow(t *testing.T) {
+	policy := &auth.BucketPolicy{
+		Version: "2024-01-01",
+		Statements: []auth.PolicyStatement{
+			{Effect: "allow", Actions: []string{"*"}, Subjects: []string{"*"}},
+			{Effect: "deny", Actions: []string{"object:put"}, Subjects: []string{"*"}, Prefixes: []string{"readonly/"}},
+		},
+	}
+
+	allowed, denied := auth.EvaluatePolicy(policy, "any-token", "object:put", "readonly/file.txt", "127.0.0.1")
+	if allowed {
+		t.Fatal("expected not allowed (deny should override)")
+	}
+	if !denied {
+		t.Fatal("expected denied")
+	}
+}
+
+func TestBucketPolicyPrefixMatch(t *testing.T) {
+	policy := &auth.BucketPolicy{
+		Version: "2024-01-01",
+		Statements: []auth.PolicyStatement{
+			{Effect: "allow", Actions: []string{"object:get"}, Subjects: []string{"*"}, Prefixes: []string{"public/"}},
+		},
+	}
+
+	allowed, _ := auth.EvaluatePolicy(policy, "any", "object:get", "public/file.txt", "")
+	if !allowed {
+		t.Fatal("expected allowed for matching prefix")
+	}
+
+	allowed, _ = auth.EvaluatePolicy(policy, "any", "object:get", "private/file.txt", "")
+	if allowed {
+		t.Fatal("expected not allowed for non-matching prefix")
+	}
+}
+
+func TestBucketPolicyIPCondition(t *testing.T) {
+	policy := &auth.BucketPolicy{
+		Version: "2024-01-01",
+		Statements: []auth.PolicyStatement{
+			{
+				Effect:   "allow",
+				Actions:  []string{"*"},
+				Subjects: []string{"*"},
+				Conditions: &auth.PolicyConditions{
+					IPWhitelist: []string{"10.0.0.0/8"},
+				},
+			},
+		},
+	}
+
+	allowed, _ := auth.EvaluatePolicy(policy, "any", "object:get", "file.txt", "10.1.2.3")
+	if !allowed {
+		t.Fatal("expected allowed from whitelisted IP")
+	}
+
+	allowed, _ = auth.EvaluatePolicy(policy, "any", "object:get", "file.txt", "192.168.1.1")
+	if allowed {
+		t.Fatal("expected not allowed from non-whitelisted IP")
+	}
+}
+
+func TestBucketPolicyWildcardSubjects(t *testing.T) {
+	policy := &auth.BucketPolicy{
+		Version: "2024-01-01",
+		Statements: []auth.PolicyStatement{
+			{Effect: "allow", Actions: []string{"object:get"}, Subjects: []string{"*"}},
+		},
+	}
+
+	allowed, _ := auth.EvaluatePolicy(policy, "random-token-id", "object:get", "any/key", "")
+	if !allowed {
+		t.Fatal("expected allowed for wildcard subject")
+	}
+}
+
+func TestBucketPolicySpecificSubject(t *testing.T) {
+	policy := &auth.BucketPolicy{
+		Version: "2024-01-01",
+		Statements: []auth.PolicyStatement{
+			{Effect: "allow", Actions: []string{"object:get"}, Subjects: []string{"token-abc"}},
+		},
+	}
+
+	allowed, _ := auth.EvaluatePolicy(policy, "token-abc", "object:get", "file.txt", "")
+	if !allowed {
+		t.Fatal("expected allowed for matching subject")
+	}
+
+	allowed, _ = auth.EvaluatePolicy(policy, "token-xyz", "object:get", "file.txt", "")
+	if allowed {
+		t.Fatal("expected not allowed for non-matching subject")
+	}
+}
+
+func TestBucketPolicyNilPolicy(t *testing.T) {
+	allowed, denied := auth.EvaluatePolicy(nil, "any", "object:get", "file.txt", "")
+	if allowed || denied {
+		t.Fatal("nil policy should return false, false")
+	}
+}
+
+// === Quarantine Tests ===
+
+func TestQuarantineListAndPurge(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.Default()
+
+	db, err := meta.Open(filepath.Join(dir, "meta", "jay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := recovery.Run(db, st, log); err != nil {
+		t.Fatal(err)
+	}
+
+	au := auth.New(db)
+	metrics := maintenance.NewMetrics()
+	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "", nil)
+	s3Srv := httptest.NewServer(s3Handler)
+	defer s3Srv.Close()
+
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false)
+	adminSrv := httptest.NewServer(adminHandler)
+	defer adminSrv.Close()
+
+	account := createTestAccount(t, adminSrv.URL)
+	tokenID, secret := createTestToken(t, adminSrv.URL, account)
+	authHdr := "Bearer " + tokenID + ":" + secret
+
+	// Create bucket and object
+	req, _ := http.NewRequest("PUT", s3Srv.URL+"/qbucket", nil)
+	req.Header.Set("Authorization", authHdr)
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	req, _ = http.NewRequest("PUT", s3Srv.URL+"/qbucket/file.txt", strings.NewReader("quarantine test"))
+	req.Header.Set("Authorization", authHdr)
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	// Get bucket ID
+	bucket, _ := db.GetBucket("qbucket")
+
+	// Quarantine the object
+	db.QuarantineObject(bucket.ID, "file.txt")
+
+	// List quarantined via QuarantineManager
+	qm := maintenance.NewQuarantineManager(db, st, log)
+	quarantined, err := qm.ListQuarantined()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quarantined) != 1 {
+		t.Fatalf("expected 1 quarantined, got %d", len(quarantined))
+	}
+	if quarantined[0].Key != "file.txt" {
+		t.Fatalf("quarantined key: got %q", quarantined[0].Key)
+	}
+
+	// Inspect — file should exist with matching checksum
+	inspection, err := qm.Inspect(bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.FileExists {
+		t.Fatal("quarantined file should exist")
+	}
+	if !inspection.ChecksumMatch {
+		t.Fatal("checksum should match (file is not actually corrupted)")
+	}
+
+	// Revalidate — should restore since checksum matches
+	restored, err := qm.Revalidate(bucket.ID, "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored {
+		t.Fatal("expected object to be restored")
+	}
+
+	// Should be accessible again
+	req, _ = http.NewRequest("GET", s3Srv.URL+"/qbucket/file.txt", nil)
+	req.Header.Set("Authorization", authHdr)
+	resp, _ = http.DefaultClient.Do(req)
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "quarantine test" {
+		t.Fatalf("after revalidation: got %q", got)
+	}
+
+	// Quarantine again and purge
+	db.QuarantineObject(bucket.ID, "file.txt")
+	purged, err := qm.PurgeAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if purged != 1 {
+		t.Fatalf("expected 1 purged, got %d", purged)
+	}
+
+	// Should be gone
+	quarantined, _ = qm.ListQuarantined()
+	if len(quarantined) != 0 {
+		t.Fatalf("expected 0 quarantined after purge, got %d", len(quarantined))
+	}
+}
+
+// === Rate Limiting Tests ===
+
+func TestRateLimiting(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.Default()
+
+	db, err := meta.Open(filepath.Join(dir, "meta", "jay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := recovery.Run(db, st, log); err != nil {
+		t.Fatal(err)
+	}
+
+	au := auth.New(db)
+	metrics := maintenance.NewMetrics()
+
+	// Very low rate limit: 2 req/sec, burst 3
+	rlCfg := &jayapi.RateLimiterConfig{Rate: 2, Burst: 3}
+	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "", rlCfg)
+	s3Srv := httptest.NewServer(s3Handler)
+	defer s3Srv.Close()
+
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false)
+	adminSrv := httptest.NewServer(adminHandler)
+	defer adminSrv.Close()
+
+	account := createTestAccount(t, adminSrv.URL)
+	tokenID, secret := createTestToken(t, adminSrv.URL, account)
+	authHdr := "Bearer " + tokenID + ":" + secret
+
+	// Create bucket
+	req, _ := http.NewRequest("PUT", s3Srv.URL+"/rl-bucket", nil)
+	req.Header.Set("Authorization", authHdr)
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	// Exhaust burst (3 requests should pass, then fail)
+	var got429 bool
+	for i := 0; i < 10; i++ {
+		req, _ := http.NewRequest("HEAD", s3Srv.URL+"/rl-bucket", nil)
+		req.Header.Set("Authorization", authHdr)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 429 {
+			got429 = true
+			if resp.Header.Get("Retry-After") == "" {
+				t.Fatal("429 response missing Retry-After header")
+			}
+			break
+		}
+	}
+	if !got429 {
+		t.Fatal("expected 429 after exceeding rate limit")
+	}
 }
 
 // helpers
