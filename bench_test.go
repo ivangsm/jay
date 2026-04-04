@@ -227,7 +227,8 @@ func BenchmarkS3PutObject(b *testing.B) {
 		b.Run(sz.name, func(b *testing.B) {
 			b.SetBytes(sz.size)
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			i := 0
+			for b.Loop() {
 				key := fmt.Sprintf("/benchbucket/obj-put-%d", i)
 				req, _ := http.NewRequest("PUT", env.s3Server.URL+key, bytes.NewReader(data))
 				req.Header.Set("Authorization", env.auth)
@@ -239,6 +240,7 @@ func BenchmarkS3PutObject(b *testing.B) {
 				if resp.StatusCode != 200 {
 					b.Fatalf("put: status %d", resp.StatusCode)
 				}
+				i++
 			}
 		})
 	}
@@ -262,7 +264,7 @@ func BenchmarkS3GetObject(b *testing.B) {
 		b.Run(sz.name, func(b *testing.B) {
 			b.SetBytes(sz.size)
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				req, _ := http.NewRequest("GET", env.s3Server.URL+key, nil)
 				req.Header.Set("Authorization", env.auth)
 				resp, err := http.DefaultClient.Do(req)
@@ -283,7 +285,7 @@ func BenchmarkS3ListObjects(b *testing.B) {
 	env := setupS3Bench(b)
 
 	// Seed 50 objects for listing
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		key := fmt.Sprintf("/benchbucket/list-obj-%03d", i)
 		req, _ := http.NewRequest("PUT", env.s3Server.URL+key, strings.NewReader("x"))
 		req.Header.Set("Authorization", env.auth)
@@ -295,7 +297,7 @@ func BenchmarkS3ListObjects(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		req, _ := http.NewRequest("GET", env.s3Server.URL+"/benchbucket?list-type=2", nil)
 		req.Header.Set("Authorization", env.auth)
 		resp, err := http.DefaultClient.Do(req)
@@ -320,13 +322,15 @@ func BenchmarkNativePutObject(b *testing.B) {
 		b.Run(sz.name, func(b *testing.B) {
 			b.SetBytes(sz.size)
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			i := 0
+			for b.Loop() {
 				key := fmt.Sprintf("obj-put-%d", i)
 				_, err := env.client.PutObject("benchbucket", key,
 					bytes.NewReader(data), sz.size, nil)
 				if err != nil {
 					b.Fatal(err)
 				}
+				i++
 			}
 		})
 	}
@@ -348,7 +352,7 @@ func BenchmarkNativeGetObject(b *testing.B) {
 		b.Run(sz.name, func(b *testing.B) {
 			b.SetBytes(sz.size)
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				result, err := env.client.GetObject("benchbucket", key)
 				if err != nil {
 					b.Fatal(err)
@@ -364,7 +368,7 @@ func BenchmarkNativeListObjects(b *testing.B) {
 	env := setupNativeBench(b)
 
 	// Seed 50 objects for listing
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		key := fmt.Sprintf("list-obj-%03d", i)
 		_, err := env.client.PutObject("benchbucket", key,
 			strings.NewReader("x"), 1, nil)
@@ -374,7 +378,7 @@ func BenchmarkNativeListObjects(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := env.client.ListObjects("benchbucket", nil)
 		if err != nil {
 			b.Fatal(err)
