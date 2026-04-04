@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -13,30 +14,50 @@ import (
 
 // Handler is the S3-compatible HTTP handler.
 type Handler struct {
-	db           *meta.DB
-	store        *store.Store
-	auth         *auth.Auth
-	log          *slog.Logger
-	readChecker  *maintenance.ReadChecker
-	metrics      *maintenance.Metrics
+	db            *meta.DB
+	store         *store.Store
+	auth          *auth.Auth
+	log           *slog.Logger
+	readChecker   *maintenance.ReadChecker
+	metrics       *maintenance.Metrics
+	signingSecret string
 }
 
 // NewHandler creates a new S3 API handler.
-func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics) *Handler {
+func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, signingSecret string) *Handler {
 	return &Handler{
-		db:          db,
-		store:       st,
-		auth:        au,
-		log:         log,
-		readChecker: maintenance.NewReadChecker(0.05),
-		metrics:     metrics,
+		db:            db,
+		store:         st,
+		auth:          au,
+		log:           log,
+		readChecker:   maintenance.NewReadChecker(0.05),
+		metrics:       metrics,
+		signingSecret: signingSecret,
 	}
 }
 
 // ServeHTTP dispatches S3 requests based on path and method.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	handler := h.withRequestID(h.withLogging(h.withAuth(h.dispatch)))
+	handler := h.withRequestID(h.withLogging(h.withPresigned(h.withAuth(h.dispatch))))
 	handler(w, r)
+}
+
+// withPresigned checks for presigned URL query params before falling through
+// to the normal auth middleware.
+func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.signingSecret != "" && r.URL.Query().Get("X-Jay-Token") != "" {
+			token, err := validatePresignedRequest(r, h.signingSecret, h.db)
+			if err != nil {
+				writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Invalid presigned URL: "+err.Error(), r.URL.Path)
+				return
+			}
+			ctx := context.WithValue(r.Context(), ctxKeyToken, token)
+			h.dispatch(w, r.WithContext(ctx))
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
