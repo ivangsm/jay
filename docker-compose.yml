@@ -1,0 +1,28 @@
+services:
+  jay:
+    build: .
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+      - "4444:4444"
+    volumes:
+      - jay-data:/data
+    environment:
+      JAY_DATA_DIR: /data
+      JAY_LISTEN_ADDR: ":9000"
+      JAY_ADMIN_ADDR: ":9001"
+      JAY_NATIVE_ADDR: ":4444"
+      JAY_ADMIN_TOKEN: "${JAY_ADMIN_TOKEN}"
+      JAY_SIGNING_SECRET: "${JAY_SIGNING_SECRET}"
+      JAY_LOG_LEVEL: info
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9001/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  jay-data:

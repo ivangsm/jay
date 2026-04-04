@@ -59,11 +59,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Health checker (not ready until recovery completes)
+	hc := NewHealthChecker(db)
+
 	// Run startup recovery
 	if err := recovery.Run(db, st, log); err != nil {
 		log.Error("recovery failed", "err", err)
 		os.Exit(1)
 	}
+	hc.SetReady(true)
 
 	// Build shared components
 	au := auth.New(db)
@@ -96,16 +100,17 @@ func main() {
 	}()
 
 	// S3 API handler
-	s3Handler := api.NewHandler(db, st, au, log, metrics)
+	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret)
 
 	// Admin API handler (on separate port)
 	adminMux := http.NewServeMux()
-	adminHandler := admin.NewHandler(db, cfg.AdminToken, log, metrics)
+	adminHandler := admin.NewHandler(db, cfg.AdminToken, log, metrics, st, cfg.SigningSecret, cfg.ListenAddr)
 	adminMux.Handle("/_jay/", adminHandler)
-	adminMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
-	})
+
+	// Health checks
+	adminMux.HandleFunc("/health", hc.ReadinessHandler)
+	adminMux.HandleFunc("/health/live", hc.LivenessHandler)
+	adminMux.HandleFunc("/health/ready", hc.ReadinessHandler)
 
 	// Start servers
 	shutdownS3 := startServer(cfg.ListenAddr, s3Handler, log, "s3")

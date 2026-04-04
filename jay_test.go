@@ -53,11 +53,11 @@ func setup(t *testing.T) *testEnv {
 
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
-	s3Handler := jayapi.NewHandler(db, st, au, log, metrics)
+	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "")
 	s3Srv := httptest.NewServer(s3Handler)
 	t.Cleanup(s3Srv.Close)
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics)
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "")
 	adminSrv := httptest.NewServer(adminHandler)
 	t.Cleanup(adminSrv.Close)
 

@@ -19,4 +19,7 @@ ENV JAY_ADMIN_ADDR=:9001
 
 EXPOSE 9000 9001 4444
 
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 --start-period=10s \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:9001/health/ready || exit 1
+
 ENTRYPOINT ["jay"]
