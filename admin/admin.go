@@ -4,27 +4,34 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
+	"github.com/ivangsm/jay/store"
+	"io"
 )
 
 // Handler serves the admin API for managing accounts and tokens.
 type Handler struct {
-	db         *meta.DB
-	adminToken string
-	log        *slog.Logger
-	metrics    *maintenance.Metrics
+	db            *meta.DB
+	store         *store.Store
+	adminToken    string
+	log           *slog.Logger
+	metrics       *maintenance.Metrics
+	signingSecret string
+	listenAddr    string
 }
 
 // NewHandler creates a new admin API handler.
-func NewHandler(db *meta.DB, adminToken string, log *slog.Logger, metrics *maintenance.Metrics) *Handler {
-	return &Handler{db: db, adminToken: adminToken, log: log, metrics: metrics}
+func NewHandler(db *meta.DB, adminToken string, log *slog.Logger, metrics *maintenance.Metrics, st *store.Store, signingSecret, listenAddr string) *Handler {
+	return &Handler{db: db, store: st, adminToken: adminToken, log: log, metrics: metrics, signingSecret: signingSecret, listenAddr: listenAddr}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +55,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleRevokeToken(w, r, tokenID)
 	case path == "/metrics" && r.Method == http.MethodGet:
 		h.handleMetrics(w, r)
+	case path == "/presign" && r.Method == http.MethodPost:
+		h.handlePresign(w, r)
+	case path == "/quarantine" && r.Method == http.MethodGet:
+		h.handleListQuarantined(w, r)
+	case path == "/quarantine/revalidate" && r.Method == http.MethodPost:
+		h.handleRevalidate(w, r)
+	case path == "/quarantine" && r.Method == http.MethodDelete:
+		h.handlePurge(w, r)
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}
@@ -197,4 +212,132 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(h.metrics.Snapshot())
+}
+
+type presignRequest struct {
+	TokenID        string `json:"token_id"`
+	Method         string `json:"method"`
+	Bucket         string `json:"bucket"`
+	Key            string `json:"key"`
+	ExpiresSeconds int    `json:"expires_seconds"`
+}
+
+type presignResponse struct {
+	URL string `json:"url"`
+}
+
+func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
+	if h.signingSecret == "" {
+		http.Error(w, `{"error":"signing secret not configured"}`, http.StatusBadRequest)
+		return
+	}
+
+	var req presignRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.TokenID == "" || req.Bucket == "" || req.Method == "" {
+		http.Error(w, `{"error":"token_id, method, and bucket are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.ExpiresSeconds <= 0 {
+		req.ExpiresSeconds = 3600
+	}
+
+	// Verify token exists
+	if _, err := h.db.GetToken(req.TokenID); err != nil {
+		http.Error(w, `{"error":"token not found"}`, http.StatusBadRequest)
+		return
+	}
+
+	path := "/" + req.Bucket
+	if req.Key != "" {
+		path += "/" + req.Key
+	}
+
+	presignedURL, err := generateAdminPresignedURL(h.signingSecret, h.listenAddr, req.TokenID, req.Method, path, time.Duration(req.ExpiresSeconds)*time.Second)
+	if err != nil {
+		h.log.Error("generate presigned URL", "err", err)
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(presignResponse{URL: presignedURL})
+}
+
+// Quarantine handlers
+
+func (h *Handler) handleListQuarantined(w http.ResponseWriter, _ *http.Request) {
+	qm := maintenance.NewQuarantineManager(h.db, h.store, h.log)
+	objects, err := qm.ListQuarantined()
+	if err != nil {
+		h.log.Error("list quarantined", "err", err)
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(objects)
+}
+
+type quarantineRequest struct {
+	BucketID string `json:"bucket_id"`
+	Key      string `json:"key"`
+}
+
+func (h *Handler) handleRevalidate(w http.ResponseWriter, r *http.Request) {
+	var req quarantineRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	qm := maintenance.NewQuarantineManager(h.db, h.store, h.log)
+	restored, err := qm.Revalidate(req.BucketID, req.Key)
+	if err != nil {
+		h.log.Error("revalidate", "err", err)
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"restored": restored})
+}
+
+func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
+	qm := maintenance.NewQuarantineManager(h.db, h.store, h.log)
+
+	body, _ := io.ReadAll(r.Body)
+	if len(body) == 0 || string(body) == "{}" {
+		count, err := qm.PurgeAll()
+		if err != nil {
+			h.log.Error("purge all", "err", err)
+			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"purged": count})
+		return
+	}
+
+	var req quarantineRequest
+	if err := json.Unmarshal(body, &req); err != nil || req.BucketID == "" || req.Key == "" {
+		count, err := qm.PurgeAll()
+		if err != nil {
+			h.log.Error("purge all", "err", err)
+			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"purged": count})
+		return
+	}
+
+	if err := qm.Purge(req.BucketID, req.Key); err != nil {
+		h.log.Error("purge", "err", err)
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

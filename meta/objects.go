@@ -232,6 +232,104 @@ func (db *DB) ForEachObject(bucketID string, fn func(Object) error) error {
 	})
 }
 
+// GetObjectMetaAny retrieves object metadata regardless of state.
+func (db *DB) GetObjectMetaAny(bucketID, key string) (*Object, error) {
+	var obj Object
+	err := db.bolt.View(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return ErrBucketNotFound
+		}
+		data := bk.Get([]byte(key))
+		if data == nil {
+			return ErrObjectNotFound
+		}
+		return json.Unmarshal(data, &obj)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &obj, nil
+}
+
+// RestoreObject sets a quarantined object's state back to "active".
+func (db *DB) RestoreObject(bucketID, key string) error {
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return ErrBucketNotFound
+		}
+		data := bk.Get([]byte(key))
+		if data == nil {
+			return ErrObjectNotFound
+		}
+		var obj Object
+		if err := json.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		obj.State = "active"
+		obj.UpdatedAt = time.Now().UTC()
+		updated, err := json.Marshal(&obj)
+		if err != nil {
+			return err
+		}
+		return bk.Put([]byte(key), updated)
+	})
+}
+
+// DeleteObjectMetaAny removes object metadata regardless of state.
+func (db *DB) DeleteObjectMetaAny(bucketID, key string) error {
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return ErrBucketNotFound
+		}
+		data := bk.Get([]byte(key))
+		if data == nil {
+			return ErrObjectNotFound
+		}
+		return bk.Delete([]byte(key))
+	})
+}
+
+// ForEachObjectFrom iterates objects starting from startKey (exclusive), up to limit.
+// Returns the key of the last object visited (for resumption) and any error.
+func (db *DB) ForEachObjectFrom(bucketID, startKey string, limit int, fn func(Object) error) (lastKey string, err error) {
+	err = db.bolt.View(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return nil
+		}
+
+		c := bk.Cursor()
+		var k, v []byte
+		if startKey == "" {
+			k, v = c.First()
+		} else {
+			k, v = c.Seek([]byte(startKey))
+			// Skip the exact match so iteration is exclusive of startKey.
+			if k != nil && string(k) == startKey {
+				k, v = c.Next()
+			}
+		}
+
+		count := 0
+		for ; k != nil && count < limit; k, v = c.Next() {
+			var obj Object
+			if err := json.Unmarshal(v, &obj); err != nil {
+				continue // skip corrupt entries
+			}
+			lastKey = string(k)
+			if err := fn(obj); err != nil {
+				return err
+			}
+			count++
+		}
+		return nil
+	})
+	return lastKey, err
+}
+
 func indexOf(s, sep string) int {
 	for i := 0; i <= len(s)-len(sep); i++ {
 		if s[i:i+len(sep)] == sep {
