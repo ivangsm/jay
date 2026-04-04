@@ -24,7 +24,7 @@ func computeSignature(signingSecret, tokenID, method, path, expires string) stri
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func generatePresignedURL(signingSecret, host, tokenID, method, path string, expires time.Duration) (string, error) {
+func generatePresignedURL(signingSecret, scheme, host, tokenID, method, path string, expires time.Duration) (string, error) {
 	if signingSecret == "" {
 		return "", fmt.Errorf("signing secret not configured")
 	}
@@ -41,7 +41,7 @@ func generatePresignedURL(signingSecret, host, tokenID, method, path string, exp
 	sig := computeSignature(signingSecret, tokenID, method, path, expiresStr)
 
 	u := url.URL{
-		Scheme: "http",
+		Scheme: scheme,
 		Host:   host,
 		Path:   path,
 	}

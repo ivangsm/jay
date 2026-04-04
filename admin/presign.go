@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func generateAdminPresignedURL(signingSecret, host, tokenID, method, path string, expires time.Duration) (string, error) {
+func generateAdminPresignedURL(signingSecret, host, tokenID, method, path string, expires time.Duration, tlsEnabled bool) (string, error) {
 	if signingSecret == "" {
 		return "", fmt.Errorf("signing secret not configured")
 	}
@@ -28,8 +28,12 @@ func generateAdminPresignedURL(signingSecret, host, tokenID, method, path string
 	mac.Write([]byte(tokenID + "\n" + method + "\n" + path + "\n" + expiresStr))
 	sig := hex.EncodeToString(mac.Sum(nil))
 
+	scheme := "http"
+	if tlsEnabled {
+		scheme = "https"
+	}
 	u := url.URL{
-		Scheme: "http",
+		Scheme: scheme,
 		Host:   host,
 		Path:   path,
 	}

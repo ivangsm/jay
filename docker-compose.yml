@@ -15,6 +15,10 @@ services:
       JAY_ADMIN_TOKEN: "${JAY_ADMIN_TOKEN}"
       JAY_SIGNING_SECRET: "${JAY_SIGNING_SECRET}"
       JAY_LOG_LEVEL: info
+      # JAY_TLS_CERT: /data/certs/server.crt
+      # JAY_TLS_KEY: /data/certs/server.key
+      # JAY_RATE_LIMIT: "100"
+      # JAY_RATE_BURST: "200"
     restart: unless-stopped
     stop_grace_period: 30s
     healthcheck:

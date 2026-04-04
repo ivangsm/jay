@@ -21,10 +21,15 @@ type Handler struct {
 	readChecker   *maintenance.ReadChecker
 	metrics       *maintenance.Metrics
 	signingSecret string
+	rateLimiter   *rateLimiter
 }
 
 // NewHandler creates a new S3 API handler.
-func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, signingSecret string) *Handler {
+func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, signingSecret string, rlCfg *RateLimiterConfig) *Handler {
+	var rl *rateLimiter
+	if rlCfg != nil && rlCfg.Rate > 0 {
+		rl = newRateLimiter(*rlCfg)
+	}
 	return &Handler{
 		db:            db,
 		store:         st,
@@ -33,12 +38,13 @@ func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, m
 		readChecker:   maintenance.NewReadChecker(0.05),
 		metrics:       metrics,
 		signingSecret: signingSecret,
+		rateLimiter:   rl,
 	}
 }
 
 // ServeHTTP dispatches S3 requests based on path and method.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	handler := h.withRequestID(h.withLogging(h.withPresigned(h.withAuth(h.dispatch))))
+	handler := h.withRequestID(h.withLogging(h.withPresigned(h.withAuth(h.withRateLimit(h.dispatch)))))
 	handler(w, r)
 }
 

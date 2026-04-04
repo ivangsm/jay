@@ -100,11 +100,16 @@ func main() {
 	}()
 
 	// S3 API handler
-	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret)
+	var rlCfg *api.RateLimiterConfig
+	if cfg.RateLimit > 0 {
+		rlCfg = &api.RateLimiterConfig{Rate: cfg.RateLimit, Burst: cfg.RateBurst}
+	}
+	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret, rlCfg)
 
 	// Admin API handler (on separate port)
 	adminMux := http.NewServeMux()
-	adminHandler := admin.NewHandler(db, cfg.AdminToken, log, metrics, st, cfg.SigningSecret, cfg.ListenAddr)
+	tlsEnabled := cfg.TLSCert != "" && cfg.TLSKey != ""
+	adminHandler := admin.NewHandler(db, cfg.AdminToken, log, metrics, st, cfg.SigningSecret, cfg.ListenAddr, tlsEnabled)
 	adminMux.Handle("/_jay/", adminHandler)
 
 	// Health checks
@@ -113,8 +118,8 @@ func main() {
 	adminMux.HandleFunc("/health/ready", hc.ReadinessHandler)
 
 	// Start servers
-	shutdownS3 := startServer(cfg.ListenAddr, s3Handler, log, "s3")
-	shutdownAdmin := startServer(cfg.AdminAddr, adminMux, log, "admin")
+	shutdownS3 := startServer(cfg.ListenAddr, s3Handler, log, "s3", cfg.TLSCert, cfg.TLSKey)
+	shutdownAdmin := startServer(cfg.AdminAddr, adminMux, log, "admin", cfg.TLSCert, cfg.TLSKey)
 
 	// Start native TCP server
 	var shutdownNative func() error

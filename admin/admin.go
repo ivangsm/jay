@@ -27,11 +27,12 @@ type Handler struct {
 	metrics       *maintenance.Metrics
 	signingSecret string
 	listenAddr    string
+	tlsEnabled    bool
 }
 
 // NewHandler creates a new admin API handler.
-func NewHandler(db *meta.DB, adminToken string, log *slog.Logger, metrics *maintenance.Metrics, st *store.Store, signingSecret, listenAddr string) *Handler {
-	return &Handler{db: db, store: st, adminToken: adminToken, log: log, metrics: metrics, signingSecret: signingSecret, listenAddr: listenAddr}
+func NewHandler(db *meta.DB, adminToken string, log *slog.Logger, metrics *maintenance.Metrics, st *store.Store, signingSecret, listenAddr string, tlsEnabled bool) *Handler {
+	return &Handler{db: db, store: st, adminToken: adminToken, log: log, metrics: metrics, signingSecret: signingSecret, listenAddr: listenAddr, tlsEnabled: tlsEnabled}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -258,7 +259,7 @@ func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
 		path += "/" + req.Key
 	}
 
-	presignedURL, err := generateAdminPresignedURL(h.signingSecret, h.listenAddr, req.TokenID, req.Method, path, time.Duration(req.ExpiresSeconds)*time.Second)
+	presignedURL, err := generateAdminPresignedURL(h.signingSecret, h.listenAddr, req.TokenID, req.Method, path, time.Duration(req.ExpiresSeconds)*time.Second, h.tlsEnabled)
 	if err != nil {
 		h.log.Error("generate presigned URL", "err", err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
