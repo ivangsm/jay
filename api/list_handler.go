@@ -53,14 +53,15 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	xmlResult := ListBucketResult{
-		XMLNS:       s3Namespace,
-		Name:        bucketName,
-		Prefix:      prefix,
-		Delimiter:   delimiter,
-		MaxKeys:     maxKeys,
-		IsTruncated: result.IsTruncated,
-		KeyCount:    len(result.Objects) + len(result.CommonPrefixes),
-		StartAfter:  q.Get("start-after"),
+		XMLNS:        s3Namespace,
+		Name:         bucketName,
+		Prefix:       prefix,
+		Delimiter:    delimiter,
+		MaxKeys:      maxKeys,
+		IsTruncated:  result.IsTruncated,
+		KeyCount:     len(result.Objects) + len(result.CommonPrefixes),
+		EncodingType: q.Get("encoding-type"),
+		StartAfter:   q.Get("start-after"),
 		ContinuationToken: contToken,
 	}
 

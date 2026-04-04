@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"regexp"
 
@@ -13,6 +14,9 @@ var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$`)
 
 // handleCreateBucket handles PUT /<bucket>
 func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, bucketName string) {
+	// Drain request body — AWS CLI sends LocationConstraint XML
+	io.Copy(io.Discard, r.Body)
+
 	token, ok := h.requireAuth(r, w, meta.ActionBucketWriteMeta, bucketName, "")
 	if !ok {
 		return

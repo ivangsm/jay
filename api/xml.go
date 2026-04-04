@@ -66,6 +66,7 @@ type ListBucketResult struct {
 	Contents       []S3Content    `xml:"Contents"`
 	CommonPrefixes []S3CommonPrefix `xml:"CommonPrefixes,omitempty"`
 	KeyCount       int            `xml:"KeyCount"`
+	EncodingType   string         `xml:"EncodingType,omitempty"`
 	StartAfter     string         `xml:"StartAfter,omitempty"`
 	ContinuationToken string     `xml:"ContinuationToken,omitempty"`
 	NextContinuationToken string `xml:"NextContinuationToken,omitempty"`
@@ -133,6 +134,7 @@ type S3Part struct {
 // CopyObjectResult is the XML response for CopyObject.
 type CopyObjectResult struct {
 	XMLName      xml.Name `xml:"CopyObjectResult"`
+	XMLNS        string   `xml:"xmlns,attr"`
 	LastModified string   `xml:"LastModified"`
 	ETag         string   `xml:"ETag"`
 }

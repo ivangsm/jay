@@ -90,7 +90,7 @@ func (h *Handler) requireAuth(r *http.Request, w http.ResponseWriter, action, bu
 		if (action == meta.ActionObjectGet || action == meta.ActionObjectList) && h.auth.IsPublicRead(bucketName) {
 			return nil, true
 		}
-		writeS3Error(w, r, http.StatusUnauthorized, S3ErrAccessDenied, "Authentication required", r.URL.Path)
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Authentication required", r.URL.Path)
 		return nil, false
 	}
 

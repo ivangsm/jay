@@ -70,7 +70,11 @@ func (a *Auth) AuthenticateSigV4(r *http.Request) (*meta.Token, error) {
 		// Compute SigV4 signature
 		signingKey := deriveSigningKey(secret, dateStr, region, "s3")
 		canonicalRequest := buildCanonicalRequest(r, signedHeadersStr)
-		stringToSign := buildStringToSign(dateStr, r.Header.Get("x-amz-date"), region, canonicalRequest)
+		amzDate := r.Header.Get("x-amz-date")
+		if amzDate == "" {
+			amzDate = r.Header.Get("Date")
+		}
+		stringToSign := buildStringToSign(dateStr, amzDate, region, canonicalRequest)
 		expectedSig := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 
 		// In simplified mode, we skip signature verification since we don't have the plain secret

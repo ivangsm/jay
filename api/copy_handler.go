@@ -116,6 +116,7 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 	}
 
 	writeXML(w, r, http.StatusOK, CopyObjectResult{
+		XMLNS:        s3Namespace,
 		LastModified: formatS3Time(now),
 		ETag:         formatETag(newObj.ETag),
 	})
