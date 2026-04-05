@@ -61,6 +61,13 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) getConn() (*conn, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("jay client: client is closed")
+	}
+	c.mu.Unlock()
+
 	// Try to get a pooled connection
 	select {
 	case cn := <-c.pool:
@@ -153,6 +160,10 @@ func (c *Client) doRequest(op byte, meta []byte) (status byte, respMeta []byte, 
 		return 0, nil, fmt.Errorf("read response header: %w", err)
 	}
 
+	if metaLen > proto.MaxMetaSize {
+		c.dropConn(cn)
+		return 0, nil, fmt.Errorf("response metadata too large: %d", metaLen)
+	}
 	if metaLen > 0 {
 		respMeta = make([]byte, metaLen)
 		if _, err := io.ReadFull(cn.br, respMeta); err != nil {
@@ -163,7 +174,10 @@ func (c *Client) doRequest(op byte, meta []byte) (status byte, respMeta []byte, 
 
 	// Drain any unexpected data
 	if dataLen > 0 {
-		io.CopyN(io.Discard, cn.br, dataLen)
+		if _, err := io.CopyN(io.Discard, cn.br, dataLen); err != nil {
+			c.dropConn(cn)
+			return status, respMeta, nil
+		}
 	}
 
 	c.putConn(cn)
@@ -192,6 +206,10 @@ func (c *Client) doRequestWithData(op byte, meta []byte, data io.Reader, dataLen
 		return 0, nil, fmt.Errorf("read response header: %w", err)
 	}
 
+	if metaLen > proto.MaxMetaSize {
+		c.dropConn(cn)
+		return 0, nil, fmt.Errorf("response metadata too large: %d", metaLen)
+	}
 	if metaLen > 0 {
 		respMeta = make([]byte, metaLen)
 		if _, err := io.ReadFull(cn.br, respMeta); err != nil {
@@ -201,7 +219,10 @@ func (c *Client) doRequestWithData(op byte, meta []byte, data io.Reader, dataLen
 	}
 
 	if respDataLen > 0 {
-		io.CopyN(io.Discard, cn.br, respDataLen)
+		if _, err := io.CopyN(io.Discard, cn.br, respDataLen); err != nil {
+			c.dropConn(cn)
+			return status, respMeta, nil
+		}
 	}
 
 	c.putConn(cn)
@@ -231,6 +252,10 @@ func (c *Client) doRequestWithDataResponse(op byte, meta []byte) (status byte, r
 		return 0, nil, nil, 0, fmt.Errorf("read response header: %w", err)
 	}
 
+	if metaLen > proto.MaxMetaSize {
+		c.dropConn(cn)
+		return 0, nil, nil, 0, fmt.Errorf("response metadata too large: %d", metaLen)
+	}
 	if metaLen > 0 {
 		respMeta = make([]byte, metaLen)
 		if _, err := io.ReadFull(cn.br, respMeta); err != nil {
@@ -256,6 +281,7 @@ func (c *Client) doRequestWithDataResponse(op byte, meta []byte) (status byte, r
 // connReader wraps a limited reader over a pooled connection.
 // Closing it returns the connection to the pool.
 type connReader struct {
+	mu     sync.Mutex
 	r      io.Reader
 	cn     *conn
 	client *Client
@@ -264,19 +290,26 @@ type connReader struct {
 }
 
 func (cr *connReader) Read(p []byte) (int, error) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
 	n, err := cr.r.Read(p)
 	cr.remain -= int64(n)
 	return n, err
 }
 
 func (cr *connReader) Close() error {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
 	if cr.closed {
 		return nil
 	}
 	cr.closed = true
 	// Drain remaining data
 	if cr.remain > 0 {
-		io.CopyN(io.Discard, cr.r, cr.remain)
+		if _, err := io.CopyN(io.Discard, cr.r, cr.remain); err != nil {
+			cr.client.dropConn(cr.cn)
+			return nil
+		}
 	}
 	cr.client.putConn(cr.cn)
 	return nil
