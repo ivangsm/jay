@@ -33,7 +33,29 @@ func newRateLimiter(cfg RateLimiterConfig) *rateLimiter {
 	if cfg.Burst <= 0 {
 		cfg.Burst = int(cfg.Rate * 2)
 	}
-	return &rateLimiter{config: cfg}
+	rl := &rateLimiter{config: cfg}
+	rl.startCleanup()
+	return rl
+}
+
+func (rl *rateLimiter) startCleanup() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cutoff := time.Now().Add(-1 * time.Hour)
+			rl.buckets.Range(func(key, value any) bool {
+				bucket := value.(*tokenBucket)
+				bucket.mu.Lock()
+				idle := bucket.lastTime.Before(cutoff)
+				bucket.mu.Unlock()
+				if idle {
+					rl.buckets.Delete(key)
+				}
+				return true
+			})
+		}
+	}()
 }
 
 func (rl *rateLimiter) allow(key string) bool {
@@ -98,14 +120,19 @@ func (h *Handler) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // clientIP extracts the client IP address from the request.
-// It checks X-Forwarded-For (using only the rightmost/last entry, which is
-// the most recently appended by a trusted proxy) and falls back to
-// r.RemoteAddr with the port stripped.
+// It only trusts X-Forwarded-For when the direct connection (RemoteAddr)
+// comes from a trusted proxy (loopback or private network). Otherwise it
+// uses RemoteAddr with the port stripped.
 func clientIP(r *http.Request) string {
-	// X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2".
-	// The last entry is the one appended by the closest (most trusted) proxy.
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Find the last comma-separated value.
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+
+	// Only trust X-Forwarded-For if the direct connection is from a trusted network.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" && isTrustedProxy(host) {
+		// X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2".
+		// The last entry is the one appended by the closest (most trusted) proxy.
 		for i := len(xff) - 1; i >= 0; i-- {
 			if xff[i] == ',' {
 				ip := trimSpace(xff[i+1:])
@@ -121,13 +148,17 @@ func clientIP(r *http.Request) string {
 		}
 	}
 
-	// Fall back to RemoteAddr, stripping the port.
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		// RemoteAddr may already lack a port.
-		return r.RemoteAddr
-	}
 	return host
+}
+
+// isTrustedProxy reports whether the given IP is a loopback or private address,
+// indicating the request arrived through a local/trusted reverse proxy.
+func isTrustedProxy(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	return parsed.IsLoopback() || parsed.IsPrivate()
 }
 
 // trimSpace trims leading and trailing ASCII spaces (avoids importing strings).
