@@ -376,7 +376,7 @@ func TestConnectionReuse(t *testing.T) {
 	c.CreateBucket("reuse")
 
 	// Multiple operations on the same client (reuses connections)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		data := "iteration"
 		key := "obj-" + string(rune('0'+i))
 		_, err := c.PutObject("reuse", key, strings.NewReader(data), int64(len(data)), nil)

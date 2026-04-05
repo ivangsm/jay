@@ -11,16 +11,16 @@ const s3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 // S3 error codes
 const (
-	S3ErrAccessDenied           = "AccessDenied"
-	S3ErrBucketAlreadyExists    = "BucketAlreadyOwnedByYou"
-	S3ErrBucketNotEmpty         = "BucketNotEmpty"
-	S3ErrInternalError          = "InternalError"
-	S3ErrInvalidArgument        = "InvalidArgument"
-	S3ErrInvalidBucketName      = "InvalidBucketName"
-	S3ErrNoSuchBucket           = "NoSuchBucket"
-	S3ErrNoSuchKey              = "NoSuchKey"
-	S3ErrMethodNotAllowed       = "MethodNotAllowed"
-	S3ErrMissingContentLength   = "MissingContentLength"
+	S3ErrAccessDenied         = "AccessDenied"
+	S3ErrBucketAlreadyExists  = "BucketAlreadyOwnedByYou"
+	S3ErrBucketNotEmpty       = "BucketNotEmpty"
+	S3ErrInternalError        = "InternalError"
+	S3ErrInvalidArgument      = "InvalidArgument"
+	S3ErrInvalidBucketName    = "InvalidBucketName"
+	S3ErrNoSuchBucket         = "NoSuchBucket"
+	S3ErrNoSuchKey            = "NoSuchKey"
+	S3ErrMethodNotAllowed     = "MethodNotAllowed"
+	S3ErrMissingContentLength = "MissingContentLength"
 )
 
 // S3Error represents an S3 XML error response.
@@ -34,10 +34,10 @@ type S3Error struct {
 
 // ListAllMyBucketsResult is the XML response for listing buckets.
 type ListAllMyBucketsResult struct {
-	XMLName xml.Name       `xml:"ListAllMyBucketsResult"`
-	XMLNS   string         `xml:"xmlns,attr"`
-	Owner   S3Owner        `xml:"Owner"`
-	Buckets S3BucketList   `xml:"Buckets"`
+	XMLName xml.Name     `xml:"ListAllMyBucketsResult"`
+	XMLNS   string       `xml:"xmlns,attr"`
+	Owner   S3Owner      `xml:"Owner"`
+	Buckets S3BucketList `xml:"Buckets"`
 }
 
 type S3Owner struct {
@@ -56,20 +56,20 @@ type S3BucketEntry struct {
 
 // ListBucketResult is the XML response for ListObjectsV2.
 type ListBucketResult struct {
-	XMLName        xml.Name       `xml:"ListBucketResult"`
-	XMLNS          string         `xml:"xmlns,attr"`
-	Name           string         `xml:"Name"`
-	Prefix         string         `xml:"Prefix"`
-	Delimiter      string         `xml:"Delimiter,omitempty"`
-	MaxKeys        int            `xml:"MaxKeys"`
-	IsTruncated    bool           `xml:"IsTruncated"`
-	Contents       []S3Content    `xml:"Contents"`
-	CommonPrefixes []S3CommonPrefix `xml:"CommonPrefixes,omitempty"`
-	KeyCount       int            `xml:"KeyCount"`
-	EncodingType   string         `xml:"EncodingType,omitempty"`
-	StartAfter     string         `xml:"StartAfter,omitempty"`
-	ContinuationToken string     `xml:"ContinuationToken,omitempty"`
-	NextContinuationToken string `xml:"NextContinuationToken,omitempty"`
+	XMLName               xml.Name         `xml:"ListBucketResult"`
+	XMLNS                 string           `xml:"xmlns,attr"`
+	Name                  string           `xml:"Name"`
+	Prefix                string           `xml:"Prefix"`
+	Delimiter             string           `xml:"Delimiter,omitempty"`
+	MaxKeys               int              `xml:"MaxKeys"`
+	IsTruncated           bool             `xml:"IsTruncated"`
+	Contents              []S3Content      `xml:"Contents"`
+	CommonPrefixes        []S3CommonPrefix `xml:"CommonPrefixes,omitempty"`
+	KeyCount              int              `xml:"KeyCount"`
+	EncodingType          string           `xml:"EncodingType,omitempty"`
+	StartAfter            string           `xml:"StartAfter,omitempty"`
+	ContinuationToken     string           `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string           `xml:"NextContinuationToken,omitempty"`
 }
 
 type S3Content struct {
@@ -95,8 +95,8 @@ type InitiateMultipartUploadResult struct {
 
 // CompleteMultipartUploadInput is the XML request for CompleteMultipartUpload.
 type CompleteMultipartUploadInput struct {
-	XMLName xml.Name           `xml:"CompleteMultipartUpload"`
-	Parts   []CompletePart     `xml:"Part"`
+	XMLName xml.Name       `xml:"CompleteMultipartUpload"`
+	Parts   []CompletePart `xml:"Part"`
 }
 
 type CompletePart struct {
@@ -116,12 +116,12 @@ type CompleteMultipartUploadResult struct {
 
 // ListPartsResult is the XML response for ListParts.
 type ListPartsResult struct {
-	XMLName  xml.Name    `xml:"ListPartsResult"`
-	XMLNS    string      `xml:"xmlns,attr"`
-	Bucket   string      `xml:"Bucket"`
-	Key      string      `xml:"Key"`
-	UploadId string      `xml:"UploadId"`
-	Parts    []S3Part    `xml:"Part"`
+	XMLName  xml.Name `xml:"ListPartsResult"`
+	XMLNS    string   `xml:"xmlns,attr"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadId string   `xml:"UploadId"`
+	Parts    []S3Part `xml:"Part"`
 }
 
 type S3Part struct {
@@ -156,7 +156,7 @@ func writeS3Error(w http.ResponseWriter, r *http.Request, httpCode int, s3Code, 
 }
 
 // writeXML writes an XML response with proper headers.
-func writeXML(w http.ResponseWriter, r *http.Request, httpCode int, v interface{}) {
+func writeXML(w http.ResponseWriter, r *http.Request, httpCode int, v any) {
 	reqID := requestIDFromContext(r.Context())
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("x-amz-request-id", reqID)

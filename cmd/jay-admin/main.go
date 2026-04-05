@@ -110,7 +110,7 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func doRequest(method, url, token string, body interface{}) ([]byte, int, error) {
+func doRequest(method, url, token string, body any) ([]byte, int, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		data, _ := json.Marshal(body)
@@ -257,7 +257,7 @@ func presign(addr, token string, args []string) error {
 		return fmt.Errorf("usage: presign -bucket <b> -key <k> -token-id <id> [-method GET] [-expires 3600]")
 	}
 
-	body := map[string]interface{}{
+	body := map[string]any{
 		"token_id":        tokenID,
 		"method":          method,
 		"bucket":          bucket,

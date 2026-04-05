@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -12,11 +13,11 @@ import (
 )
 
 var (
-	ErrNoCredentials    = errors.New("no credentials provided")
+	ErrNoCredentials      = errors.New("no credentials provided")
 	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrTokenExpired     = errors.New("token expired")
-	ErrTokenRevoked     = errors.New("token revoked")
-	ErrAccessDenied     = errors.New("access denied")
+	ErrTokenExpired       = errors.New("token expired")
+	ErrTokenRevoked       = errors.New("token revoked")
+	ErrAccessDenied       = errors.New("access denied")
 )
 
 // Auth handles authentication and authorization.
@@ -38,8 +39,8 @@ func (a *Auth) Authenticate(r *http.Request) (*meta.Token, error) {
 	}
 
 	// Bearer <token_id>:<secret>
-	if strings.HasPrefix(authHeader, "Bearer ") {
-		parts := strings.SplitN(strings.TrimPrefix(authHeader, "Bearer "), ":", 2)
+	if after, ok := strings.CutPrefix(authHeader, "Bearer "); ok {
+		parts := strings.SplitN(after, ":", 2)
 		if len(parts) != 2 {
 			return nil, ErrInvalidCredentials
 		}
@@ -144,12 +145,7 @@ func containsAction(actions []string, action string) bool {
 }
 
 func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(slice, item)
 }
 
 // AuthorizeWithPolicy performs all existing Authorize checks and additionally

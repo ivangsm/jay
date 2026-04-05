@@ -101,9 +101,9 @@ func (db *DB) DeleteObjectMeta(bucketID, key string) (*Object, error) {
 
 // ListObjectsResult holds the result of a ListObjects call.
 type ListObjectsResult struct {
-	Objects       []Object
+	Objects        []Object
 	CommonPrefixes []string
-	IsTruncated   bool
+	IsTruncated    bool
 	NextStartAfter string
 }
 
@@ -125,10 +125,7 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 		c := bk.Cursor()
 		// Determine start position
 		var k, v []byte
-		seekKey := prefix
-		if startAfter > seekKey {
-			seekKey = startAfter
-		}
+		seekKey := max(startAfter, prefix)
 		if seekKey == "" {
 			k, v = c.First()
 		} else {

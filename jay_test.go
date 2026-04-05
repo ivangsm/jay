@@ -1146,7 +1146,7 @@ func TestRateLimiting(t *testing.T) {
 
 	// Exhaust burst (3 requests should pass, then fail)
 	var got429 bool
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		req, _ := http.NewRequest("HEAD", s3Srv.URL+"/rl-bucket", nil)
 		req.Header.Set("Authorization", authHdr)
 		resp, err := http.DefaultClient.Do(req)
