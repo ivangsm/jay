@@ -55,7 +55,7 @@ func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 		if h.signingSecret != "" && r.URL.Query().Get("X-Jay-Token") != "" {
 			token, err := validatePresignedRequest(r, h.signingSecret, h.db)
 			if err != nil {
-				writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Invalid presigned URL: "+err.Error(), r.URL.Path)
+				writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Invalid presigned URL", r.URL.Path)
 				return
 			}
 			ctx := context.WithValue(r.Context(), ctxKeyToken, token)
