@@ -44,7 +44,7 @@ func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, m
 
 // ServeHTTP dispatches S3 requests based on path and method.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	handler := h.withRequestID(h.withLogging(h.withPresigned(h.withAuth(h.withRateLimit(h.dispatch)))))
+	handler := h.withLogging(h.withPresigned(h.withRequestIDAndAuth(h.withRateLimit(h.dispatch))))
 	handler(w, r)
 }
 
@@ -58,8 +58,12 @@ func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 				writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Invalid presigned URL", r.URL.Path)
 				return
 			}
-			ctx := context.WithValue(r.Context(), ctxKeyToken, token)
-			h.dispatch(w, r.WithContext(ctx))
+			// Set request ID and token, then go straight to rate limit + dispatch
+			reqID := generateRequestID()
+			ctx := context.WithValue(r.Context(), ctxKeyRequestID, reqID)
+			ctx = context.WithValue(ctx, ctxKeyToken, token)
+			w.Header().Set("x-amz-request-id", reqID)
+			h.withRateLimit(h.dispatch)(w, r.WithContext(ctx))
 			return
 		}
 		next(w, r)

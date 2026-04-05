@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/xml"
-	"fmt"
 	"net/http"
 	"time"
 )
@@ -178,5 +177,5 @@ func formatETag(etag string) string {
 	if etag[0] == '"' {
 		return etag
 	}
-	return fmt.Sprintf(`"%s"`, etag)
+	return `"` + etag + `"`
 }

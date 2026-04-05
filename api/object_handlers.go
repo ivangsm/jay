@@ -358,10 +358,6 @@ func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// sanitizeHeaderValue removes \r and \n characters to prevent CRLF header injection.
-func sanitizeHeaderValue(v string) string {
-	return strings.NewReplacer("\r", "", "\n", "").Replace(v)
-}
 
 // parseRange parses a Range header value like "bytes=0-499" or "bytes=-500" or "bytes=500-".
 // Returns start, end (inclusive), and whether the range is valid.

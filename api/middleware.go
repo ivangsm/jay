@@ -2,10 +2,11 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ivangsm/jay/meta"
@@ -32,17 +33,29 @@ func tokenFromContext(ctx context.Context) *meta.Token {
 	return nil
 }
 
+// generateRequestID produces a random hex request ID without crypto/rand.
 func generateRequestID() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	v := rand.Uint64()
+	var buf [16]byte
+	const hex = "0123456789abcdef"
+	for i := range 16 {
+		buf[i] = hex[v&0xf]
+		v >>= 4
+	}
+	return string(buf[:])
 }
 
-// withRequestID adds a unique request ID to the context and response headers.
-func (h *Handler) withRequestID(next http.HandlerFunc) http.HandlerFunc {
+// withRequestIDAndAuth combines request ID generation and authentication into
+// a single middleware to avoid multiple r.WithContext / request clone calls.
+func (h *Handler) withRequestIDAndAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqID := generateRequestID()
+
+		token, _ := h.auth.Authenticate(r)
+
 		ctx := context.WithValue(r.Context(), ctxKeyRequestID, reqID)
+		ctx = context.WithValue(ctx, ctxKeyToken, token)
+
 		w.Header().Set("x-amz-request-id", reqID)
 		next(w, r.WithContext(ctx))
 	}
@@ -63,22 +76,6 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 			slog.Int("status", sw.status),
 			slog.Duration("duration", time.Since(start)),
 		)
-	}
-}
-
-// withAuth authenticates the request. If auth fails and the bucket is not public-read,
-// it returns an error. The token (or nil for public access) is stored in context.
-func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		token, err := h.auth.Authenticate(r)
-		if err != nil {
-			// Store nil token — handlers check public access separately
-			ctx := context.WithValue(r.Context(), ctxKeyToken, (*meta.Token)(nil))
-			next(w, r.WithContext(ctx))
-			return
-		}
-		ctx := context.WithValue(r.Context(), ctxKeyToken, token)
-		next(w, r.WithContext(ctx))
 	}
 }
 
@@ -104,7 +101,7 @@ func (h *Handler) requireAuth(r *http.Request, w http.ResponseWriter, action, bu
 	return token, true
 }
 
-// statusWriter wraps ResponseWriter to capture the status code.
+// statusWriter wraps ResponseWriter to capture the status code and enable sendfile.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
@@ -115,6 +112,14 @@ func (sw *statusWriter) WriteHeader(code int) {
 	sw.ResponseWriter.WriteHeader(code)
 }
 
+// ReadFrom enables sendfile(2) when copying from *os.File to the response.
+func (sw *statusWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := sw.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(sw.ResponseWriter, r)
+}
+
 // Ensure statusWriter implements http.Flusher if the underlying writer does.
 func (sw *statusWriter) Flush() {
 	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
@@ -122,5 +127,15 @@ func (sw *statusWriter) Flush() {
 	}
 }
 
-// Compile-time interface check.
-var _ http.ResponseWriter = (*statusWriter)(nil)
+// Compile-time interface checks.
+var (
+	_ http.ResponseWriter = (*statusWriter)(nil)
+	_ io.ReaderFrom       = (*statusWriter)(nil)
+)
+
+// sanitizeHeaderValue removes \r and \n characters to prevent CRLF header injection.
+var headerSanitizer = strings.NewReplacer("\r", "", "\n", "")
+
+func sanitizeHeaderValue(v string) string {
+	return headerSanitizer.Replace(v)
+}
