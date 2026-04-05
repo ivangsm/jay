@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -228,6 +229,7 @@ func (db *DB) ListMultipartUploads(bucketID string) ([]MultipartUpload, error) {
 		return bk.ForEach(func(k, v []byte) error {
 			var u MultipartUpload
 			if err := json.Unmarshal(v, &u); err != nil {
+				slog.Warn("meta: corrupt multipart upload record", "key", string(k), "err", err)
 				return nil
 			}
 			if u.BucketID == bucketID && u.State == "initiated" {
@@ -253,6 +255,7 @@ func (db *DB) CleanupExpiredUploads(maxAge time.Duration) ([]MultipartUpload, er
 		bk.ForEach(func(k, v []byte) error {
 			var u MultipartUpload
 			if err := json.Unmarshal(v, &u); err != nil {
+				slog.Warn("meta: corrupt multipart upload record", "key", string(k), "err", err)
 				return nil
 			}
 			if u.State == "initiated" && u.CreatedAt.Before(cutoff) {

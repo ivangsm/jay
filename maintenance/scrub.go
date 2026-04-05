@@ -114,6 +114,13 @@ func (s *Scrubber) RunOnce() ScrubResult {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for _, bucket := range buckets {
+		type quarantineAction struct {
+			key         string
+			locationRef string
+			isMismatch  bool // true = checksum mismatch, false = missing file
+		}
+		var toQuarantine []quarantineAction
+
 		s.db.ForEachObject(bucket.ID, func(obj meta.Object) error {
 			if obj.State != "active" {
 				return nil
@@ -133,7 +140,7 @@ func (s *Scrubber) RunOnce() ScrubResult {
 					"key", obj.Key,
 					"location", obj.LocationRef,
 				)
-				s.db.QuarantineObject(bucket.ID, obj.Key)
+				toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: false})
 				result.Missing++
 				return nil
 			}
@@ -158,8 +165,7 @@ func (s *Scrubber) RunOnce() ScrubResult {
 					"actual", actual,
 					"location", obj.LocationRef,
 				)
-				s.db.QuarantineObject(bucket.ID, obj.Key)
-				s.store.Quarantine(obj.LocationRef)
+				toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: true})
 				result.Quarantined++
 				return nil
 			}
@@ -167,6 +173,14 @@ func (s *Scrubber) RunOnce() ScrubResult {
 			result.Healthy++
 			return nil
 		})
+
+		// Quarantine outside the View transaction to avoid deadlock.
+		for _, qa := range toQuarantine {
+			s.db.QuarantineObject(bucket.ID, qa.key)
+			if qa.isMismatch {
+				s.store.Quarantine(qa.locationRef)
+			}
+		}
 
 		// Check for shutdown between buckets
 		select {
@@ -200,6 +214,13 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 	for _, bucket := range buckets {
 		startKey := s.lastKey[bucket.ID]
 
+		type quarantineAction struct {
+			key         string
+			locationRef string
+			isMismatch  bool
+		}
+		var toQuarantine []quarantineAction
+
 		lastVisited, err := s.db.ForEachObjectFrom(bucket.ID, startKey, maxPerRun, func(obj meta.Object) error {
 			if obj.State != "active" {
 				return nil
@@ -214,7 +235,7 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 					"key", obj.Key,
 					"location", obj.LocationRef,
 				)
-				s.db.QuarantineObject(bucket.ID, obj.Key)
+				toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: false})
 				result.Missing++
 				return nil
 			}
@@ -238,8 +259,7 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 					"actual", actual,
 					"location", obj.LocationRef,
 				)
-				s.db.QuarantineObject(bucket.ID, obj.Key)
-				s.store.Quarantine(obj.LocationRef)
+				toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: true})
 				result.Quarantined++
 				return nil
 			}
@@ -247,6 +267,14 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 			result.Healthy++
 			return nil
 		})
+
+		// Quarantine outside the View transaction to avoid deadlock.
+		for _, qa := range toQuarantine {
+			s.db.QuarantineObject(bucket.ID, qa.key)
+			if qa.isMismatch {
+				s.store.Quarantine(qa.locationRef)
+			}
+		}
 
 		if err != nil {
 			s.log.Error("incremental scrub: iterate objects",

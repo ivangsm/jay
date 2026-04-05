@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -147,6 +148,7 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 
 			var obj Object
 			if err := json.Unmarshal(v, &obj); err != nil {
+				slog.Warn("meta: corrupt object record", "key", string(k), "err", err)
 				continue
 			}
 			if obj.State != "active" {
@@ -222,7 +224,8 @@ func (db *DB) ForEachObject(bucketID string, fn func(Object) error) error {
 		return bk.ForEach(func(k, v []byte) error {
 			var obj Object
 			if err := json.Unmarshal(v, &obj); err != nil {
-				return nil // skip corrupt entries
+				slog.Warn("meta: corrupt object record", "key", string(k), "err", err)
+				return nil
 			}
 			return fn(obj)
 		})
@@ -314,7 +317,8 @@ func (db *DB) ForEachObjectFrom(bucketID, startKey string, limit int, fn func(Ob
 		for ; k != nil && count < limit; k, v = c.Next() {
 			var obj Object
 			if err := json.Unmarshal(v, &obj); err != nil {
-				continue // skip corrupt entries
+				slog.Warn("meta: corrupt object record", "key", string(k), "err", err)
+				continue
 			}
 			lastKey = string(k)
 			if err := fn(obj); err != nil {
