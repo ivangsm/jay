@@ -5,11 +5,44 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ivangsm/jay/meta"
 )
+
+// errInvalidLocationRef is returned when a location ref contains path traversal
+// sequences, null bytes, or resolves outside the data directory.
+var errInvalidLocationRef = fmt.Errorf("store: invalid location ref")
+
+// validateLocationRef checks that locationRef is safe to use as a sub-path
+// under s.dataDir. It rejects null bytes, ".." components, and any path that
+// would escape the data directory after cleaning.
+func (s *Store) validateLocationRef(locationRef string) error {
+	if strings.ContainsRune(locationRef, 0) {
+		return errInvalidLocationRef
+	}
+	if strings.Contains(locationRef, "..") {
+		return errInvalidLocationRef
+	}
+	cleaned := filepath.Join(s.dataDir, filepath.Clean(locationRef))
+	if !strings.HasPrefix(cleaned, filepath.Clean(s.dataDir)+string(filepath.Separator)) {
+		return errInvalidLocationRef
+	}
+	return nil
+}
+
+// SafePath validates locationRef and returns the absolute path. It should be
+// used instead of AbsPath whenever locationRef originates from untrusted or
+// externally-stored input.
+func (s *Store) SafePath(locationRef string) (string, error) {
+	if err := s.validateLocationRef(locationRef); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.dataDir, locationRef), nil
+}
 
 // Store manages physical object files on the filesystem.
 type Store struct {
@@ -33,6 +66,8 @@ func ObjectPath(bucketID, objectID string) string {
 }
 
 // AbsPath returns the absolute path for a location_ref.
+// Deprecated: AbsPath does not validate the locationRef. Use SafePath for
+// untrusted input to prevent path traversal attacks.
 func (s *Store) AbsPath(locationRef string) string {
 	return filepath.Join(s.dataDir, locationRef)
 }
@@ -46,8 +81,9 @@ func (s *Store) AbsPath(locationRef string) string {
 //  3. Rename to final path
 //  4. fsync parent directory
 func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum string, size int64, locationRef string, err error) {
-	// Create temp file in same filesystem for atomic rename
-	tmpFile, err := os.CreateTemp(filepath.Join(s.dataDir, "tmp"), "jay-upload-*")
+	// Create temp file in same filesystem for atomic rename.
+	// The .writing suffix signals to GC that this file is actively being written.
+	tmpFile, err := os.CreateTemp(filepath.Join(s.dataDir, "tmp"), "jay-upload-*.writing")
 	if err != nil {
 		return "", 0, "", fmt.Errorf("store: create temp: %w", err)
 	}
@@ -77,6 +113,15 @@ func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum
 		return "", 0, "", fmt.Errorf("store: close temp: %w", err)
 	}
 
+	// Remove .writing suffix to signal that the write is complete and the file
+	// is ready for rename. This makes the file eligible for GC cleanup if the
+	// final rename below fails and the temp file becomes orphaned.
+	readyPath := strings.TrimSuffix(tmpPath, ".writing")
+	if err = os.Rename(tmpPath, readyPath); err != nil {
+		return "", 0, "", fmt.Errorf("store: mark temp ready: %w", err)
+	}
+	tmpPath = readyPath
+
 	checksum = hex.EncodeToString(h.Sum(nil))
 	locationRef = ObjectPath(bucketID, objectID)
 	finalPath := s.AbsPath(locationRef)
@@ -102,7 +147,11 @@ func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum
 
 // ReadObject opens the file at locationRef for reading. Caller must close it.
 func (s *Store) ReadObject(locationRef string) (*os.File, error) {
-	f, err := os.Open(s.AbsPath(locationRef))
+	p, err := s.SafePath(locationRef)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(p)
 	if err != nil {
 		return nil, fmt.Errorf("store: open: %w", err)
 	}
@@ -111,7 +160,11 @@ func (s *Store) ReadObject(locationRef string) (*os.File, error) {
 
 // DeleteObject removes the physical file at locationRef.
 func (s *Store) DeleteObject(locationRef string) error {
-	if err := os.Remove(s.AbsPath(locationRef)); err != nil && !os.IsNotExist(err) {
+	p, err := s.SafePath(locationRef)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("store: delete: %w", err)
 	}
 	return nil
@@ -119,7 +172,10 @@ func (s *Store) DeleteObject(locationRef string) error {
 
 // Quarantine moves a file from its location to the quarantine directory.
 func (s *Store) Quarantine(locationRef string) error {
-	src := s.AbsPath(locationRef)
+	src, err := s.SafePath(locationRef)
+	if err != nil {
+		return err
+	}
 	dst := filepath.Join(s.dataDir, "quarantine", filepath.Base(locationRef))
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("store: quarantine: %w", err)
@@ -161,7 +217,11 @@ func (s *Store) RemoveBucketDir(bucketID string) error {
 
 // VerifyChecksum reads the file at locationRef and returns whether its SHA-256 matches expected.
 func (s *Store) VerifyChecksum(locationRef, expected string) (bool, string, error) {
-	f, err := os.Open(s.AbsPath(locationRef))
+	p, err := s.SafePath(locationRef)
+	if err != nil {
+		return false, "", err
+	}
+	f, err := os.Open(p)
 	if err != nil {
 		return false, "", err
 	}
@@ -193,6 +253,15 @@ func (s *Store) ListBucketFiles(bucketID string) ([]string, error) {
 		return nil, nil
 	}
 	return files, err
+}
+
+// Cleanup safely removes the file at locationRef, logging but not propagating
+// errors. It is intended for best-effort cleanup when a subsequent operation
+// (e.g. metadata commit) fails after a successful write.
+func (s *Store) Cleanup(locationRef string) {
+	if err := s.DeleteObject(locationRef); err != nil {
+		slog.Warn("store: cleanup failed", "location", locationRef, "err", err)
+	}
 }
 
 // DataDir returns the root data directory.

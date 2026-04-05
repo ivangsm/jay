@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // PartPath returns the relative path for a multipart part.
@@ -18,13 +19,17 @@ func PartPath(uploadID string, partNumber int) string {
 // Returns the SHA-256 checksum, size, and location ref.
 func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (checksum string, size int64, locationRef string, err error) {
 	locationRef = PartPath(uploadID, partNumber)
-	finalPath := s.AbsPath(locationRef)
+	finalPath, err := s.SafePath(locationRef)
+	if err != nil {
+		return "", 0, "", err
+	}
 
 	if err = os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return "", 0, "", fmt.Errorf("store: mkdir part: %w", err)
 	}
 
-	tmpFile, err := os.CreateTemp(filepath.Join(s.dataDir, "tmp"), "jay-part-*")
+	// The .writing suffix signals to GC that this file is actively being written.
+	tmpFile, err := os.CreateTemp(filepath.Join(s.dataDir, "tmp"), "jay-part-*.writing")
 	if err != nil {
 		return "", 0, "", fmt.Errorf("store: create temp part: %w", err)
 	}
@@ -51,6 +56,13 @@ func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (chec
 		return "", 0, "", fmt.Errorf("store: close part: %w", err)
 	}
 
+	// Remove .writing suffix now that the write is complete.
+	readyPath := strings.TrimSuffix(tmpPath, ".writing")
+	if err = os.Rename(tmpPath, readyPath); err != nil {
+		return "", 0, "", fmt.Errorf("store: mark part ready: %w", err)
+	}
+	tmpPath = readyPath
+
 	checksum = hex.EncodeToString(h.Sum(nil))
 
 	if err = os.Rename(tmpPath, finalPath); err != nil {
@@ -67,7 +79,8 @@ func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (chec
 // AssembleParts concatenates parts into a final object file.
 // Returns the SHA-256 checksum, total size, and location ref of the assembled object.
 func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string) (checksum string, size int64, locationRef string, err error) {
-	tmpFile, err := os.CreateTemp(filepath.Join(s.dataDir, "tmp"), "jay-assemble-*")
+	// The .writing suffix signals to GC that this file is actively being written.
+	tmpFile, err := os.CreateTemp(filepath.Join(s.dataDir, "tmp"), "jay-assemble-*.writing")
 	if err != nil {
 		return "", 0, "", fmt.Errorf("store: create assemble temp: %w", err)
 	}
@@ -84,7 +97,12 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 	w := io.MultiWriter(tmpFile, h)
 
 	for _, loc := range partLocations {
-		f, ferr := os.Open(s.AbsPath(loc))
+		partPath, verr := s.SafePath(loc)
+		if verr != nil {
+			err = fmt.Errorf("store: invalid part location %s: %w", loc, verr)
+			return
+		}
+		f, ferr := os.Open(partPath)
 		if ferr != nil {
 			err = fmt.Errorf("store: open part %s: %w", loc, ferr)
 			return
@@ -105,9 +123,19 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 		return "", 0, "", fmt.Errorf("store: close assembled: %w", err)
 	}
 
+	// Remove .writing suffix now that the write is complete.
+	readyPath := strings.TrimSuffix(tmpPath, ".writing")
+	if err = os.Rename(tmpPath, readyPath); err != nil {
+		return "", 0, "", fmt.Errorf("store: mark assemble ready: %w", err)
+	}
+	tmpPath = readyPath
+
 	checksum = hex.EncodeToString(h.Sum(nil))
 	locationRef = ObjectPath(bucketID, objectID)
-	finalPath := s.AbsPath(locationRef)
+	finalPath, err := s.SafePath(locationRef)
+	if err != nil {
+		return "", 0, "", err
+	}
 
 	if err = os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return "", 0, "", fmt.Errorf("store: mkdir assembled: %w", err)
