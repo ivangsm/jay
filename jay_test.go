@@ -106,7 +106,7 @@ func createTestAccount(t *testing.T, adminURL string) string {
 
 func createTestToken(t *testing.T, adminURL, accountID string) (string, string) {
 	t.Helper()
-	body := `{"account_id":"` + accountID + `","name":"test"}`
+	body := `{"account_id":"` + accountID + `","name":"test","allowed_actions":["bucket:list","bucket:read-meta","bucket:write-meta","object:get","object:put","object:delete","object:list","multipart:create","multipart:upload-part","multipart:complete","multipart:abort"]}`
 	req, _ := http.NewRequest("POST", adminURL+"/_jay/tokens", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-admin")
 	req.Header.Set("Content-Type", "application/json")
@@ -504,7 +504,8 @@ func setupWithSigning(t *testing.T) *testEnv {
 
 func computeTestSignature(signingSecret, tokenID, method, path, expires string) string {
 	mac := hmac.New(sha256.New, []byte(signingSecret))
-	mac.Write([]byte(tokenID + "\n" + method + "\n" + path + "\n" + expires))
+	// Include empty canonical query string to match updated signature format.
+	mac.Write([]byte(tokenID + "\n" + method + "\n" + path + "\n" + "\n" + expires))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

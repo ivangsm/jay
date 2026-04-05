@@ -9,10 +9,14 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// MaxBucketsPerAccount is the maximum number of buckets a single account may own.
+const MaxBucketsPerAccount = 1000
+
 var (
-	ErrBucketExists   = errors.New("bucket already exists")
-	ErrBucketNotFound = errors.New("bucket not found")
-	ErrBucketNotEmpty = errors.New("bucket is not empty")
+	ErrBucketExists        = errors.New("bucket already exists")
+	ErrBucketNotFound      = errors.New("bucket not found")
+	ErrBucketNotEmpty      = errors.New("bucket is not empty")
+	ErrBucketLimitExceeded = errors.New("account bucket limit exceeded")
 )
 
 // CreateBucket creates a new bucket. Returns ErrBucketExists if the name is taken.
@@ -37,6 +41,27 @@ func (db *DB) CreateBucket(b *Bucket) error {
 		if bk.Get([]byte(b.Name)) != nil {
 			return ErrBucketExists
 		}
+
+		// Enforce per-account bucket limit.
+		if b.OwnerAccountID != "" {
+			count := 0
+			if err := bk.ForEach(func(k, v []byte) error {
+				var existing Bucket
+				if err := json.Unmarshal(v, &existing); err != nil {
+					return nil // skip corrupt entries
+				}
+				if existing.OwnerAccountID == b.OwnerAccountID {
+					count++
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			if count >= MaxBucketsPerAccount {
+				return ErrBucketLimitExceeded
+			}
+		}
+
 		if err := bk.Put([]byte(b.Name), data); err != nil {
 			return err
 		}

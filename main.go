@@ -150,8 +150,17 @@ func main() {
 		log.Error("admin server shutdown error", "err", err)
 	}
 	if shutdownNative != nil {
-		if err := shutdownNative(); err != nil {
-			log.Error("native server shutdown error", "err", err)
+		done := make(chan struct{})
+		go func() {
+			if err := shutdownNative(); err != nil {
+				log.Error("native server shutdown error", "err", err)
+			}
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			log.Warn("native server shutdown timed out")
 		}
 	}
 

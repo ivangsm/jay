@@ -65,11 +65,12 @@ type MultipartUpload struct {
 
 // MultipartPart represents a single part in a multipart upload.
 type MultipartPart struct {
-	PartNumber   int    `json:"part_number"`
-	Size         int64  `json:"size"`
-	ETag         string `json:"etag"`
-	ChecksumSHA256 string `json:"checksum_sha256"`
-	LocationRef  string `json:"location_ref"`
+	PartNumber     int       `json:"part_number"`
+	Size           int64     `json:"size"`
+	ETag           string    `json:"etag"`
+	ChecksumSHA256 string    `json:"checksum_sha256"`
+	LocationRef    string    `json:"location_ref"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // Actions

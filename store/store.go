@@ -203,10 +203,14 @@ func (s *Store) CleanTmp() (int, error) {
 	return count, nil
 }
 
-// EnsureBucketDir creates the objects directory for a bucket.
+// EnsureBucketDir creates the objects directory for a bucket and fsyncs the
+// parent to ensure the directory entry is durable.
 func (s *Store) EnsureBucketDir(bucketID string) error {
 	dir := filepath.Join(s.dataDir, "buckets", bucketID, "objects")
-	return os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return fsyncDir(filepath.Join(s.dataDir, "buckets", bucketID))
 }
 
 // RemoveBucketDir removes the bucket's directory tree. Only call after confirming no objects remain.
@@ -275,6 +279,9 @@ func (s *Store) ObjectExists(obj *meta.Object) bool {
 	return err == nil
 }
 
+// fsyncDir fsyncs a directory to ensure rename/unlink operations are durable.
+// Note: On macOS, directory fsync is a no-op. Full durability guarantees
+// only apply on Linux with ext4/xfs filesystems.
 func fsyncDir(path string) error {
 	d, err := os.Open(path)
 	if err != nil {
