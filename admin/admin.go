@@ -22,6 +22,7 @@ import (
 
 // authFailure tracks failed authentication attempts from an IP.
 type authFailure struct {
+	mu       sync.Mutex
 	count    int
 	lastFail time.Time
 }
@@ -97,12 +98,16 @@ func (h *Handler) authenticateAdmin(r *http.Request) bool {
 	// Check rate limit for this IP
 	if val, ok := h.authFailures.Load(clientIP); ok {
 		af := val.(*authFailure)
-		if af.count >= maxAuthFailures && time.Since(af.lastFail) < authFailureWindow {
-			h.log.Warn("admin auth rate limited", "ip", clientIP, "failures", af.count)
+		af.mu.Lock()
+		count := af.count
+		lastFail := af.lastFail
+		af.mu.Unlock()
+		if count >= maxAuthFailures && time.Since(lastFail) < authFailureWindow {
+			h.log.Warn("admin auth rate limited", "ip", clientIP, "failures", count)
 			return false
 		}
 		// Reset if window has expired
-		if time.Since(af.lastFail) >= authFailureWindow {
+		if time.Since(lastFail) >= authFailureWindow {
 			h.authFailures.Delete(clientIP)
 		}
 	}
@@ -116,8 +121,10 @@ func (h *Handler) authenticateAdmin(r *http.Request) bool {
 		h.log.Warn("admin auth failure", "ip", clientIP)
 		val, _ := h.authFailures.LoadOrStore(clientIP, &authFailure{})
 		af := val.(*authFailure)
+		af.mu.Lock()
 		af.count++
 		af.lastFail = time.Now()
+		af.mu.Unlock()
 		return false
 	}
 
@@ -205,7 +212,8 @@ func (h *Handler) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 
 	actions := req.AllowedActions
 	if len(actions) == 0 {
-		actions = meta.AllActions
+		http.Error(w, `{"error":"allowed_actions is required"}`, http.StatusBadRequest)
+		return
 	}
 
 	token := &meta.Token{

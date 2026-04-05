@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 )
@@ -20,8 +21,15 @@ type Config struct {
 }
 
 func LoadConfig() Config {
-	rateLimit, _ := strconv.ParseFloat(envOr("JAY_RATE_LIMIT", "0"), 64)
+	rateLimit, _ := strconv.ParseFloat(envOr("JAY_RATE_LIMIT", "100"), 64)
 	rateBurst, _ := strconv.Atoi(envOr("JAY_RATE_BURST", "200"))
+
+	if adminToken := os.Getenv("JAY_ADMIN_TOKEN"); adminToken != "" && len(adminToken) < 16 {
+		slog.Warn("JAY_ADMIN_TOKEN is too short, minimum 16 characters recommended")
+	}
+	if signingSecret := os.Getenv("JAY_SIGNING_SECRET"); signingSecret != "" && len(signingSecret) < 32 {
+		slog.Warn("JAY_SIGNING_SECRET is too short, minimum 32 characters recommended")
+	}
 
 	cfg := Config{
 		DataDir:       envOr("JAY_DATA_DIR", "./data"),
