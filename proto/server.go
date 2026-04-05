@@ -2,7 +2,6 @@ package proto
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -240,7 +239,7 @@ func (h *connHandler) handleOneRequest() error {
 type request struct {
 	op       byte
 	streamID uint32
-	meta     json.RawMessage
+	meta     []byte
 	data     io.Reader
 	dataLen  int64
 }

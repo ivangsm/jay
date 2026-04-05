@@ -1,7 +1,6 @@
 package proto
 
 import (
-	"encoding/json"
 	"errors"
 	"net"
 	"regexp"
@@ -14,43 +13,32 @@ import (
 
 var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$`)
 
-type bucketRequest struct {
-	Bucket string `json:"bucket"`
-}
-
-type bucketInfoResponse struct {
-	BucketID   string `json:"bucket_id"`
-	Name       string `json:"name"`
-	CreatedAt  string `json:"created_at"`
-	Visibility string `json:"visibility"`
-}
-
 func (h *connHandler) handleCreateBucket(req *request) error {
-	var params bucketRequest
-	if err := json.Unmarshal(req.meta, &params); err != nil {
+	bucket, err := DecodeBucket(req.meta)
+	if err != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionBucketWriteMeta, params.Bucket, ""); err != nil {
+	if err := h.auth.Authorize(h.token, meta.ActionBucketWriteMeta, bucket, ""); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	if !validBucketName.MatchString(params.Bucket) ||
-		strings.Contains(params.Bucket, "..") ||
-		strings.Contains(params.Bucket, "--") ||
-		net.ParseIP(params.Bucket) != nil {
+	if !validBucketName.MatchString(bucket) ||
+		strings.Contains(bucket, "..") ||
+		strings.Contains(bucket, "--") ||
+		net.ParseIP(bucket) != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid bucket name", "InvalidBucketName")
 	}
 
-	bucket := &meta.Bucket{
+	b := &meta.Bucket{
 		ID:             uuid.New().String(),
-		Name:           params.Bucket,
+		Name:           bucket,
 		OwnerAccountID: h.token.AccountID,
 		Visibility:     "private",
 		Status:         "active",
 	}
 
-	if err := h.db.CreateBucket(bucket); err != nil {
+	if err := h.db.CreateBucket(b); err != nil {
 		if errors.Is(err, meta.ErrBucketExists) {
 			return h.writeError(StatusConflict, req.streamID, "bucket already exists", "BucketAlreadyExists")
 		}
@@ -58,31 +46,23 @@ func (h *connHandler) handleCreateBucket(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	h.store.EnsureBucketDir(bucket.ID)
+	h.store.EnsureBucketDir(b.ID)
 
-	resp, err := json.Marshal(bucketInfoResponse{
-		BucketID:   bucket.ID,
-		Name:       bucket.Name,
-		CreatedAt:  bucket.CreatedAt.Format(time.RFC3339),
-		Visibility: bucket.Visibility,
-	})
-	if err != nil {
-		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
-	}
-	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
+	resp := EncodeBucketInfo(b.ID, b.Name, b.CreatedAt.Format(time.RFC3339), b.Visibility)
+	return h.writeResponseCombined(StatusOK, req.streamID, resp)
 }
 
 func (h *connHandler) handleDeleteBucket(req *request) error {
-	var params bucketRequest
-	if err := json.Unmarshal(req.meta, &params); err != nil {
+	bucket, err := DecodeBucket(req.meta)
+	if err != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionBucketWriteMeta, params.Bucket, ""); err != nil {
+	if err := h.auth.Authorize(h.token, meta.ActionBucketWriteMeta, bucket, ""); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	bucket, err := h.db.GetBucket(params.Bucket)
+	bkt, err := h.db.GetBucket(bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrBucketNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
@@ -90,28 +70,28 @@ func (h *connHandler) handleDeleteBucket(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	if err := h.db.DeleteBucket(params.Bucket); err != nil {
+	if err := h.db.DeleteBucket(bucket); err != nil {
 		if errors.Is(err, meta.ErrBucketNotEmpty) {
 			return h.writeError(StatusConflict, req.streamID, "bucket is not empty", "BucketNotEmpty")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	h.store.RemoveBucketDir(bucket.ID)
+	h.store.RemoveBucketDir(bkt.ID)
 	return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 }
 
 func (h *connHandler) handleHeadBucket(req *request) error {
-	var params bucketRequest
-	if err := json.Unmarshal(req.meta, &params); err != nil {
+	bucket, err := DecodeBucket(req.meta)
+	if err != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionBucketReadMeta, params.Bucket, ""); err != nil {
+	if err := h.auth.Authorize(h.token, meta.ActionBucketReadMeta, bucket, ""); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	bucket, err := h.db.GetBucket(params.Bucket)
+	bkt, err := h.db.GetBucket(bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrBucketNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
@@ -119,16 +99,8 @@ func (h *connHandler) handleHeadBucket(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	resp, err := json.Marshal(bucketInfoResponse{
-		BucketID:   bucket.ID,
-		Name:       bucket.Name,
-		CreatedAt:  bucket.CreatedAt.Format(time.RFC3339),
-		Visibility: bucket.Visibility,
-	})
-	if err != nil {
-		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
-	}
-	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
+	resp := EncodeBucketInfo(bkt.ID, bkt.Name, bkt.CreatedAt.Format(time.RFC3339), bkt.Visibility)
+	return h.writeResponseCombined(StatusOK, req.streamID, resp)
 }
 
 func (h *connHandler) handleListBuckets(req *request) error {
@@ -142,25 +114,12 @@ func (h *connHandler) handleListBuckets(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	type entry struct {
-		Name      string `json:"name"`
-		CreatedAt string `json:"created_at"`
-	}
-	type listResp struct {
-		Buckets []entry `json:"buckets"`
-	}
-
-	result := listResp{}
-	for _, b := range buckets {
-		result.Buckets = append(result.Buckets, entry{
-			Name:      b.Name,
-			CreatedAt: b.CreatedAt.Format(time.RFC3339),
-		})
+	names := make([]string, len(buckets))
+	createdAts := make([]string, len(buckets))
+	for i, b := range buckets {
+		names[i] = b.Name
+		createdAts[i] = b.CreatedAt.Format(time.RFC3339)
 	}
 
-	resp, err := json.Marshal(result)
-	if err != nil {
-		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
-	}
-	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
+	return h.writeResponseCombined(StatusOK, req.streamID, EncodeBucketList(names, createdAts))
 }

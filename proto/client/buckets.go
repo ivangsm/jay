@@ -1,30 +1,28 @@
 package client
 
 import (
-	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/ivangsm/jay/proto"
 )
 
 // BucketInfo contains bucket metadata.
 type BucketInfo struct {
-	BucketID   string    `json:"bucket_id"`
-	Name       string    `json:"name"`
-	CreatedAt  time.Time `json:"created_at"`
-	Visibility string    `json:"visibility"`
+	BucketID   string
+	Name       string
+	CreatedAt  string
+	Visibility string
 }
 
 // BucketEntry is a bucket in a list response.
 type BucketEntry struct {
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
+	Name      string
+	CreatedAt string
 }
 
 // CreateBucket creates a new bucket.
 func (c *Client) CreateBucket(name string) (*BucketInfo, error) {
-	meta, _ := json.Marshal(map[string]string{"bucket": name})
+	meta := proto.EncodeBucket(name)
 	status, respMeta, err := c.doRequest(proto.OpCreateBucket, meta)
 	if err != nil {
 		return nil, err
@@ -32,16 +30,16 @@ func (c *Client) CreateBucket(name string) (*BucketInfo, error) {
 	if err := checkError(status, respMeta); err != nil {
 		return nil, err
 	}
-	var info BucketInfo
-	if err := json.Unmarshal(respMeta, &info); err != nil {
-		return nil, fmt.Errorf("unmarshal create bucket response: %w", err)
+	id, n, createdAt, visibility, err := proto.DecodeBucketInfo(respMeta)
+	if err != nil {
+		return nil, fmt.Errorf("decode bucket info: %w", err)
 	}
-	return &info, nil
+	return &BucketInfo{BucketID: id, Name: n, CreatedAt: createdAt, Visibility: visibility}, nil
 }
 
-// DeleteBucket deletes a bucket. Fails if the bucket is not empty.
+// DeleteBucket deletes a bucket.
 func (c *Client) DeleteBucket(name string) error {
-	meta, _ := json.Marshal(map[string]string{"bucket": name})
+	meta := proto.EncodeBucket(name)
 	status, respMeta, err := c.doRequest(proto.OpDeleteBucket, meta)
 	if err != nil {
 		return err
@@ -49,9 +47,9 @@ func (c *Client) DeleteBucket(name string) error {
 	return checkError(status, respMeta)
 }
 
-// HeadBucket checks if a bucket exists and returns its info.
+// HeadBucket returns metadata about a bucket.
 func (c *Client) HeadBucket(name string) (*BucketInfo, error) {
-	meta, _ := json.Marshal(map[string]string{"bucket": name})
+	meta := proto.EncodeBucket(name)
 	status, respMeta, err := c.doRequest(proto.OpHeadBucket, meta)
 	if err != nil {
 		return nil, err
@@ -59,32 +57,34 @@ func (c *Client) HeadBucket(name string) (*BucketInfo, error) {
 	if err := checkError(status, respMeta); err != nil {
 		return nil, err
 	}
-	var info BucketInfo
-	if err := json.Unmarshal(respMeta, &info); err != nil {
-		return nil, fmt.Errorf("unmarshal head bucket response: %w", err)
+	id, n, createdAt, visibility, err := proto.DecodeBucketInfo(respMeta)
+	if err != nil {
+		return nil, fmt.Errorf("decode bucket info: %w", err)
 	}
-	return &info, nil
+	return &BucketInfo{BucketID: id, Name: n, CreatedAt: createdAt, Visibility: visibility}, nil
 }
 
-// ListBuckets returns all buckets accessible to this token.
+// ListBuckets returns all buckets the authenticated user has access to.
 func (c *Client) ListBuckets() ([]BucketEntry, error) {
-	status, respMeta, err := c.doRequest(proto.OpListBuckets, []byte("{}"))
+	status, respMeta, err := c.doRequest(proto.OpListBuckets, nil)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkError(status, respMeta); err != nil {
 		return nil, err
 	}
-	var result struct {
-		Buckets []BucketEntry `json:"buckets"`
+	names, createdAts, err := proto.DecodeBucketList(respMeta)
+	if err != nil {
+		return nil, fmt.Errorf("decode bucket list: %w", err)
 	}
-	if err := json.Unmarshal(respMeta, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal list buckets response: %w", err)
+	entries := make([]BucketEntry, len(names))
+	for i := range names {
+		entries[i] = BucketEntry{Name: names[i], CreatedAt: createdAts[i]}
 	}
-	return result.Buckets, nil
+	return entries, nil
 }
 
-// Ping sends a keepalive ping to the server.
+// Ping sends a ping to the server.
 func (c *Client) Ping() error {
 	status, respMeta, err := c.doRequest(proto.OpPing, nil)
 	if err != nil {

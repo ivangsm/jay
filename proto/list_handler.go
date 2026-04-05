@@ -1,47 +1,22 @@
 package proto
 
 import (
-	"encoding/json"
 	"errors"
 
 	"github.com/ivangsm/jay/meta"
 )
 
-type listObjectsRequest struct {
-	Bucket     string `json:"bucket"`
-	Prefix     string `json:"prefix,omitempty"`
-	Delimiter  string `json:"delimiter,omitempty"`
-	StartAfter string `json:"start_after,omitempty"`
-	MaxKeys    int    `json:"max_keys,omitempty"`
-}
-
-type listObjectEntry struct {
-	Key            string `json:"key"`
-	Size           int64  `json:"size"`
-	ETag           string `json:"etag"`
-	ChecksumSHA256 string `json:"checksum_sha256"`
-	LastModified   string `json:"last_modified"`
-	ContentType    string `json:"content_type"`
-}
-
-type listObjectsResponse struct {
-	Objects        []listObjectEntry `json:"objects"`
-	CommonPrefixes []string          `json:"common_prefixes,omitempty"`
-	IsTruncated    bool              `json:"is_truncated"`
-	NextStartAfter string            `json:"next_start_after,omitempty"`
-}
-
 func (h *connHandler) handleListObjects(req *request) error {
-	var params listObjectsRequest
-	if err := json.Unmarshal(req.meta, &params); err != nil {
+	bucket, prefix, delimiter, startAfter, maxKeys, err := DecodeListObjectsRequest(req.meta)
+	if err != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionObjectList, params.Bucket, ""); err != nil {
+	if err := h.auth.Authorize(h.token, meta.ActionObjectList, bucket, ""); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	bucket, err := h.db.GetBucket(params.Bucket)
+	bkt, err := h.db.GetBucket(bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrBucketNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
@@ -49,7 +24,6 @@ func (h *connHandler) handleListObjects(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	maxKeys := params.MaxKeys
 	if maxKeys <= 0 {
 		maxKeys = 1000
 	}
@@ -57,32 +31,24 @@ func (h *connHandler) handleListObjects(req *request) error {
 		maxKeys = 10000
 	}
 
-	result, err := h.db.ListObjects(bucket.ID, params.Prefix, params.Delimiter, params.StartAfter, maxKeys)
+	result, err := h.db.ListObjects(bkt.ID, prefix, delimiter, startAfter, maxKeys)
 	if err != nil {
 		h.log.Error("list objects", "err", err)
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	response := listObjectsResponse{
-		CommonPrefixes: result.CommonPrefixes,
-		IsTruncated:    result.IsTruncated,
-		NextStartAfter: result.NextStartAfter,
-	}
-
-	for _, obj := range result.Objects {
-		response.Objects = append(response.Objects, listObjectEntry{
+	entries := make([]ListObjectEntry, len(result.Objects))
+	for i, obj := range result.Objects {
+		entries[i] = ListObjectEntry{
 			Key:            obj.Key,
 			Size:           obj.SizeBytes,
 			ETag:           obj.ETag,
 			ChecksumSHA256: obj.ChecksumSHA256,
 			LastModified:   obj.UpdatedAt.Format("2006-01-02T15:04:05Z"),
 			ContentType:    obj.ContentType,
-		})
+		}
 	}
 
-	resp, err := json.Marshal(response)
-	if err != nil {
-		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
-	}
-	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
+	resp := EncodeListObjectsResponse(entries, result.CommonPrefixes, result.IsTruncated, result.NextStartAfter)
+	return h.writeResponseCombined(StatusOK, req.streamID, resp)
 }

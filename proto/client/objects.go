@@ -1,7 +1,6 @@
 package client
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 
@@ -10,24 +9,24 @@ import (
 
 // PutOptions are optional parameters for PutObject.
 type PutOptions struct {
-	ContentType string            `json:"content_type,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	ContentType string
+	Metadata    map[string]string
 }
 
 // PutResult contains the result of a PutObject operation.
 type PutResult struct {
-	ETag           string `json:"etag"`
-	ChecksumSHA256 string `json:"checksum_sha256"`
+	ETag           string
+	ChecksumSHA256 string
 }
 
 // ObjectInfo contains object metadata.
 type ObjectInfo struct {
-	ContentType    string            `json:"content_type"`
-	Size           int64             `json:"size"`
-	ETag           string            `json:"etag"`
-	ChecksumSHA256 string            `json:"checksum_sha256"`
-	LastModified   string            `json:"last_modified"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
+	ContentType    string
+	Size           int64
+	ETag           string
+	ChecksumSHA256 string
+	LastModified   string
+	Metadata       map[string]string
 }
 
 // GetResult contains the object data and metadata from GetObject.
@@ -39,21 +38,14 @@ type GetResult struct {
 
 // PutObject uploads an object. The data reader must provide exactly size bytes.
 func (c *Client) PutObject(bucket, key string, data io.Reader, size int64, opts *PutOptions) (*PutResult, error) {
-	reqMeta := struct {
-		Bucket      string            `json:"bucket"`
-		Key         string            `json:"key"`
-		ContentType string            `json:"content_type,omitempty"`
-		Metadata    map[string]string `json:"metadata,omitempty"`
-	}{
-		Bucket: bucket,
-		Key:    key,
-	}
+	var contentType string
+	var metadata map[string]string
 	if opts != nil {
-		reqMeta.ContentType = opts.ContentType
-		reqMeta.Metadata = opts.Metadata
+		contentType = opts.ContentType
+		metadata = opts.Metadata
 	}
 
-	meta, _ := json.Marshal(reqMeta)
+	meta := proto.EncodePutObjectRequest(bucket, key, contentType, metadata)
 	status, respMeta, err := c.doRequestWithData(proto.OpPutObject, meta, data, size)
 	if err != nil {
 		return nil, err
@@ -61,17 +53,17 @@ func (c *Client) PutObject(bucket, key string, data io.Reader, size int64, opts 
 	if err := checkError(status, respMeta); err != nil {
 		return nil, err
 	}
-	var result PutResult
-	if err := json.Unmarshal(respMeta, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal put response: %w", err)
+	etag, checksum, err := proto.DecodePutResponse(respMeta)
+	if err != nil {
+		return nil, fmt.Errorf("decode put response: %w", err)
 	}
-	return &result, nil
+	return &PutResult{ETag: etag, ChecksumSHA256: checksum}, nil
 }
 
 // GetObject downloads an object. Returns object info and a streaming body.
 // The caller must call result.Body.Close() when done reading.
 func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
-	meta, _ := json.Marshal(map[string]string{"bucket": bucket, "key": key})
+	meta := proto.EncodeBucketKey(bucket, key)
 	status, respMeta, dataReader, _, err := c.doRequestWithDataResponse(proto.OpGetObject, meta)
 	if err != nil {
 		return nil, err
@@ -83,15 +75,24 @@ func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
 		return nil, err
 	}
 
-	var info ObjectInfo
-	if err := json.Unmarshal(respMeta, &info); err != nil {
+	contentType, size, etag, checksum, lastModified, metadata, err := proto.DecodeObjectInfo(respMeta)
+	if err != nil {
 		if dataReader != nil {
 			dataReader.Close()
 		}
-		return nil, fmt.Errorf("unmarshal get response: %w", err)
+		return nil, fmt.Errorf("decode get response: %w", err)
 	}
 
-	result := &GetResult{ObjectInfo: info}
+	result := &GetResult{
+		ObjectInfo: ObjectInfo{
+			ContentType:    contentType,
+			Size:           size,
+			ETag:           etag,
+			ChecksumSHA256: checksum,
+			LastModified:   lastModified,
+			Metadata:       metadata,
+		},
+	}
 	if dataReader != nil {
 		result.Body = dataReader
 	} else {
@@ -102,7 +103,7 @@ func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
 
 // HeadObject returns object metadata without downloading the content.
 func (c *Client) HeadObject(bucket, key string) (*ObjectInfo, error) {
-	meta, _ := json.Marshal(map[string]string{"bucket": bucket, "key": key})
+	meta := proto.EncodeBucketKey(bucket, key)
 	status, respMeta, err := c.doRequest(proto.OpHeadObject, meta)
 	if err != nil {
 		return nil, err
@@ -110,16 +111,23 @@ func (c *Client) HeadObject(bucket, key string) (*ObjectInfo, error) {
 	if err := checkError(status, respMeta); err != nil {
 		return nil, err
 	}
-	var info ObjectInfo
-	if err := json.Unmarshal(respMeta, &info); err != nil {
-		return nil, fmt.Errorf("unmarshal head response: %w", err)
+	contentType, size, etag, checksum, lastModified, metadata, err := proto.DecodeObjectInfo(respMeta)
+	if err != nil {
+		return nil, fmt.Errorf("decode head response: %w", err)
 	}
-	return &info, nil
+	return &ObjectInfo{
+		ContentType:    contentType,
+		Size:           size,
+		ETag:           etag,
+		ChecksumSHA256: checksum,
+		LastModified:   lastModified,
+		Metadata:       metadata,
+	}, nil
 }
 
 // DeleteObject deletes an object.
 func (c *Client) DeleteObject(bucket, key string) error {
-	meta, _ := json.Marshal(map[string]string{"bucket": bucket, "key": key})
+	meta := proto.EncodeBucketKey(bucket, key)
 	status, respMeta, err := c.doRequest(proto.OpDeleteObject, meta)
 	if err != nil {
 		return err

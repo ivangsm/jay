@@ -3,7 +3,6 @@ package proto
 import (
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,49 +12,23 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
-type putObjectRequest struct {
-	Bucket      string            `json:"bucket"`
-	Key         string            `json:"key"`
-	ContentType string            `json:"content_type,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-}
-
-type putObjectResponse struct {
-	ETag           string `json:"etag"`
-	ChecksumSHA256 string `json:"checksum_sha256"`
-}
-
-type objectInfoResponse struct {
-	ContentType    string            `json:"content_type"`
-	Size           int64             `json:"size"`
-	ETag           string            `json:"etag"`
-	ChecksumSHA256 string            `json:"checksum_sha256"`
-	LastModified   string            `json:"last_modified"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
-}
-
-type objectRequest struct {
-	Bucket string `json:"bucket"`
-	Key    string `json:"key"`
-}
-
 func (h *connHandler) handlePutObject(req *request) error {
-	var params putObjectRequest
-	if err := json.Unmarshal(req.meta, &params); err != nil {
+	bucket, key, contentType, metadata, err := DecodePutObjectRequest(req.meta)
+	if err != nil {
 		if derr := drainData(req); derr != nil {
 			return derr
 		}
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionObjectPut, params.Bucket, params.Key); err != nil {
+	if err := h.auth.Authorize(h.token, meta.ActionObjectPut, bucket, key); err != nil {
 		if derr := drainData(req); derr != nil {
 			return derr
 		}
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	bucket, err := h.db.GetBucket(params.Bucket)
+	bkt, err := h.db.GetBucket(bucket)
 	if err != nil {
 		if derr := drainData(req); derr != nil {
 			return derr
@@ -68,7 +41,6 @@ func (h *connHandler) handlePutObject(req *request) error {
 
 	objectID := uuid.New().String()
 
-	// Stream data through MD5 hasher (store computes SHA-256)
 	md5Hash := md5.New()
 	var body io.Reader
 	if req.data != nil {
@@ -77,22 +49,22 @@ func (h *connHandler) handlePutObject(req *request) error {
 		body = &emptyReader{}
 	}
 
-	checksum, size, locationRef, err := h.store.WriteObject(bucket.ID, objectID, body)
+	checksum, size, locationRef, err := h.store.WriteObject(bkt.ID, objectID, body)
 	if err != nil {
-		h.log.Error("write object", "err", err, "bucket", params.Bucket, "key", params.Key)
+		h.log.Error("write object", "err", err, "bucket", bucket, "key", key)
 		return h.writeError(StatusInternal, req.streamID, "failed to store object", "InternalError")
 	}
 
 	etag := hex.EncodeToString(md5Hash.Sum(nil))
 
-	contentType := params.ContentType
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 
+	now := time.Now().UTC()
 	obj := &meta.Object{
-		BucketID:        bucket.ID,
-		Key:             params.Key,
+		BucketID:        bkt.ID,
+		Key:             key,
 		ObjectID:        objectID,
 		State:           "active",
 		SizeBytes:       size,
@@ -100,8 +72,8 @@ func (h *connHandler) handlePutObject(req *request) error {
 		ETag:            etag,
 		ChecksumSHA256:  checksum,
 		LocationRef:     locationRef,
-		CreatedAt:       time.Now().UTC(),
-		MetadataHeaders: params.Metadata,
+		CreatedAt:       now,
+		MetadataHeaders: metadata,
 	}
 
 	prev, err := h.db.PutObjectMeta(obj)
@@ -115,27 +87,20 @@ func (h *connHandler) handlePutObject(req *request) error {
 		h.store.DeleteObject(prev.LocationRef)
 	}
 
-	resp, err := json.Marshal(putObjectResponse{
-		ETag:           etag,
-		ChecksumSHA256: checksum,
-	})
-	if err != nil {
-		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
-	}
-	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
+	return h.writeResponseCombined(StatusOK, req.streamID, EncodePutResponse(etag, checksum))
 }
 
 func (h *connHandler) handleGetObject(req *request) error {
-	var params objectRequest
-	if err := json.Unmarshal(req.meta, &params); err != nil {
+	bucket, key, err := DecodeBucketKey(req.meta)
+	if err != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionObjectGet, params.Bucket, params.Key); err != nil {
+	if err := h.auth.Authorize(h.token, meta.ActionObjectGet, bucket, key); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	bucket, err := h.db.GetBucket(params.Bucket)
+	bkt, err := h.db.GetBucket(bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrBucketNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
@@ -143,7 +108,7 @@ func (h *connHandler) handleGetObject(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	obj, err := h.db.GetObjectMeta(bucket.ID, params.Key)
+	obj, err := h.db.GetObjectMeta(bkt.ID, key)
 	if err != nil {
 		if errors.Is(err, meta.ErrObjectNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "object not found", "NoSuchKey")
@@ -158,32 +123,26 @@ func (h *connHandler) handleGetObject(req *request) error {
 	}
 	defer f.Close()
 
-	resp, err := json.Marshal(objectInfoResponse{
-		ContentType:    obj.ContentType,
-		Size:           obj.SizeBytes,
-		ETag:           obj.ETag,
-		ChecksumSHA256: obj.ChecksumSHA256,
-		LastModified:   obj.UpdatedAt.Format(time.RFC3339),
-		Metadata:       obj.MetadataHeaders,
-	})
-	if err != nil {
-		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
-	}
-
+	resp := EncodeObjectInfo(
+		obj.ContentType, obj.SizeBytes,
+		obj.ETag, obj.ChecksumSHA256,
+		obj.UpdatedAt.Format(time.RFC3339),
+		obj.MetadataHeaders,
+	)
 	return h.writeResponse(StatusOK, req.streamID, resp, f, obj.SizeBytes)
 }
 
 func (h *connHandler) handleHeadObject(req *request) error {
-	var params objectRequest
-	if err := json.Unmarshal(req.meta, &params); err != nil {
+	bucket, key, err := DecodeBucketKey(req.meta)
+	if err != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionObjectGet, params.Bucket, params.Key); err != nil {
+	if err := h.auth.Authorize(h.token, meta.ActionObjectGet, bucket, key); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	bucket, err := h.db.GetBucket(params.Bucket)
+	bkt, err := h.db.GetBucket(bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrBucketNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
@@ -191,7 +150,7 @@ func (h *connHandler) handleHeadObject(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	obj, err := h.db.GetObjectMeta(bucket.ID, params.Key)
+	obj, err := h.db.GetObjectMeta(bkt.ID, key)
 	if err != nil {
 		if errors.Is(err, meta.ErrObjectNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "object not found", "NoSuchKey")
@@ -199,32 +158,26 @@ func (h *connHandler) handleHeadObject(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	resp, err := json.Marshal(objectInfoResponse{
-		ContentType:    obj.ContentType,
-		Size:           obj.SizeBytes,
-		ETag:           obj.ETag,
-		ChecksumSHA256: obj.ChecksumSHA256,
-		LastModified:   obj.UpdatedAt.Format(time.RFC3339),
-		Metadata:       obj.MetadataHeaders,
-	})
-	if err != nil {
-		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
-	}
-
-	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
+	resp := EncodeObjectInfo(
+		obj.ContentType, obj.SizeBytes,
+		obj.ETag, obj.ChecksumSHA256,
+		obj.UpdatedAt.Format(time.RFC3339),
+		obj.MetadataHeaders,
+	)
+	return h.writeResponseCombined(StatusOK, req.streamID, resp)
 }
 
 func (h *connHandler) handleDeleteObject(req *request) error {
-	var params objectRequest
-	if err := json.Unmarshal(req.meta, &params); err != nil {
+	bucket, key, err := DecodeBucketKey(req.meta)
+	if err != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionObjectDelete, params.Bucket, params.Key); err != nil {
+	if err := h.auth.Authorize(h.token, meta.ActionObjectDelete, bucket, key); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	bucket, err := h.db.GetBucket(params.Bucket)
+	bkt, err := h.db.GetBucket(bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrBucketNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
@@ -232,10 +185,9 @@ func (h *connHandler) handleDeleteObject(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	obj, err := h.db.DeleteObjectMeta(bucket.ID, params.Key)
+	obj, err := h.db.DeleteObjectMeta(bkt.ID, key)
 	if err != nil {
 		if errors.Is(err, meta.ErrObjectNotFound) {
-			// Return OK for deleting non-existent objects (like S3)
 			return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
@@ -252,9 +204,6 @@ func (h *connHandler) handleDeleteObject(req *request) error {
 // MaxDrainSize, indicating the connection must be closed.
 var errDataTooLarge = fmt.Errorf("data too large to drain, closing connection")
 
-// drainData drains remaining data from a request's data reader.
-// If dataLen exceeds MaxDrainSize, it returns errDataTooLarge to signal
-// the caller that the connection is in a corrupt state and must be closed.
 func drainData(req *request) error {
 	if req.data == nil || req.dataLen == 0 {
 		return nil

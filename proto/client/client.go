@@ -2,7 +2,6 @@ package client
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -280,8 +279,8 @@ func (c *Client) doRequestWithDataResponse(op byte, meta []byte) (status byte, r
 
 // connReader wraps a limited reader over a pooled connection.
 // Closing it returns the connection to the pool.
+// Not safe for concurrent use — a single GetObject result must be consumed by one goroutine.
 type connReader struct {
-	mu     sync.Mutex
 	r      io.Reader
 	cn     *conn
 	client *Client
@@ -290,21 +289,16 @@ type connReader struct {
 }
 
 func (cr *connReader) Read(p []byte) (int, error) {
-	cr.mu.Lock()
-	defer cr.mu.Unlock()
 	n, err := cr.r.Read(p)
 	cr.remain -= int64(n)
 	return n, err
 }
 
 func (cr *connReader) Close() error {
-	cr.mu.Lock()
-	defer cr.mu.Unlock()
 	if cr.closed {
 		return nil
 	}
 	cr.closed = true
-	// Drain remaining data
 	if cr.remain > 0 {
 		if _, err := io.CopyN(io.Discard, cr.r, cr.remain); err != nil {
 			cr.client.dropConn(cr.cn)
@@ -335,13 +329,10 @@ func checkError(status byte, meta []byte) error {
 	}
 	e := &Error{Status: status}
 	if len(meta) > 0 {
-		var resp struct {
-			Error string `json:"error"`
-			Code  string `json:"code"`
-		}
-		if err := json.Unmarshal(meta, &resp); err == nil {
-			e.Message = resp.Error
-			e.Code = resp.Code
+		msg, code, err := proto.DecodeError(meta)
+		if err == nil {
+			e.Message = msg
+			e.Code = code
 		}
 	}
 	if e.Message == "" {
