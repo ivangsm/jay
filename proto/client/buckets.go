@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/ivangsm/jay/proto"
@@ -32,7 +33,9 @@ func (c *Client) CreateBucket(name string) (*BucketInfo, error) {
 		return nil, err
 	}
 	var info BucketInfo
-	json.Unmarshal(respMeta, &info)
+	if err := json.Unmarshal(respMeta, &info); err != nil {
+		return nil, fmt.Errorf("unmarshal create bucket response: %w", err)
+	}
 	return &info, nil
 }
 
@@ -57,7 +60,9 @@ func (c *Client) HeadBucket(name string) (*BucketInfo, error) {
 		return nil, err
 	}
 	var info BucketInfo
-	json.Unmarshal(respMeta, &info)
+	if err := json.Unmarshal(respMeta, &info); err != nil {
+		return nil, fmt.Errorf("unmarshal head bucket response: %w", err)
+	}
 	return &info, nil
 }
 
@@ -73,7 +78,9 @@ func (c *Client) ListBuckets() ([]BucketEntry, error) {
 	var result struct {
 		Buckets []BucketEntry `json:"buckets"`
 	}
-	json.Unmarshal(respMeta, &result)
+	if err := json.Unmarshal(respMeta, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal list buckets response: %w", err)
+	}
 	return result.Buckets, nil
 }
 

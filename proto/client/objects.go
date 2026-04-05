@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 
 	"github.com/ivangsm/jay/proto"
@@ -61,7 +62,9 @@ func (c *Client) PutObject(bucket, key string, data io.Reader, size int64, opts 
 		return nil, err
 	}
 	var result PutResult
-	json.Unmarshal(respMeta, &result)
+	if err := json.Unmarshal(respMeta, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal put response: %w", err)
+	}
 	return &result, nil
 }
 
@@ -81,7 +84,12 @@ func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
 	}
 
 	var info ObjectInfo
-	json.Unmarshal(respMeta, &info)
+	if err := json.Unmarshal(respMeta, &info); err != nil {
+		if dataReader != nil {
+			dataReader.Close()
+		}
+		return nil, fmt.Errorf("unmarshal get response: %w", err)
+	}
 
 	result := &GetResult{ObjectInfo: info}
 	if dataReader != nil {
@@ -103,7 +111,9 @@ func (c *Client) HeadObject(bucket, key string) (*ObjectInfo, error) {
 		return nil, err
 	}
 	var info ObjectInfo
-	json.Unmarshal(respMeta, &info)
+	if err := json.Unmarshal(respMeta, &info); err != nil {
+		return nil, fmt.Errorf("unmarshal head response: %w", err)
+	}
 	return &info, nil
 }
 

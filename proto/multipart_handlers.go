@@ -109,25 +109,34 @@ func (h *connHandler) handleCreateMultipartUpload(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	resp, _ := json.Marshal(createMultipartResponse{UploadID: upload.UploadID})
+	resp, err := json.Marshal(createMultipartResponse{UploadID: upload.UploadID})
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }
 
 func (h *connHandler) handleUploadPart(req *request) error {
 	var params uploadPartRequest
 	if err := json.Unmarshal(req.meta, &params); err != nil {
-		drainData(req)
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
 	if err := h.auth.Authorize(h.token, meta.ActionMultipartUpload, params.Bucket, params.Key); err != nil {
-		drainData(req)
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	upload, err := h.db.GetMultipartUpload(params.UploadID)
 	if err != nil {
-		drainData(req)
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		if errors.Is(err, meta.ErrUploadNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
 		}
@@ -135,8 +144,17 @@ func (h *connHandler) handleUploadPart(req *request) error {
 	}
 
 	if upload.State != "initiated" {
-		drainData(req)
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		return h.writeError(StatusBadRequest, req.streamID, "upload not active", "InvalidArgument")
+	}
+
+	if params.PartNumber < 1 || params.PartNumber > meta.MaxMultipartParts {
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
+		return h.writeError(StatusBadRequest, req.streamID, "part number must be between 1 and 10000", "InvalidArgument")
 	}
 
 	md5Hash := md5.New()
@@ -164,11 +182,15 @@ func (h *connHandler) handleUploadPart(req *request) error {
 	}
 
 	if err := h.db.AddMultipartPart(params.UploadID, part); err != nil {
+		h.store.Cleanup(locationRef)
 		h.log.Error("add part meta", "err", err)
 		return h.writeError(StatusInternal, req.streamID, "failed to register part", "InternalError")
 	}
 
-	resp, _ := json.Marshal(uploadPartResponse{ETag: etag, ChecksumSHA256: checksum})
+	resp, err := json.Marshal(uploadPartResponse{ETag: etag, ChecksumSHA256: checksum})
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }
 
@@ -228,7 +250,7 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 
 	prev, err := h.db.PutObjectMeta(obj)
 	if err != nil {
-		h.store.DeleteObject(locationRef)
+		h.store.Cleanup(locationRef)
 		return h.writeError(StatusInternal, req.streamID, "failed to store metadata", "InternalError")
 	}
 
@@ -239,11 +261,14 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 	h.store.CleanupUploadParts(params.UploadID)
 	h.db.DeleteMultipartUpload(params.UploadID)
 
-	resp, _ := json.Marshal(completeMultipartResponse{
+	resp, err := json.Marshal(completeMultipartResponse{
 		ETag:           etag,
 		ChecksumSHA256: checksum,
 		Size:           size,
 	})
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }
 
@@ -299,7 +324,10 @@ func (h *connHandler) handleListParts(req *request) error {
 		})
 	}
 
-	resp, _ := json.Marshal(response)
+	resp, err := json.Marshal(response)
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }
 

@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 
 	"github.com/ivangsm/jay/proto"
@@ -47,7 +48,9 @@ func (c *Client) CreateMultipartUpload(bucket, key string, opts *PutOptions) (st
 	var resp struct {
 		UploadID string `json:"upload_id"`
 	}
-	json.Unmarshal(respMeta, &resp)
+	if err := json.Unmarshal(respMeta, &resp); err != nil {
+		return "", fmt.Errorf("unmarshal create multipart response: %w", err)
+	}
 	return resp.UploadID, nil
 }
 
@@ -79,7 +82,9 @@ func (c *Client) UploadPart(bucket, key, uploadID string, partNumber int, data i
 	var resp struct {
 		ETag string `json:"etag"`
 	}
-	json.Unmarshal(respMeta, &resp)
+	if err := json.Unmarshal(respMeta, &resp); err != nil {
+		return "", fmt.Errorf("unmarshal upload part response: %w", err)
+	}
 	return resp.ETag, nil
 }
 
@@ -113,7 +118,9 @@ func (c *Client) CompleteMultipartUpload(bucket, key, uploadID string, parts []C
 	}
 
 	var result PutResult
-	json.Unmarshal(respMeta, &result)
+	if err := json.Unmarshal(respMeta, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal complete multipart response: %w", err)
+	}
 	return &result, nil
 }
 
@@ -161,6 +168,8 @@ func (c *Client) ListParts(bucket, key, uploadID string) ([]PartInfo, error) {
 	var resp struct {
 		Parts []PartInfo `json:"parts"`
 	}
-	json.Unmarshal(respMeta, &resp)
+	if err := json.Unmarshal(respMeta, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshal list parts response: %w", err)
+	}
 	return resp.Parts, nil
 }

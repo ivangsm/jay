@@ -77,6 +77,9 @@ func (h *connHandler) handleListObjects(req *request) error {
 		})
 	}
 
-	resp, _ := json.Marshal(response)
+	resp, err := json.Marshal(response)
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }

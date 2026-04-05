@@ -55,12 +55,15 @@ func (h *connHandler) handleCreateBucket(req *request) error {
 
 	h.store.EnsureBucketDir(bucket.ID)
 
-	resp, _ := json.Marshal(bucketInfoResponse{
+	resp, err := json.Marshal(bucketInfoResponse{
 		BucketID:   bucket.ID,
 		Name:       bucket.Name,
 		CreatedAt:  bucket.CreatedAt.Format(time.RFC3339),
 		Visibility: bucket.Visibility,
 	})
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }
 
@@ -111,12 +114,15 @@ func (h *connHandler) handleHeadBucket(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	resp, _ := json.Marshal(bucketInfoResponse{
+	resp, err := json.Marshal(bucketInfoResponse{
 		BucketID:   bucket.ID,
 		Name:       bucket.Name,
 		CreatedAt:  bucket.CreatedAt.Format(time.RFC3339),
 		Visibility: bucket.Visibility,
 	})
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }
 
@@ -147,6 +153,9 @@ func (h *connHandler) handleListBuckets(req *request) error {
 		})
 	}
 
-	resp, _ := json.Marshal(result)
+	resp, err := json.Marshal(result)
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }

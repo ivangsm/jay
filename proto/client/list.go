@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/ivangsm/jay/proto"
 )
@@ -59,6 +60,8 @@ func (c *Client) ListObjects(bucket string, opts *ListOptions) (*ListResult, err
 		return nil, err
 	}
 	var result ListResult
-	json.Unmarshal(respMeta, &result)
+	if err := json.Unmarshal(respMeta, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal list objects response: %w", err)
+	}
 	return &result, nil
 }
