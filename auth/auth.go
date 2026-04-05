@@ -1,11 +1,13 @@
 package auth
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ivangsm/jay/meta"
@@ -20,14 +22,41 @@ var (
 	ErrAccessDenied       = errors.New("access denied")
 )
 
+const authCacheTTL = 5 * time.Minute
+
+// authCacheEntry stores a validated token with an expiry time.
+type authCacheEntry struct {
+	token     *meta.Token
+	expiresAt time.Time
+}
+
 // Auth handles authentication and authorization.
 type Auth struct {
-	db *meta.DB
+	db    *meta.DB
+	mu    sync.RWMutex
+	cache map[[32]byte]authCacheEntry
 }
 
 // New creates an Auth instance.
 func New(db *meta.DB) *Auth {
-	return &Auth{db: db}
+	return &Auth{db: db, cache: make(map[[32]byte]authCacheEntry)}
+}
+
+// cacheKey produces a SHA-256 hash of tokenID:secret for cache lookup.
+func cacheKey(tokenID, secret string) [32]byte {
+	return sha256.Sum256([]byte(tokenID + ":" + secret))
+}
+
+// InvalidateToken removes all cache entries for a given token ID.
+// Call this when a token is revoked or modified.
+func (a *Auth) InvalidateToken(tokenID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for k, v := range a.cache {
+		if v.token.TokenID == tokenID {
+			delete(a.cache, k)
+		}
+	}
 }
 
 // Authenticate extracts and validates credentials from the request.
@@ -63,6 +92,25 @@ func (a *Auth) AuthenticateCredentials(tokenID, secret string) (*meta.Token, err
 }
 
 func (a *Auth) validateToken(tokenID, secret string) (*meta.Token, error) {
+	// Fast path: check cache with a read lock.
+	key := cacheKey(tokenID, secret)
+	now := time.Now()
+
+	a.mu.RLock()
+	if entry, ok := a.cache[key]; ok && now.Before(entry.expiresAt) {
+		a.mu.RUnlock()
+		// Re-check revocation/expiry on the cached token without bcrypt.
+		if entry.token.Status == "revoked" {
+			return nil, ErrTokenRevoked
+		}
+		if entry.token.ExpiresAt != nil && now.After(*entry.token.ExpiresAt) {
+			return nil, ErrTokenExpired
+		}
+		return entry.token, nil
+	}
+	a.mu.RUnlock()
+
+	// Slow path: full validation with bcrypt.
 	token, err := a.db.GetToken(tokenID)
 	if err != nil {
 		if errors.Is(err, meta.ErrTokenNotFound) {
@@ -75,7 +123,7 @@ func (a *Auth) validateToken(tokenID, secret string) (*meta.Token, error) {
 		return nil, ErrTokenRevoked
 	}
 
-	if token.ExpiresAt != nil && time.Now().After(*token.ExpiresAt) {
+	if token.ExpiresAt != nil && now.After(*token.ExpiresAt) {
 		return nil, ErrTokenExpired
 	}
 
@@ -91,6 +139,11 @@ func (a *Auth) validateToken(tokenID, secret string) (*meta.Token, error) {
 	if account.Status != "active" {
 		return nil, ErrAccessDenied
 	}
+
+	// Store in cache.
+	a.mu.Lock()
+	a.cache[key] = authCacheEntry{token: token, expiresAt: now.Add(authCacheTTL)}
+	a.mu.Unlock()
 
 	return token, nil
 }

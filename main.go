@@ -109,7 +109,7 @@ func main() {
 	// Admin API handler (on separate port)
 	adminMux := http.NewServeMux()
 	tlsEnabled := cfg.TLSCert != "" && cfg.TLSKey != ""
-	adminHandler := admin.NewHandler(db, cfg.AdminToken, log, metrics, st, cfg.SigningSecret, cfg.ListenAddr, tlsEnabled)
+	adminHandler := admin.NewHandler(db, cfg.AdminToken, log, metrics, st, cfg.SigningSecret, cfg.ListenAddr, tlsEnabled, au)
 	adminMux.Handle("/_jay/", adminHandler)
 
 	// Health checks

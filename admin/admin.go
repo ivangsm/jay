@@ -31,6 +31,7 @@ type authFailure struct {
 type Handler struct {
 	db            *meta.DB
 	store         *store.Store
+	auth          *auth.Auth
 	adminToken    string
 	log           *slog.Logger
 	metrics       *maintenance.Metrics
@@ -47,8 +48,8 @@ const (
 )
 
 // NewHandler creates a new admin API handler.
-func NewHandler(db *meta.DB, adminToken string, log *slog.Logger, metrics *maintenance.Metrics, st *store.Store, signingSecret, listenAddr string, tlsEnabled bool) *Handler {
-	return &Handler{db: db, store: st, adminToken: adminToken, log: log, metrics: metrics, signingSecret: signingSecret, listenAddr: listenAddr, tlsEnabled: tlsEnabled}
+func NewHandler(db *meta.DB, adminToken string, log *slog.Logger, metrics *maintenance.Metrics, st *store.Store, signingSecret, listenAddr string, tlsEnabled bool, au *auth.Auth) *Handler {
+	return &Handler{db: db, store: st, auth: au, adminToken: adminToken, log: log, metrics: metrics, signingSecret: signingSecret, listenAddr: listenAddr, tlsEnabled: tlsEnabled}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +261,9 @@ func (h *Handler) handleRevokeToken(w http.ResponseWriter, _ *http.Request, toke
 		h.log.Error("revoke token", "err", err)
 		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 		return
+	}
+	if h.auth != nil {
+		h.auth.InvalidateToken(tokenID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

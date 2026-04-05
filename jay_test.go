@@ -66,7 +66,7 @@ func setup(t *testing.T) *testEnv {
 	s3Srv := httptest.NewServer(s3Handler)
 	t.Cleanup(s3Srv.Close)
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false)
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false, au)
 	adminSrv := httptest.NewServer(adminHandler)
 	t.Cleanup(adminSrv.Close)
 
@@ -481,7 +481,7 @@ func setupWithSigning(t *testing.T) *testEnv {
 	s3Srv := httptest.NewServer(s3Handler)
 	t.Cleanup(s3Srv.Close)
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, signingSecret, s3Srv.Listener.Addr().String(), false)
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, signingSecret, s3Srv.Listener.Addr().String(), false, au)
 	adminSrv := httptest.NewServer(adminHandler)
 	t.Cleanup(adminSrv.Close)
 
@@ -1015,7 +1015,7 @@ func TestQuarantineListAndPurge(t *testing.T) {
 	s3Srv := httptest.NewServer(s3Handler)
 	defer s3Srv.Close()
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false)
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false, au)
 	adminSrv := httptest.NewServer(adminHandler)
 	defer adminSrv.Close()
 
@@ -1131,7 +1131,7 @@ func TestRateLimiting(t *testing.T) {
 	s3Srv := httptest.NewServer(s3Handler)
 	defer s3Srv.Close()
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false)
+	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false, au)
 	adminSrv := httptest.NewServer(adminHandler)
 	defer adminSrv.Close()
 
