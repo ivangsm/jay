@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -76,7 +77,14 @@ func (gc *GC) cleanOldTempFiles() {
 		return
 	}
 
-	cutoff := time.Now().Add(-1 * time.Hour)
+	now := time.Now()
+	// Completed temp files (no .writing suffix) are eligible after 1 hour.
+	completedCutoff := now.Add(-1 * time.Hour)
+	// Files still marked .writing are only deleted after 24 hours, as they
+	// may belong to a slow but active upload. After 24 hours they are
+	// considered truly abandoned.
+	writingCutoff := now.Add(-24 * time.Hour)
+
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -85,11 +93,24 @@ func (gc *GC) cleanOldTempFiles() {
 		if err != nil {
 			continue
 		}
+
+		name := e.Name()
+		isWriting := strings.HasSuffix(name, ".writing")
+
+		var cutoff time.Time
+		if isWriting {
+			cutoff = writingCutoff
+		} else {
+			cutoff = completedCutoff
+		}
+
 		if info.ModTime().Before(cutoff) {
-			path := filepath.Join(tmpDir, e.Name())
+			path := filepath.Join(tmpDir, name)
 			if err := os.Remove(path); err == nil {
 				gc.FilesCollected.Add(1)
-				gc.log.Info("gc: removed stale temp file", "file", e.Name())
+				gc.log.Info("gc: removed stale temp file",
+					"file", name,
+					"age", now.Sub(info.ModTime()).Round(time.Second))
 			}
 		}
 	}
