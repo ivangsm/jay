@@ -48,9 +48,11 @@ func (h *Handler) withRequestID(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// withLogging logs each request with structured logging.
+// withLogging logs each request with structured logging and adds security headers.
 func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: 200}
 		next(sw, r)

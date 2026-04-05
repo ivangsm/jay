@@ -120,6 +120,7 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 	}
 
 	if err := h.db.AddMultipartPart(uploadID, part); err != nil {
+		h.store.Cleanup(locationRef)
 		h.log.Error("add part meta", "err", err, "upload", uploadID, "part", partNumber)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to register part", "/"+bucketName+"/"+objectKey)
 		return
@@ -201,7 +202,7 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	prev, err := h.db.PutObjectMeta(obj)
 	if err != nil {
-		h.store.DeleteObject(locationRef)
+		h.store.Cleanup(locationRef)
 		h.log.Error("put object meta", "err", err, "upload", uploadID)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to store metadata", "/"+bucketName+"/"+objectKey)
 		return

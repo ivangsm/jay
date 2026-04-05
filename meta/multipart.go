@@ -10,10 +10,14 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+const MaxMultipartParts = 10000
+
 var (
-	bucketMultipart   = []byte("multipart")
-	ErrUploadNotFound = errors.New("upload not found")
+	bucketMultipart    = []byte("multipart")
+	ErrUploadNotFound  = errors.New("upload not found")
 	ErrUploadNotActive = errors.New("upload is not active")
+	ErrInvalidPartNumber = errors.New("part number must be between 1 and 10000")
+	ErrTooManyParts    = errors.New("upload exceeds maximum number of parts (10000)")
 )
 
 // ensureMultipartBucket creates the multipart bbolt bucket if needed.
@@ -67,6 +71,10 @@ func (db *DB) GetMultipartUpload(uploadID string) (*MultipartUpload, error) {
 
 // AddMultipartPart adds or replaces a part in a multipart upload.
 func (db *DB) AddMultipartPart(uploadID string, part MultipartPart) error {
+	if part.PartNumber < 1 || part.PartNumber > MaxMultipartParts {
+		return ErrInvalidPartNumber
+	}
+
 	return db.bolt.Update(func(tx *bolt.Tx) error {
 		bk := tx.Bucket(bucketMultipart)
 		if bk == nil {
@@ -94,6 +102,9 @@ func (db *DB) AddMultipartPart(uploadID string, part MultipartPart) error {
 			}
 		}
 		if !found {
+			if len(upload.Parts) >= MaxMultipartParts {
+				return ErrTooManyParts
+			}
 			upload.Parts = append(upload.Parts, part)
 		}
 
@@ -127,6 +138,13 @@ func (db *DB) CompleteMultipartUpload(uploadID string, partNumbers []int) (*Mult
 		}
 		if upload.State != "initiated" {
 			return ErrUploadNotActive
+		}
+
+		// Validate part numbers are in valid range
+		for _, pn := range partNumbers {
+			if pn < 1 || pn > MaxMultipartParts {
+				return fmt.Errorf("invalid part number %d", pn)
+			}
 		}
 
 		// Validate all requested parts exist

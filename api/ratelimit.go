@@ -2,6 +2,7 @@ package api
 
 import (
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -17,7 +18,7 @@ type RateLimiterConfig struct {
 // rateLimiter implements per-token token bucket rate limiting.
 type rateLimiter struct {
 	config  RateLimiterConfig
-	buckets sync.Map // map[string]*tokenBucket (key = token ID or "__anonymous__")
+	buckets sync.Map // map[string]*tokenBucket (key = token ID or "ip:<addr>")
 }
 
 type tokenBucket struct {
@@ -79,9 +80,11 @@ func (h *Handler) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		key := "__anonymous__"
+		var key string
 		if token := tokenFromContext(r.Context()); token != nil {
 			key = token.TokenID
+		} else {
+			key = "ip:" + clientIP(r)
 		}
 
 		if !h.rateLimiter.allow(key) {
@@ -92,4 +95,48 @@ func (h *Handler) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// clientIP extracts the client IP address from the request.
+// It checks X-Forwarded-For (using only the rightmost/last entry, which is
+// the most recently appended by a trusted proxy) and falls back to
+// r.RemoteAddr with the port stripped.
+func clientIP(r *http.Request) string {
+	// X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2".
+	// The last entry is the one appended by the closest (most trusted) proxy.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Find the last comma-separated value.
+		for i := len(xff) - 1; i >= 0; i-- {
+			if xff[i] == ',' {
+				ip := trimSpace(xff[i+1:])
+				if ip != "" {
+					return ip
+				}
+			}
+		}
+		// No comma found — single value.
+		ip := trimSpace(xff)
+		if ip != "" {
+			return ip
+		}
+	}
+
+	// Fall back to RemoteAddr, stripping the port.
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// RemoteAddr may already lack a port.
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// trimSpace trims leading and trailing ASCII spaces (avoids importing strings).
+func trimSpace(s string) string {
+	for len(s) > 0 && s[0] == ' ' {
+		s = s[1:]
+	}
+	for len(s) > 0 && s[len(s)-1] == ' ' {
+		s = s[:len(s)-1]
+	}
+	return s
 }

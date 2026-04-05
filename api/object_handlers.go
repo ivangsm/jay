@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
-	"github.com/google/uuid"
 )
 
 // handlePutObject handles PUT /<bucket>/<key>
@@ -65,7 +65,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	for k, v := range r.Header {
 		lk := strings.ToLower(k)
 		if strings.HasPrefix(lk, "x-amz-meta-") && len(v) > 0 {
-			userMeta[lk] = v[0]
+			userMeta[lk] = sanitizeHeaderValue(v[0])
 		}
 	}
 
@@ -87,7 +87,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	prev, err := h.db.PutObjectMeta(obj)
 	if err != nil {
 		// Metadata commit failed — clean up the physical file
-		h.store.DeleteObject(locationRef)
+		h.store.Cleanup(locationRef)
 		h.log.Error("put object meta", "err", err, "bucket", bucketName, "key", objectKey)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 			"Failed to store metadata", "/"+bucketName+"/"+objectKey)
@@ -324,6 +324,11 @@ func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// sanitizeHeaderValue removes \r and \n characters to prevent CRLF header injection.
+func sanitizeHeaderValue(v string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(v)
+}
+
 // parseRange parses a Range header value like "bytes=0-499" or "bytes=-500" or "bytes=500-".
 // Returns start, end (inclusive), and whether the range is valid.
 func parseRange(rangeHeader string, totalSize int64) (start, end int64, ok bool) {
@@ -347,10 +352,7 @@ func parseRange(rangeHeader string, totalSize int64) (start, end int64, ok bool)
 		if err != nil || suffix <= 0 {
 			return 0, 0, false
 		}
-		start = totalSize - suffix
-		if start < 0 {
-			start = 0
-		}
+		start = max(totalSize-suffix, 0)
 		return start, totalSize - 1, true
 	}
 
