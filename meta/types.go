@@ -42,6 +42,7 @@ type Token struct {
 	AccountID      string     `json:"account_id"`
 	Name           string     `json:"name"`
 	SecretHash     string     `json:"secret_hash"`
+	SecretKey      string     `json:"secret_key,omitempty"` // plaintext secret for SigV4 HMAC computation
 	AllowedActions []string   `json:"allowed_actions"`
 	BucketScope    []string   `json:"bucket_scope,omitempty"`
 	PrefixScope    []string   `json:"prefix_scope,omitempty"`

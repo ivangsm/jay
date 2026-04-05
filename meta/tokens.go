@@ -90,8 +90,9 @@ func (db *DB) ListTokens(accountID string) ([]Token, error) {
 				return nil
 			}
 			if accountID == "" || t.AccountID == accountID {
-				// Don't expose the secret hash in listings
+				// Don't expose secrets in listings
 				t.SecretHash = ""
+				t.SecretKey = ""
 				tokens = append(tokens, t)
 			}
 			return nil

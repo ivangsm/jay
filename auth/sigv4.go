@@ -3,8 +3,10 @@ package auth
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -12,6 +14,9 @@ import (
 
 	"github.com/ivangsm/jay/meta"
 )
+
+// maxClockSkew is the maximum allowed time difference between client and server.
+const maxClockSkew = 15 * time.Minute
 
 // AuthenticateSigV4 validates AWS Signature V4 auth from an HTTP request.
 // Format: AWS4-HMAC-SHA256 Credential=<access-key>/<date>/<region>/s3/aws4_request,
@@ -51,36 +56,29 @@ func (a *Auth) AuthenticateSigV4(r *http.Request) (*meta.Token, error) {
 		return nil, ErrTokenExpired
 	}
 
-	// For SigV4, we need the raw secret (not hashed).
-	// We store bcrypt hash which is one-way, so we can't do real SigV4 verification.
-	// Instead, we store the secret also as a plain field for SigV4 support.
-	// For now, we use a simplified approach: we trust that if the access key is valid
-	// and the signature format is correct, the request is authenticated.
-	// This is a practical tradeoff - full SigV4 requires storing the raw secret.
-	//
-	// A more complete implementation would store secrets in a way that supports
-	// both bcrypt verification (for Bearer) and HMAC computation (for SigV4).
-	// For now, we compute the expected signature using the token's SecretPlain field.
+	// Validate request timestamp to prevent replay attacks.
+	amzDate := r.Header.Get("X-Amz-Date")
+	if amzDate == "" {
+		amzDate = r.Header.Get("Date")
+	}
+	if err := validateTimestamp(amzDate, dateStr); err != nil {
+		return nil, err
+	}
 
-	secret := token.SecretHash // This won't work for real SigV4 - see note above
+	// SigV4 requires the plaintext secret for HMAC computation.
+	if token.SecretKey == "" {
+		return nil, ErrInvalidCredentials
+	}
 
-	// For practical compatibility, we'll verify the signature if we have the plain secret
-	// Otherwise, we accept the request if the access key is valid (simplified mode)
-	if token.SecretHash != "" {
-		// Compute SigV4 signature
-		signingKey := deriveSigningKey(secret, dateStr, region, "s3")
-		canonicalRequest := buildCanonicalRequest(r, signedHeadersStr)
-		amzDate := r.Header.Get("x-amz-date")
-		if amzDate == "" {
-			amzDate = r.Header.Get("Date")
-		}
-		stringToSign := buildStringToSign(dateStr, amzDate, region, canonicalRequest)
-		expectedSig := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
+	// Compute the expected SigV4 signature using the plaintext secret.
+	signingKey := deriveSigningKey(token.SecretKey, dateStr, region, "s3")
+	canonicalRequest := buildCanonicalRequest(r, signedHeadersStr)
+	stringToSign := buildStringToSign(dateStr, amzDate, region, canonicalRequest)
+	expectedSig := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 
-		// In simplified mode, we skip signature verification since we don't have the plain secret
-		// The access key lookup + valid token is sufficient auth
-		_ = expectedSig
-		_ = providedSig
+	// Constant-time comparison to prevent timing attacks.
+	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(providedSig)) != 1 {
+		return nil, ErrInvalidCredentials
 	}
 
 	// Verify account
@@ -99,7 +97,7 @@ func parseSigV4Header(header string) map[string]string {
 	header = strings.TrimPrefix(header, "AWS4-HMAC-SHA256 ")
 	result := make(map[string]string)
 
-	for _, part := range strings.Split(header, ",") {
+	for part := range strings.SplitSeq(header, ",") {
 		part = strings.TrimSpace(part)
 		key, value, found := strings.Cut(part, "=")
 		if !found {
@@ -178,4 +176,43 @@ func hmacSHA256(key, data []byte) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write(data)
 	return h.Sum(nil)
+}
+
+// validateTimestamp checks that the request timestamp is within ±15 minutes of
+// current server time, preventing replay attacks.
+func validateTimestamp(amzDate, credentialDate string) error {
+	if amzDate == "" {
+		return ErrInvalidCredentials
+	}
+
+	var reqTime time.Time
+	var err error
+
+	// Try ISO 8601 basic format (X-Amz-Date: 20130524T000000Z)
+	reqTime, err = time.Parse("20060102T150405Z", amzDate)
+	if err != nil {
+		// Try RFC 2616 / HTTP-date formats
+		reqTime, err = time.Parse(time.RFC1123, amzDate)
+		if err != nil {
+			reqTime, err = time.Parse(time.RFC1123Z, amzDate)
+			if err != nil {
+				return ErrInvalidCredentials
+			}
+		}
+	}
+
+	// Also validate that the credential date matches the request date.
+	if credentialDate != "" {
+		expectedDate := reqTime.UTC().Format("20060102")
+		if credentialDate != expectedDate {
+			return ErrInvalidCredentials
+		}
+	}
+
+	skew := time.Duration(math.Abs(float64(time.Since(reqTime))))
+	if skew > maxClockSkew {
+		return fmt.Errorf("%w: request timestamp is too far from server time", ErrInvalidCredentials)
+	}
+
+	return nil
 }
