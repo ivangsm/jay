@@ -3,7 +3,9 @@ package proto
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,7 +35,10 @@ func (h *connHandler) handleCreateBucket(req *request) error {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	if !validBucketName.MatchString(params.Bucket) {
+	if !validBucketName.MatchString(params.Bucket) ||
+		strings.Contains(params.Bucket, "..") ||
+		strings.Contains(params.Bucket, "--") ||
+		net.ParseIP(params.Bucket) != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid bucket name", "InvalidBucketName")
 	}
 

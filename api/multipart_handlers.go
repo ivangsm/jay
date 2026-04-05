@@ -117,6 +117,7 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		ETag:           etag,
 		ChecksumSHA256: checksum,
 		LocationRef:    locationRef,
+		CreatedAt:      time.Now().UTC(),
 	}
 
 	if err := h.db.AddMultipartPart(uploadID, part); err != nil {
@@ -212,9 +213,13 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		h.store.DeleteObject(prev.LocationRef)
 	}
 
-	// Cleanup parts
-	h.store.CleanupUploadParts(uploadID)
-	h.db.DeleteMultipartUpload(uploadID)
+	// Cleanup parts (best-effort)
+	if err := h.store.CleanupUploadParts(uploadID); err != nil {
+		h.log.Warn("cleanup upload parts", "err", err, "upload_id", uploadID)
+	}
+	if err := h.db.DeleteMultipartUpload(uploadID); err != nil {
+		h.log.Warn("delete multipart upload record", "err", err, "upload_id", uploadID)
+	}
 
 	writeXML(w, r, http.StatusOK, CompleteMultipartUploadResult{
 		XMLNS:    s3Namespace,
@@ -242,9 +247,13 @@ func (h *Handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Cleanup part files
-	h.store.CleanupUploadParts(upload.UploadID)
-	h.db.DeleteMultipartUpload(uploadID)
+	// Cleanup part files (best-effort)
+	if err := h.store.CleanupUploadParts(upload.UploadID); err != nil {
+		h.log.Warn("cleanup upload parts", "err", err, "upload_id", upload.UploadID)
+	}
+	if err := h.db.DeleteMultipartUpload(uploadID); err != nil {
+		h.log.Warn("delete multipart upload record", "err", err, "upload_id", uploadID)
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }

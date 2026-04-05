@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,6 +26,20 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 	if !found || srcKey == "" {
 		writeS3Error(w, r, http.StatusBadRequest, S3ErrInvalidArgument,
 			"Invalid x-amz-copy-source", "/"+dstBucket+"/"+dstKey)
+		return
+	}
+
+	// URL-decode source bucket and key
+	srcBucket, err := url.PathUnescape(srcBucket)
+	if err != nil {
+		writeS3Error(w, r, http.StatusBadRequest, S3ErrInvalidArgument,
+			"Invalid copy source", copySource)
+		return
+	}
+	srcKey, err = url.PathUnescape(srcKey)
+	if err != nil {
+		writeS3Error(w, r, http.StatusBadRequest, S3ErrInvalidArgument,
+			"Invalid copy source", copySource)
 		return
 	}
 

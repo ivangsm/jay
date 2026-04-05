@@ -39,9 +39,12 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 
 	maxKeys := 1000
 	if mk := q.Get("max-keys"); mk != "" {
-		if n, err := strconv.Atoi(mk); err == nil && n > 0 && n <= 1000 {
+		if n, err := strconv.Atoi(mk); err == nil && n > 0 {
 			maxKeys = n
 		}
+	}
+	if maxKeys > 10000 {
+		maxKeys = 10000
 	}
 
 	result, err := h.db.ListObjects(bucket.ID, prefix, delimiter, startAfter, maxKeys)

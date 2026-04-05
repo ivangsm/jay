@@ -179,6 +179,7 @@ func (h *connHandler) handleUploadPart(req *request) error {
 		ETag:           etag,
 		ChecksumSHA256: checksum,
 		LocationRef:    locationRef,
+		CreatedAt:      time.Now().UTC(),
 	}
 
 	if err := h.db.AddMultipartPart(params.UploadID, part); err != nil {
@@ -258,8 +259,12 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 		h.store.DeleteObject(prev.LocationRef)
 	}
 
-	h.store.CleanupUploadParts(params.UploadID)
-	h.db.DeleteMultipartUpload(params.UploadID)
+	if err := h.store.CleanupUploadParts(params.UploadID); err != nil {
+		h.log.Warn("cleanup upload parts", "err", err, "upload_id", params.UploadID)
+	}
+	if err := h.db.DeleteMultipartUpload(params.UploadID); err != nil {
+		h.log.Warn("delete multipart upload record", "err", err, "upload_id", params.UploadID)
+	}
 
 	resp, err := json.Marshal(completeMultipartResponse{
 		ETag:           etag,
@@ -290,8 +295,12 @@ func (h *connHandler) handleAbortMultipart(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	h.store.CleanupUploadParts(upload.UploadID)
-	h.db.DeleteMultipartUpload(params.UploadID)
+	if err := h.store.CleanupUploadParts(upload.UploadID); err != nil {
+		h.log.Warn("cleanup upload parts", "err", err, "upload_id", upload.UploadID)
+	}
+	if err := h.db.DeleteMultipartUpload(params.UploadID); err != nil {
+		h.log.Warn("delete multipart upload record", "err", err, "upload_id", params.UploadID)
+	}
 
 	return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 }

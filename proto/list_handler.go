@@ -53,6 +53,9 @@ func (h *connHandler) handleListObjects(req *request) error {
 	if maxKeys <= 0 {
 		maxKeys = 1000
 	}
+	if maxKeys > 10000 {
+		maxKeys = 10000
+	}
 
 	result, err := h.db.ListObjects(bucket.ID, params.Prefix, params.Delimiter, params.StartAfter, maxKeys)
 	if err != nil {

@@ -8,6 +8,9 @@ import (
 
 // WriteHeader writes the 17-byte frame header to w.
 func WriteHeader(w io.Writer, opOrStatus byte, streamID uint32, metaLen uint32, dataLen int64) error {
+	if dataLen < 0 {
+		return fmt.Errorf("invalid negative data length")
+	}
 	var buf [HeaderSize]byte
 	buf[0] = opOrStatus
 	binary.BigEndian.PutUint32(buf[1:5], streamID)
@@ -27,6 +30,9 @@ func ReadHeader(r io.Reader) (opOrStatus byte, streamID uint32, metaLen uint32, 
 	streamID = binary.BigEndian.Uint32(buf[1:5])
 	metaLen = binary.BigEndian.Uint32(buf[5:9])
 	dataLen = int64(binary.BigEndian.Uint64(buf[9:17]))
+	if dataLen < 0 {
+		return 0, 0, 0, 0, fmt.Errorf("invalid negative data length")
+	}
 	return
 }
 

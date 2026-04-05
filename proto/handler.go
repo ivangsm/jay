@@ -35,9 +35,9 @@ func (h *connHandler) dispatch(req *request) error {
 	case OpPing:
 		return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 	default:
-		// Drain any data
+		// Drain any data (bounded by dataLen to prevent unbounded reads)
 		if req.dataLen > 0 && req.data != nil {
-			io.Copy(io.Discard, req.data)
+			io.CopyN(io.Discard, req.data, req.dataLen)
 		}
 		return h.writeError(StatusBadRequest, req.streamID, "unknown operation", "UnknownOp")
 	}

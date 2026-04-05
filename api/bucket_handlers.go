@@ -3,11 +3,13 @@ package api
 import (
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
+	"strings"
 
-	"github.com/ivangsm/jay/meta"
 	"github.com/google/uuid"
+	"github.com/ivangsm/jay/meta"
 )
 
 var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$`)
@@ -22,7 +24,10 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	if !validBucketName.MatchString(bucketName) {
+	if !validBucketName.MatchString(bucketName) ||
+		strings.Contains(bucketName, "..") ||
+		strings.Contains(bucketName, "--") ||
+		net.ParseIP(bucketName) != nil {
 		writeS3Error(w, r, http.StatusBadRequest, S3ErrInvalidBucketName,
 			"Bucket name is invalid", "/"+bucketName)
 		return

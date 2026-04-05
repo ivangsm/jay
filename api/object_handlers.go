@@ -177,6 +177,40 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
+
+		// Probabilistic checksum verification for range requests (files <= 64MB)
+		if h.readChecker.ShouldVerify() && obj.SizeBytes <= 64<<20 {
+			verifier := maintenance.NewReadVerifier(f, obj.ChecksumSHA256)
+			if _, err := io.Copy(io.Discard, verifier); err != nil {
+				h.log.Error("range read verify", "err", err, "bucket", bucketName, "key", objectKey)
+				writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+					"Failed to read object", "/"+bucketName+"/"+objectKey)
+				h.readChecker.RecordCheck(false)
+				return
+			}
+			if !verifier.Valid() {
+				h.log.Error("checksum mismatch on range read",
+					"bucket", bucketName, "key", objectKey,
+					"expected", obj.ChecksumSHA256,
+					"actual", verifier.ActualChecksum(),
+					"location", obj.LocationRef,
+				)
+				h.readChecker.RecordCheck(false)
+				h.db.QuarantineObject(bucket.ID, objectKey)
+				h.store.Quarantine(obj.LocationRef)
+				writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+					"Object integrity check failed", "/"+bucketName+"/"+objectKey)
+				return
+			}
+			h.readChecker.RecordCheck(true)
+			// Seek back to serve the range
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+					"Failed to seek", "/"+bucketName+"/"+objectKey)
+				return
+			}
+		}
+
 		length := end - start + 1
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
