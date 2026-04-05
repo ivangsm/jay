@@ -2,12 +2,15 @@ package admin
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,8 +18,13 @@ import (
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
-	"io"
 )
+
+// authFailure tracks failed authentication attempts from an IP.
+type authFailure struct {
+	count    int
+	lastFail time.Time
+}
 
 // Handler serves the admin API for managing accounts and tokens.
 type Handler struct {
@@ -28,7 +36,14 @@ type Handler struct {
 	signingSecret string
 	listenAddr    string
 	tlsEnabled    bool
+
+	authFailures sync.Map // map[string]*authFailure keyed by remote IP
 }
+
+const (
+	maxAuthFailures     = 5
+	authFailureWindow   = 15 * time.Minute
+)
 
 // NewHandler creates a new admin API handler.
 func NewHandler(db *meta.DB, adminToken string, log *slog.Logger, metrics *maintenance.Metrics, st *store.Store, signingSecret, listenAddr string, tlsEnabled bool) *Handler {
@@ -73,8 +88,42 @@ func (h *Handler) authenticateAdmin(r *http.Request) bool {
 	if h.adminToken == "" {
 		return false
 	}
+
+	clientIP := r.RemoteAddr
+	if idx := strings.LastIndex(clientIP, ":"); idx != -1 {
+		clientIP = clientIP[:idx]
+	}
+
+	// Check rate limit for this IP
+	if val, ok := h.authFailures.Load(clientIP); ok {
+		af := val.(*authFailure)
+		if af.count >= maxAuthFailures && time.Since(af.lastFail) < authFailureWindow {
+			h.log.Warn("admin auth rate limited", "ip", clientIP, "failures", af.count)
+			return false
+		}
+		// Reset if window has expired
+		if time.Since(af.lastFail) >= authFailureWindow {
+			h.authFailures.Delete(clientIP)
+		}
+	}
+
 	authHeader := r.Header.Get("Authorization")
-	return authHeader == "Bearer "+h.adminToken
+	expected := "Bearer " + h.adminToken
+	// Constant-time comparison to prevent timing attacks
+	ok := subtle.ConstantTimeCompare([]byte(authHeader), []byte(expected)) == 1
+
+	if !ok {
+		h.log.Warn("admin auth failure", "ip", clientIP)
+		val, _ := h.authFailures.LoadOrStore(clientIP, &authFailure{})
+		af := val.(*authFailure)
+		af.count++
+		af.lastFail = time.Now()
+		return false
+	}
+
+	// Successful auth clears failure counter
+	h.authFailures.Delete(clientIP)
+	return true
 }
 
 type createAccountRequest struct {
@@ -164,6 +213,7 @@ func (h *Handler) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		AccountID:      req.AccountID,
 		Name:           req.Name,
 		SecretHash:     hash,
+		SecretKey:      secret,
 		AllowedActions: actions,
 		BucketScope:    req.BucketScope,
 		PrefixScope:    req.PrefixScope,
