@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -41,18 +42,24 @@ type objectRequest struct {
 func (h *connHandler) handlePutObject(req *request) error {
 	var params putObjectRequest
 	if err := json.Unmarshal(req.meta, &params); err != nil {
-		drainData(req)
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
 	if err := h.auth.Authorize(h.token, meta.ActionObjectPut, params.Bucket, params.Key); err != nil {
-		drainData(req)
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	bucket, err := h.db.GetBucket(params.Bucket)
 	if err != nil {
-		drainData(req)
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		if errors.Is(err, meta.ErrBucketNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
 		}
@@ -99,7 +106,7 @@ func (h *connHandler) handlePutObject(req *request) error {
 
 	prev, err := h.db.PutObjectMeta(obj)
 	if err != nil {
-		h.store.DeleteObject(locationRef)
+		h.store.Cleanup(locationRef)
 		h.log.Error("put object meta", "err", err)
 		return h.writeError(StatusInternal, req.streamID, "failed to store metadata", "InternalError")
 	}
@@ -108,10 +115,13 @@ func (h *connHandler) handlePutObject(req *request) error {
 		h.store.DeleteObject(prev.LocationRef)
 	}
 
-	resp, _ := json.Marshal(putObjectResponse{
+	resp, err := json.Marshal(putObjectResponse{
 		ETag:           etag,
 		ChecksumSHA256: checksum,
 	})
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }
 
@@ -148,7 +158,7 @@ func (h *connHandler) handleGetObject(req *request) error {
 	}
 	defer f.Close()
 
-	resp, _ := json.Marshal(objectInfoResponse{
+	resp, err := json.Marshal(objectInfoResponse{
 		ContentType:    obj.ContentType,
 		Size:           obj.SizeBytes,
 		ETag:           obj.ETag,
@@ -156,6 +166,9 @@ func (h *connHandler) handleGetObject(req *request) error {
 		LastModified:   obj.UpdatedAt.Format(time.RFC3339),
 		Metadata:       obj.MetadataHeaders,
 	})
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 
 	return h.writeResponse(StatusOK, req.streamID, resp, f, obj.SizeBytes)
 }
@@ -186,7 +199,7 @@ func (h *connHandler) handleHeadObject(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	resp, _ := json.Marshal(objectInfoResponse{
+	resp, err := json.Marshal(objectInfoResponse{
 		ContentType:    obj.ContentType,
 		Size:           obj.SizeBytes,
 		ETag:           obj.ETag,
@@ -194,6 +207,9 @@ func (h *connHandler) handleHeadObject(req *request) error {
 		LastModified:   obj.UpdatedAt.Format(time.RFC3339),
 		Metadata:       obj.MetadataHeaders,
 	})
+	if err != nil {
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 
 	return h.writeResponse(StatusOK, req.streamID, resp, nil, 0)
 }
@@ -232,17 +248,22 @@ func (h *connHandler) handleDeleteObject(req *request) error {
 	return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 }
 
-// drainData drains up to MaxDrainSize bytes from a request's data reader.
-// This is necessary when rejecting a PutObject whose data is already in flight.
-func drainData(req *request) {
+// errDataTooLarge is returned by drainData when the remaining data exceeds
+// MaxDrainSize, indicating the connection must be closed.
+var errDataTooLarge = fmt.Errorf("data too large to drain, closing connection")
+
+// drainData drains remaining data from a request's data reader.
+// If dataLen exceeds MaxDrainSize, it returns errDataTooLarge to signal
+// the caller that the connection is in a corrupt state and must be closed.
+func drainData(req *request) error {
 	if req.data == nil || req.dataLen == 0 {
-		return
+		return nil
 	}
-	n := req.dataLen
-	if n > MaxDrainSize {
-		n = MaxDrainSize
+	if req.dataLen > MaxDrainSize {
+		return errDataTooLarge
 	}
-	io.CopyN(io.Discard, req.data, n)
+	_, err := io.CopyN(io.Discard, req.data, req.dataLen)
+	return err
 }
 
 type emptyReader struct{}

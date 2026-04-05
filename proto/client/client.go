@@ -75,9 +75,8 @@ func (c *Client) getConn() (*conn, error) {
 
 func (c *Client) putConn(cn *conn) {
 	c.mu.Lock()
-	closed := c.closed
-	c.mu.Unlock()
-	if closed {
+	defer c.mu.Unlock()
+	if c.closed {
 		cn.nc.Close()
 		return
 	}

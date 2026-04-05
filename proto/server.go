@@ -9,10 +9,20 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
+)
+
+const (
+	defaultMaxConns      = 1000
+	handshakeTimeout     = 10 * time.Second
+	idleTimeout          = 60 * time.Second
+	minDataReadTimeout   = 30 * time.Second
+	dataReadBytesPerSec  = 1 << 20 // 1MB/s minimum expected throughput
 )
 
 // Server is the native TCP protocol server.
@@ -24,16 +34,19 @@ type Server struct {
 	listener net.Listener
 	wg       sync.WaitGroup
 	quit     chan struct{}
+	maxConns int
+	active   atomic.Int64
 }
 
 // NewServer creates a new native protocol server.
 func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger) *Server {
 	return &Server{
-		db:    db,
-		store: st,
-		auth:  au,
-		log:   log,
-		quit:  make(chan struct{}),
+		db:       db,
+		store:    st,
+		auth:     au,
+		log:      log,
+		quit:     make(chan struct{}),
+		maxConns: defaultMaxConns,
 	}
 }
 
@@ -72,11 +85,18 @@ func (s *Server) acceptLoop() {
 				continue
 			}
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+
+		if int(s.active.Load()) >= s.maxConns {
+			s.log.Warn("connection limit reached, rejecting", "remote", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+
+		s.active.Add(1)
+		s.wg.Go(func() {
+			defer s.active.Add(-1)
 			s.handleConn(conn)
-		}()
+		})
 	}
 }
 
@@ -85,6 +105,9 @@ func (s *Server) handleConn(nc net.Conn) {
 
 	br := bufio.NewReaderSize(nc, 64*1024)
 	bw := bufio.NewWriterSize(nc, 64*1024)
+
+	// Set handshake deadline
+	nc.SetDeadline(time.Now().Add(handshakeTimeout))
 
 	// Handshake
 	credentials, err := ReadHandshake(br)
@@ -116,6 +139,9 @@ func (s *Server) handleConn(nc net.Conn) {
 		return
 	}
 
+	// Clear handshake deadline
+	nc.SetDeadline(time.Time{})
+
 	// Connection handler
 	h := &connHandler{
 		db:    s.db,
@@ -135,6 +161,9 @@ func (s *Server) handleConn(nc net.Conn) {
 			return
 		default:
 		}
+
+		// Set idle timeout before waiting for next request header
+		nc.SetReadDeadline(time.Now().Add(idleTimeout))
 
 		if err := h.handleOneRequest(); err != nil {
 			if err != io.EOF && !isConnClosed(err) {
@@ -163,6 +192,9 @@ func (h *connHandler) handleOneRequest() error {
 		return err
 	}
 
+	// Clear the idle deadline now that we have a request header
+	h.conn.SetReadDeadline(time.Time{})
+
 	// Read metadata payload
 	var metaPayload []byte
 	if metaLen > 0 {
@@ -178,6 +210,12 @@ func (h *connHandler) handleOneRequest() error {
 	// Data reader (for PutObject)
 	var dataReader io.Reader
 	if dataLen > 0 {
+		// Set a read deadline proportional to data size (minimum 30s)
+		timeout := time.Duration(dataLen/dataReadBytesPerSec+1) * time.Second
+		if timeout < minDataReadTimeout {
+			timeout = minDataReadTimeout
+		}
+		h.conn.SetReadDeadline(time.Now().Add(timeout))
 		dataReader = io.LimitReader(h.br, dataLen)
 	}
 
@@ -192,6 +230,9 @@ func (h *connHandler) handleOneRequest() error {
 	if err := h.dispatch(req); err != nil {
 		return err
 	}
+
+	// Clear data read deadline after request is handled
+	h.conn.SetReadDeadline(time.Time{})
 
 	return h.bw.Flush()
 }

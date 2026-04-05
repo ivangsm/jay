@@ -21,8 +21,8 @@ const (
 	// Layout: [4B magic] [1B version] [1B status] [2B reserved]
 	HandshakeResponseSize = 8
 
-	// MaxMetaSize limits metadata payload to 16MB (prevents memory exhaustion).
-	MaxMetaSize = 16 << 20
+	// MaxMetaSize limits metadata payload to 1MB (prevents memory exhaustion).
+	MaxMetaSize = 1 << 20
 
 	// MaxDrainSize is how much data we'll drain on auth failure before closing.
 	MaxDrainSize = 10 << 20 // 10MB
