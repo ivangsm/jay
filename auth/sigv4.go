@@ -134,8 +134,11 @@ func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
 	// Canonical query string
 	queryString := r.URL.RawQuery
 
-	// Canonical headers
+	// Canonical headers — header names must be lowercased per SigV4 spec.
 	headerNames := strings.Split(signedHeaders, ";")
+	for i, h := range headerNames {
+		headerNames[i] = strings.ToLower(strings.TrimSpace(h))
+	}
 	sort.Strings(headerNames)
 	var canonHeaders strings.Builder
 	for _, h := range headerNames {
@@ -149,6 +152,9 @@ func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
 		canonHeaders.WriteString("\n")
 	}
 
+	// Signed headers list must also be lowercased.
+	signedHeadersLower := strings.Join(headerNames, ";")
+
 	// Payload hash
 	payloadHash := r.Header.Get("x-amz-content-sha256")
 	if payloadHash == "" {
@@ -156,7 +162,7 @@ func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
 	}
 
 	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
-		method, uri, queryString, canonHeaders.String(), signedHeaders, payloadHash)
+		method, uri, queryString, canonHeaders.String(), signedHeadersLower, payloadHash)
 }
 
 func buildStringToSign(dateStr, amzDate, region, canonicalRequest string) string {
