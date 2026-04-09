@@ -14,6 +14,7 @@ func openTestDB(t *testing.T) *DB {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	db.SetSigningSecret("test-signing-secret-at-least-32-chars")
 	t.Cleanup(func() { _ = db.Close() })
 	return db
 }

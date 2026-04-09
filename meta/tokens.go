@@ -12,7 +12,7 @@ import (
 )
 
 var (
-	ErrTokenNotFound = errors.New("token not found")
+	ErrTokenNotFound   = errors.New("token not found")
 	ErrAccountNotFound = errors.New("account not found")
 )
 
@@ -49,7 +49,8 @@ func (db *DB) GetAccount(id string) (*Account, error) {
 	return &a, nil
 }
 
-// CreateToken stores a new token in bbolt.
+// CreateToken stores a new token in bbolt. The caller passes a Token with
+// a plaintext SecretKey; it is encrypted before being persisted.
 func (db *DB) CreateToken(t *Token) error {
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now().UTC()
@@ -57,7 +58,14 @@ func (db *DB) CreateToken(t *Token) error {
 	if t.Status == "" {
 		t.Status = "active"
 	}
-	data, err := json.Marshal(t)
+	enc, err := db.encryptSecret(t.SecretKey)
+	if err != nil {
+		return fmt.Errorf("meta: encrypt secret key: %w", err)
+	}
+	// Store encrypted version on disk, leave caller's struct untouched.
+	stored := *t
+	stored.SecretKey = enc
+	data, err := json.Marshal(&stored)
 	if err != nil {
 		return fmt.Errorf("meta: marshal token: %w", err)
 	}
@@ -66,7 +74,7 @@ func (db *DB) CreateToken(t *Token) error {
 	})
 }
 
-// GetToken retrieves a token by ID.
+// GetToken retrieves a token by ID and transparently decrypts SecretKey.
 func (db *DB) GetToken(tokenID string) (*Token, error) {
 	var t Token
 	err := db.bolt.View(func(tx *bolt.Tx) error {
@@ -79,10 +87,16 @@ func (db *DB) GetToken(tokenID string) (*Token, error) {
 	if err != nil {
 		return nil, err
 	}
+	plain, err := db.decryptSecret(t.SecretKey)
+	if err != nil {
+		return nil, fmt.Errorf("meta: decrypt token %s: %w", tokenID, err)
+	}
+	t.SecretKey = plain
 	return &t, nil
 }
 
 // ListTokens returns all tokens, optionally filtered by account.
+// SecretHash and SecretKey are zeroed in the response.
 func (db *DB) ListTokens(accountID string) ([]Token, error) {
 	var tokens []Token
 	err := db.bolt.View(func(tx *bolt.Tx) error {
@@ -92,7 +106,6 @@ func (db *DB) ListTokens(accountID string) ([]Token, error) {
 				return nil
 			}
 			if accountID == "" || t.AccountID == accountID {
-				// Don't expose secrets in listings
 				t.SecretHash = ""
 				t.SecretKey = ""
 				tokens = append(tokens, t)
@@ -115,7 +128,6 @@ const (
 // CreateAccountIfNotExists looks up an account by Name. If found, returns it
 // with created=false. If not found, creates a new one with a uuid ID.
 func (db *DB) CreateAccountIfNotExists(name string) (*Account, bool, error) {
-	// Search existing accounts by Name (linear — OK for O(10) accounts)
 	var found *Account
 	err := db.bolt.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketAccounts).ForEach(func(k, v []byte) error {
@@ -152,8 +164,8 @@ func (db *DB) CreateAccountIfNotExists(name string) (*Account, bool, error) {
 // CreateTokenIfNotExists creates a token with a caller-provided ID. If a token
 // with the same ID already exists, it compares the plaintext secret against
 // the stored bcrypt hash:
-//   - match    → returns TokenSeedReused (no write)
-//   - mismatch → returns TokenSeedMismatch (no write)
+//   - match    -> returns TokenSeedReused (no write)
+//   - mismatch -> returns TokenSeedMismatch (no write)
 //
 // Otherwise creates a new token with the supplied hash and returns TokenSeedCreated.
 func (db *DB) CreateTokenIfNotExists(tokenID, accountID, name, secretHash, plaintextSecret string, allowedActions []string) (*Token, TokenSeedStatus, error) {
