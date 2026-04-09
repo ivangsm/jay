@@ -3,16 +3,11 @@ package api
 import (
 	"errors"
 	"io"
-	"net"
 	"net/http"
-	"regexp"
-	"strings"
 
 	"github.com/google/uuid"
 	"github.com/ivangsm/jay/meta"
 )
-
-var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$`)
 
 // handleCreateBucket handles PUT /<bucket>
 func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, bucketName string) {
@@ -24,10 +19,7 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	if !validBucketName.MatchString(bucketName) ||
-		strings.Contains(bucketName, "..") ||
-		strings.Contains(bucketName, "--") ||
-		net.ParseIP(bucketName) != nil {
+	if !meta.ValidBucketName(bucketName) {
 		writeS3Error(w, r, http.StatusBadRequest, S3ErrInvalidBucketName,
 			"Bucket name is invalid", "/"+bucketName)
 		return
@@ -62,6 +54,10 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 	if err := h.store.EnsureBucketDir(bucket.ID); err != nil {
 		h.log.Error("create bucket dir", "err", err, "bucket", bucketName)
 		// Best effort: metadata is already committed
+	}
+
+	if h.metrics != nil {
+		h.metrics.CreateBucketTotal.Add(1)
 	}
 
 	w.Header().Set("Location", "/"+bucketName)
@@ -103,6 +99,10 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 	// Clean up physical directory (best-effort; metadata is already deleted)
 	if err := h.store.RemoveBucketDir(bucket.ID); err != nil {
 		h.log.Error("remove bucket dir", "err", err, "bucket", bucketName)
+	}
+
+	if h.metrics != nil {
+		h.metrics.DeleteBucketTotal.Add(1)
 	}
 
 	w.WriteHeader(http.StatusNoContent)

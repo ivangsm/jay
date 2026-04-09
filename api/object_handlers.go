@@ -1,21 +1,26 @@
 package api
 
 import (
-	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 )
+
+var md5Pool = sync.Pool{
+	New: func() any { return md5.New() },
+}
 
 // handlePutObject handles PUT /<bucket>/<key>
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
@@ -40,7 +45,9 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	objectID := uuid.New().String()
 
 	// Calculate MD5 for ETag while the store calculates SHA-256
-	md5Hash := md5.New()
+	md5Hash := md5Pool.Get().(hash.Hash)
+	md5Hash.Reset()
+	defer md5Pool.Put(md5Hash)
 	body := io.TeeReader(r.Body, md5Hash)
 
 	// Write to store (atomic: temp → fsync → rename → fsync dir)
@@ -178,43 +185,6 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 			return
 		}
 
-		// Probabilistic checksum verification for range requests (files <= 64MB)
-		if h.readChecker.ShouldVerify() && obj.SizeBytes <= 64<<20 {
-			verifier := maintenance.NewReadVerifier(f, obj.ChecksumSHA256)
-			if _, err := io.Copy(io.Discard, verifier); err != nil {
-				h.log.Error("range read verify", "err", err, "bucket", bucketName, "key", objectKey)
-				writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-					"Failed to read object", "/"+bucketName+"/"+objectKey)
-				h.readChecker.RecordCheck(false)
-				return
-			}
-			if !verifier.Valid() {
-				h.log.Error("checksum mismatch on range read",
-					"bucket", bucketName, "key", objectKey,
-					"expected", obj.ChecksumSHA256,
-					"actual", verifier.ActualChecksum(),
-					"location", obj.LocationRef,
-				)
-				h.readChecker.RecordCheck(false)
-				if err := h.db.QuarantineObject(bucket.ID, objectKey); err != nil {
-					h.log.Error("quarantine object meta", "err", err, "bucket", bucketName, "key", objectKey)
-				}
-				if err := h.store.Quarantine(obj.LocationRef); err != nil {
-					h.log.Error("quarantine object file", "err", err, "location", obj.LocationRef)
-				}
-				writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-					"Object integrity check failed", "/"+bucketName+"/"+objectKey)
-				return
-			}
-			h.readChecker.RecordCheck(true)
-			// Seek back to serve the range
-			if _, err := f.Seek(0, io.SeekStart); err != nil {
-				writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-					"Failed to seek", "/"+bucketName+"/"+objectKey)
-				return
-			}
-		}
-
 		length := end - start + 1
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
@@ -239,16 +209,12 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		h.metrics.BytesDownloaded.Add(obj.SizeBytes)
 	}
 
-	// Probabilistic checksum verification on read (skip for range requests)
+	// Probabilistic checksum verification on read (streaming — no buffering)
 	if h.readChecker.ShouldVerify() && obj.SizeBytes <= 64<<20 {
-		var buf bytes.Buffer
 		verifier := maintenance.NewReadVerifier(f, obj.ChecksumSHA256)
-		if _, err := io.Copy(&buf, verifier); err != nil {
-			h.log.Error("read verify", "err", err, "bucket", bucketName, "key", objectKey)
-			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-				"Failed to read object", "/"+bucketName+"/"+objectKey)
-			h.readChecker.RecordCheck(false)
-			return
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.Copy(w, verifier); err != nil {
+			h.log.Warn("send verified object", "err", err, "bucket", bucketName, "key", objectKey)
 		}
 		if !verifier.Valid() {
 			h.log.Error("checksum mismatch on read",
@@ -258,20 +224,18 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 				"location", obj.LocationRef,
 			)
 			h.readChecker.RecordCheck(false)
+			if h.metrics != nil {
+				h.metrics.ChecksumFailures.Add(1)
+				h.metrics.ObjectsQuarantined.Add(1)
+			}
 			if err := h.db.QuarantineObject(bucket.ID, objectKey); err != nil {
 				h.log.Error("quarantine object meta", "err", err, "bucket", bucketName, "key", objectKey)
 			}
 			if err := h.store.Quarantine(obj.LocationRef); err != nil {
 				h.log.Error("quarantine object file", "err", err, "location", obj.LocationRef)
 			}
-			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-				"Object integrity check failed", "/"+bucketName+"/"+objectKey)
-			return
-		}
-		h.readChecker.RecordCheck(true)
-		w.WriteHeader(http.StatusOK)
-		if _, err := io.Copy(w, &buf); err != nil {
-			h.log.Warn("send verified object", "err", err, "bucket", bucketName, "key", objectKey)
+		} else {
+			h.readChecker.RecordCheck(true)
 		}
 		return
 	}

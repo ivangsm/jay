@@ -74,6 +74,10 @@ func validatePresignedRequest(r *http.Request, signingSecret string, db *meta.DB
 	if time.Now().Unix() > expiresUnix {
 		return nil, fmt.Errorf("presigned URL has expired")
 	}
+	maxExpiry := time.Now().Unix() + int64((7 * 24 * time.Hour).Seconds())
+	if expiresUnix > maxExpiry {
+		return nil, fmt.Errorf("presigned URL expiry exceeds maximum of 7 days")
+	}
 
 	// Verify HMAC — include canonical query (excluding meta params) in signature
 	cq := canonicalQuery(q)

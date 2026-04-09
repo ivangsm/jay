@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -131,20 +132,13 @@ func clientIP(r *http.Request) string {
 
 	// Only trust X-Forwarded-For if the direct connection is from a trusted network.
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" && isTrustedProxy(host) {
-		// X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2".
-		// The last entry is the one appended by the closest (most trusted) proxy.
-		for i := len(xff) - 1; i >= 0; i-- {
-			if xff[i] == ',' {
-				ip := trimSpace(xff[i+1:])
-				if ip != "" {
-					return ip
-				}
+		// X-Forwarded-For: "client, proxy1, proxy2" — leftmost is the original client.
+		parts := strings.Split(xff, ",")
+		for _, part := range parts {
+			ip := strings.TrimSpace(part)
+			if ip != "" {
+				return ip
 			}
-		}
-		// No comma found — single value.
-		ip := trimSpace(xff)
-		if ip != "" {
-			return ip
 		}
 	}
 
@@ -161,13 +155,3 @@ func isTrustedProxy(ip string) bool {
 	return parsed.IsLoopback() || parsed.IsPrivate()
 }
 
-// trimSpace trims leading and trailing ASCII spaces (avoids importing strings).
-func trimSpace(s string) string {
-	for len(s) > 0 && s[0] == ' ' {
-		s = s[1:]
-	}
-	for len(s) > 0 && s[len(s)-1] == ' ' {
-		s = s[:len(s)-1]
-	}
-	return s
-}

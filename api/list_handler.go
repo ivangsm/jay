@@ -88,5 +88,9 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 		})
 	}
 
+	if h.metrics != nil {
+		h.metrics.ListObjectsTotal.Add(1)
+	}
+
 	writeXML(w, r, http.StatusOK, xmlResult)
 }

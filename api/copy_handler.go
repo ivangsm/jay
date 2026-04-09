@@ -2,7 +2,6 @@ package api
 
 import (
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -141,5 +140,3 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 	})
 }
 
-// Ensure io package is used
-var _ = io.EOF

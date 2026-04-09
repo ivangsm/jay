@@ -2,9 +2,10 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -33,16 +34,11 @@ func tokenFromContext(ctx context.Context) *meta.Token {
 	return nil
 }
 
-// generateRequestID produces a random hex request ID without crypto/rand.
+// generateRequestID produces a cryptographically random hex request ID.
 func generateRequestID() string {
-	v := rand.Uint64()
-	var buf [16]byte
-	const hex = "0123456789abcdef"
-	for i := range 16 {
-		buf[i] = hex[v&0xf]
-		v >>= 4
-	}
-	return string(buf[:])
+	var buf [8]byte
+	_, _ = rand.Read(buf[:])
+	return hex.EncodeToString(buf[:])
 }
 
 // withRequestIDAndAuth combines request ID generation and authentication into
@@ -66,6 +62,7 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: 200}
 		next(sw, r)
@@ -89,11 +86,17 @@ func (h *Handler) requireAuth(r *http.Request, w http.ResponseWriter, action, bu
 		if (action == meta.ActionObjectGet || action == meta.ActionObjectList) && h.auth.IsPublicRead(bucketName) {
 			return nil, true
 		}
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
 		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Authentication required", r.URL.Path)
 		return nil, false
 	}
 
 	if err := h.auth.Authorize(token, action, bucketName, objectKey); err != nil {
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
 		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", r.URL.Path)
 		return nil, false
 	}
