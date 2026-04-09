@@ -7,10 +7,10 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /jay .
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates wget
 COPY --from=builder /jay /usr/local/bin/jay
 
-RUN mkdir -p /data
+RUN adduser -D -u 1000 jay && mkdir -p /data && chown jay:jay /data
 VOLUME /data
 
 ENV JAY_DATA_DIR=/data
@@ -24,7 +24,6 @@ EXPOSE 9000
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 --start-period=10s \
   CMD wget --no-verbose --tries=1 --spider http://localhost:9001/health/ready || exit 1
 
-RUN adduser -D -u 1000 jay
 USER jay
 
 ENTRYPOINT ["jay"]
