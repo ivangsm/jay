@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ivangsm/jay/auth"
@@ -26,26 +28,40 @@ const (
 
 // Server is the native TCP protocol server.
 type Server struct {
-	db       *meta.DB
-	store    *store.Store
-	auth     *auth.Auth
-	log      *slog.Logger
-	listener net.Listener
-	wg       sync.WaitGroup
-	quit     chan struct{}
-	maxConns int
-	active   atomic.Int64
+	db        *meta.DB
+	store     *store.Store
+	auth      *auth.Auth
+	log       *slog.Logger
+	listener  net.Listener
+	wg        sync.WaitGroup
+	quit      chan struct{}
+	maxConns  int
+	active    atomic.Int64
+	rateLimit int64
+	rateBurst int64
 }
 
 // NewServer creates a new native protocol server.
-func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger) *Server {
+// rateLimit is the maximum requests per second per connection (default 100).
+// rateBurst is the burst allowance for the first window (default 200).
+func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, rateLimit, rateBurst int) *Server {
+	rl := int64(rateLimit)
+	if rl <= 0 {
+		rl = 100
+	}
+	rb := int64(rateBurst)
+	if rb <= 0 {
+		rb = 200
+	}
 	return &Server{
-		db:       db,
-		store:    st,
-		auth:     au,
-		log:      log,
-		quit:     make(chan struct{}),
-		maxConns: defaultMaxConns,
+		db:        db,
+		store:     st,
+		auth:      au,
+		log:       log,
+		quit:      make(chan struct{}),
+		maxConns:  defaultMaxConns,
+		rateLimit: rl,
+		rateBurst: rb,
 	}
 }
 
@@ -151,14 +167,16 @@ func (s *Server) handleConn(nc net.Conn) {
 
 	// Connection handler
 	h := &connHandler{
-		db:    s.db,
-		store: s.store,
-		auth:  s.auth,
-		log:   s.log,
-		token: token,
-		conn:  nc,
-		br:    br,
-		bw:    bw,
+		db:          s.db,
+		store:       s.store,
+		auth:        s.auth,
+		log:         s.log,
+		token:       token,
+		conn:        nc,
+		br:          br,
+		bw:          bw,
+		rateLimit:   s.rateLimit,
+		windowStart: time.Now(),
 	}
 
 	// Request loop
@@ -186,20 +204,45 @@ func (s *Server) handleConn(nc net.Conn) {
 
 // connHandler handles requests on a single authenticated connection.
 type connHandler struct {
-	db    *meta.DB
-	store *store.Store
-	auth  *auth.Auth
-	log   *slog.Logger
-	token *meta.Token
-	conn  net.Conn
-	br    *bufio.Reader
-	bw    *bufio.Writer
+	db          *meta.DB
+	store       *store.Store
+	auth        *auth.Auth
+	log         *slog.Logger
+	token       *meta.Token
+	conn        net.Conn
+	br          *bufio.Reader
+	bw          *bufio.Writer
+	rateLimit   int64
+	reqCount    int64
+	windowStart time.Time
 }
 
 func (h *connHandler) handleOneRequest() error {
 	op, streamID, metaLen, dataLen, err := ReadHeader(h.br)
 	if err != nil {
 		return err
+	}
+
+	// Per-connection rate limiting (sliding window, 1-second granularity)
+	now := time.Now()
+	if now.Sub(h.windowStart) > time.Second {
+		h.reqCount = 0
+		h.windowStart = now
+	}
+	h.reqCount++
+	if h.reqCount > h.rateLimit {
+		// Drain meta then data for this frame so the connection stays usable
+		if metaLen > 0 {
+			_, _ = io.CopyN(io.Discard, h.br, int64(metaLen))
+		}
+		if dataLen > 0 {
+			_, _ = io.CopyN(io.Discard, h.br, dataLen)
+		}
+		errMeta := EncodeError("rate limit exceeded", "RateLimitExceeded")
+		if wErr := WriteFrameCombined(h.bw, StatusBadRequest, streamID, errMeta); wErr != nil {
+			return wErr
+		}
+		return h.bw.Flush()
 	}
 
 	// Clear the idle deadline now that we have a request header
@@ -269,8 +312,12 @@ func isConnClosed(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	return strings.Contains(s, "use of closed network connection") ||
-		strings.Contains(s, "connection reset by peer") ||
-		strings.Contains(s, "broken pipe")
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return errors.Is(opErr.Err, syscall.ECONNRESET) || errors.Is(opErr.Err, syscall.EPIPE)
+	}
+	return false
 }

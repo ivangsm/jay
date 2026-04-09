@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 )
 
 // Binary encoding helpers for the native wire protocol.
@@ -608,6 +609,12 @@ func DecodeBucketList(data []byte) (names []string, createdAts []string, err err
 	return names, createdAts, d.Err()
 }
 
+// frameBufPool pools buffers for WriteFrameCombined to avoid per-response allocations.
+// Most meta-only responses (the majority of traffic) fit within 4KB.
+var frameBufPool = sync.Pool{
+	New: func() any { return make([]byte, 0, 4096) },
+}
+
 // WriteFrameCombined writes header + meta in a single write when possible.
 // This is an optimization over WriteFrame for responses without data.
 func WriteFrameCombined(w io.Writer, opOrStatus byte, streamID uint32, meta []byte) error {
@@ -616,7 +623,15 @@ func WriteFrameCombined(w io.Writer, opOrStatus byte, streamID uint32, meta []by
 		return fmt.Errorf("meta too large")
 	}
 	total := HeaderSize + metaLen
-	buf := make([]byte, total)
+
+	var buf []byte
+	if total <= 4096 {
+		buf = frameBufPool.Get().([]byte)[:total]
+		defer frameBufPool.Put(buf[:0])
+	} else {
+		buf = make([]byte, total)
+	}
+
 	buf[0] = opOrStatus
 	binary.BigEndian.PutUint32(buf[1:5], streamID)
 	binary.BigEndian.PutUint32(buf[5:9], uint32(metaLen))
