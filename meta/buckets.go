@@ -166,6 +166,30 @@ func (db *DB) ListBuckets(ownerAccountID string) ([]Bucket, error) {
 	return buckets, err
 }
 
+// BucketStats returns the count and total size of active objects in a bucket.
+// Missing bucket returns 0, 0, nil (not an error — consistent with ForEachObject).
+func (db *DB) BucketStats(bucketID string) (count int64, totalSize int64, err error) {
+	err = db.bolt.View(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return nil
+		}
+		return bk.ForEach(func(k, v []byte) error {
+			var obj Object
+			if err := json.Unmarshal(v, &obj); err != nil {
+				return nil // skip corrupt entries
+			}
+			if obj.State != "active" {
+				return nil
+			}
+			count++
+			totalSize += obj.SizeBytes
+			return nil
+		})
+	})
+	return count, totalSize, err
+}
+
 // UpdateBucketPolicy updates the policy JSON for a bucket.
 func (db *DB) UpdateBucketPolicy(name string, policy json.RawMessage) error {
 	return db.bolt.Update(func(tx *bolt.Tx) error {
