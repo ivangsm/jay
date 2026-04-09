@@ -97,7 +97,10 @@ func (qm *QuarantineManager) Inspect(bucketID, key string) (*InspectionResult, e
 
 	result := &InspectionResult{Object: qo}
 
-	absPath := qm.store.AbsPath(obj.LocationRef)
+	absPath, err := qm.store.SafePath(obj.LocationRef)
+	if err != nil {
+		return nil, err
+	}
 	info, err := os.Stat(absPath)
 	if err != nil {
 		// File does not exist

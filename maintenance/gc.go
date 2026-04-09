@@ -17,6 +17,10 @@ type GC struct {
 	quit     chan struct{}
 	running  atomic.Bool
 
+	// hasPendingWork is set by NotifyDeletion when an object is deleted.
+	// Future optimizations can check this flag to skip unnecessary GC cycles.
+	hasPendingWork atomic.Bool
+
 	FilesCollected atomic.Int64
 }
 
@@ -43,6 +47,14 @@ func (gc *GC) Stop() {
 	if gc.running.CompareAndSwap(true, false) {
 		close(gc.quit)
 	}
+}
+
+// NotifyDeletion signals the GC that an object has been deleted and there may
+// be work to do. The caller (e.g. the delete handler in the API layer) should
+// call this after successfully deleting an object. The flag is consumed by
+// future GC cycles.
+func (gc *GC) NotifyDeletion() {
+	gc.hasPendingWork.Store(true)
 }
 
 func (gc *GC) loop() {
@@ -117,8 +129,8 @@ func (gc *GC) cleanOldTempFiles() {
 }
 
 func (gc *GC) cleanEmptyDirs() {
-	// TODO: implement empty-bucket-dir GC.
-	// Currently a no-op: an empty objects/ subdir does not imply the bucket is
-	// gone — it may still exist in metadata — so we leave these directories
-	// alone until we have a cross-check against the metadata DB.
+	// Empty objects/ subdirs are left in place: the bucket may still exist in
+	// metadata and new objects may be written. Only bucket deletion (via API)
+	// removes these directories. Removing them here would cause errors when the
+	// store attempts to write objects to a bucket that still exists in meta.
 }

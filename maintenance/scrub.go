@@ -3,6 +3,7 @@ package maintenance
 import (
 	"log/slog"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -203,6 +204,7 @@ func (s *Scrubber) RunOnce() ScrubResult {
 // RunIncremental checks up to maxPerRun objects per bucket, starting from
 // where the last run left off. When a bucket is fully scanned the cursor
 // wraps around. Once all buckets wrap, lastFullScan is updated.
+// Buckets are processed in parallel using a bounded worker pool.
 func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 	var result ScrubResult
 
@@ -213,106 +215,156 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 		return result
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	type bucketResult struct {
+		partial     ScrubResult
+		bucketID    string
+		lastVisited string
+		wrapped     bool
+		iterErr     bool
+	}
 
-	allWrapped := true
+	sem := make(chan struct{}, runtime.NumCPU())
+	var wg sync.WaitGroup
+	results := make([]bucketResult, len(buckets))
 
-	for _, bucket := range buckets {
-		startKey := s.lastKey[bucket.ID]
-
-		type quarantineAction struct {
-			key         string
-			locationRef string
-			isMismatch  bool
+	for i, bucket := range buckets {
+		// Check for shutdown before launching a new goroutine.
+		select {
+		case <-s.quit:
+			break
+		default:
 		}
-		var toQuarantine []quarantineAction
 
-		lastVisited, err := s.db.ForEachObjectFrom(bucket.ID, startKey, maxPerRun, func(obj meta.Object) error {
-			if obj.State != "active" {
+		s.mu.Lock()
+		startKey := s.lastKey[bucket.ID]
+		s.mu.Unlock()
+
+		wg.Add(1)
+		sem <- struct{}{} // acquire semaphore slot
+
+		go func(idx int, b meta.Bucket, start string) {
+			defer wg.Done()
+			defer func() { <-sem }() // release semaphore slot
+
+			br := bucketResult{bucketID: b.ID}
+
+			type quarantineAction struct {
+				key         string
+				locationRef string
+				isMismatch  bool
+			}
+			var toQuarantine []quarantineAction
+
+			lastVisited, iterErr := s.db.ForEachObjectFrom(b.ID, start, maxPerRun, func(obj meta.Object) error {
+				if obj.State != "active" {
+					return nil
+				}
+
+				br.partial.Checked++
+
+				if !s.store.ObjectExists(&obj) {
+					s.log.Warn("scrub: missing file",
+						"bucket", b.Name,
+						"key", obj.Key,
+						"location", obj.LocationRef,
+					)
+					toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: false})
+					br.partial.Missing++
+					return nil
+				}
+
+				match, actual, verifyErr := s.store.VerifyChecksum(obj.LocationRef, obj.ChecksumSHA256)
+				if verifyErr != nil {
+					s.log.Error("scrub: verify checksum",
+						"err", verifyErr,
+						"bucket", b.Name,
+						"key", obj.Key,
+					)
+					br.partial.Errors++
+					return nil
+				}
+
+				if !match {
+					s.log.Error("scrub: checksum mismatch",
+						"bucket", b.Name,
+						"key", obj.Key,
+						"expected", obj.ChecksumSHA256,
+						"actual", actual,
+						"location", obj.LocationRef,
+					)
+					toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: true})
+					br.partial.Quarantined++
+					return nil
+				}
+
+				br.partial.Healthy++
 				return nil
-			}
+			})
 
-			result.Checked++
-			s.totalChecked++
-
-			if !s.store.ObjectExists(&obj) {
-				s.log.Warn("scrub: missing file",
-					"bucket", bucket.Name,
-					"key", obj.Key,
-					"location", obj.LocationRef,
-				)
-				toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: false})
-				result.Missing++
-				return nil
-			}
-
-			match, actual, verifyErr := s.store.VerifyChecksum(obj.LocationRef, obj.ChecksumSHA256)
-			if verifyErr != nil {
-				s.log.Error("scrub: verify checksum",
-					"err", verifyErr,
-					"bucket", bucket.Name,
-					"key", obj.Key,
-				)
-				result.Errors++
-				return nil
-			}
-
-			if !match {
-				s.log.Error("scrub: checksum mismatch",
-					"bucket", bucket.Name,
-					"key", obj.Key,
-					"expected", obj.ChecksumSHA256,
-					"actual", actual,
-					"location", obj.LocationRef,
-				)
-				toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: true})
-				result.Quarantined++
-				return nil
-			}
-
-			result.Healthy++
-			return nil
-		})
-
-		// Quarantine outside the View transaction to avoid deadlock.
-		for _, qa := range toQuarantine {
-			if qerr := s.db.QuarantineObject(bucket.ID, qa.key); qerr != nil {
-				s.log.Error("incremental scrub: quarantine meta", "err", qerr, "bucket", bucket.Name, "key", qa.key)
-			}
-			if qa.isMismatch {
-				if qerr := s.store.Quarantine(qa.locationRef); qerr != nil {
-					s.log.Error("incremental scrub: quarantine file", "err", qerr, "location", qa.locationRef)
+			// Quarantine outside the View transaction to avoid deadlock.
+			for _, qa := range toQuarantine {
+				if qerr := s.db.QuarantineObject(b.ID, qa.key); qerr != nil {
+					s.log.Error("incremental scrub: quarantine meta", "err", qerr, "bucket", b.Name, "key", qa.key)
+				}
+				if qa.isMismatch {
+					if qerr := s.store.Quarantine(qa.locationRef); qerr != nil {
+						s.log.Error("incremental scrub: quarantine file", "err", qerr, "location", qa.locationRef)
+					}
 				}
 			}
-		}
 
-		if err != nil {
-			s.log.Error("incremental scrub: iterate objects",
-				"err", err,
-				"bucket", bucket.Name,
-			)
-			result.Errors++
+			if iterErr != nil {
+				s.log.Error("incremental scrub: iterate objects",
+					"err", iterErr,
+					"bucket", b.Name,
+				)
+				br.iterErr = true
+			}
+
+			br.lastVisited = lastVisited
+			if lastVisited == "" {
+				br.wrapped = true
+			}
+
+			results[idx] = br
+		}(i, bucket, startKey)
+	}
+
+	wg.Wait()
+
+	// Aggregate results and update shared state under the lock.
+	allWrapped := true
+	s.mu.Lock()
+	for _, br := range results {
+		result.Checked += br.partial.Checked
+		result.Healthy += br.partial.Healthy
+		result.Quarantined += br.partial.Quarantined
+		result.Missing += br.partial.Missing
+		result.Errors += br.partial.Errors
+		s.totalChecked += int64(br.partial.Checked)
+
+		if br.iterErr {
+			result.Errors++ // count the iteration error itself
 			continue
 		}
 
-		if lastVisited == "" {
-			// No more objects from startKey onward — wrap to beginning.
-			s.lastKey[bucket.ID] = ""
+		if br.bucketID == "" {
+			continue // unused slot (early shutdown)
+		}
+
+		if br.wrapped {
+			s.lastKey[br.bucketID] = ""
 		} else {
-			s.lastKey[bucket.ID] = lastVisited
+			s.lastKey[br.bucketID] = br.lastVisited
 			allWrapped = false
 		}
-
-		select {
-		case <-s.quit:
-			return result
-		default:
-		}
 	}
+	s.mu.Unlock()
 
 	if allWrapped && len(buckets) > 0 {
+		s.mu.Lock()
 		s.lastFullScan = time.Now().UTC()
+		s.mu.Unlock()
 	}
 
 	return result

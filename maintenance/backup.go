@@ -9,36 +9,29 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/ivangsm/jay/meta"
 )
 
 // BackupManager handles consistent backups of the bbolt database.
 type BackupManager struct {
-	dbPath    string
+	db        *meta.DB
 	backupDir string
 	log       *slog.Logger
 }
 
 // NewBackupManager creates a backup manager.
-func NewBackupManager(dbPath, backupDir string, log *slog.Logger) *BackupManager {
+func NewBackupManager(db *meta.DB, backupDir string, log *slog.Logger) *BackupManager {
 	if err := os.MkdirAll(backupDir, 0o755); err != nil {
 		log.Error("create backup dir", "err", err, "path", backupDir)
 	}
-	return &BackupManager{dbPath: dbPath, backupDir: backupDir, log: log}
+	return &BackupManager{db: db, backupDir: backupDir, log: log}
 }
 
 // Run creates a consistent snapshot of the bbolt database.
-// It opens the DB in read-only mode and uses bbolt's View transaction
-// to get a consistent snapshot, then writes it to a timestamped file.
+// It uses the shared meta.DB handle's Backup method which runs inside a
+// read transaction — no second bolt handle is opened.
 func (bm *BackupManager) Run() (string, error) {
-	db, err := bolt.Open(bm.dbPath, 0o600, &bolt.Options{
-		ReadOnly: true,
-		Timeout:  5 * time.Second,
-	})
-	if err != nil {
-		return "", fmt.Errorf("backup: open db: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	backupPath := filepath.Join(bm.backupDir, fmt.Sprintf("jay-%s.db", ts))
 
@@ -47,11 +40,7 @@ func (bm *BackupManager) Run() (string, error) {
 		return "", fmt.Errorf("backup: create file: %w", err)
 	}
 
-	err = db.View(func(tx *bolt.Tx) error {
-		_, err := tx.WriteTo(f)
-		return err
-	})
-	if err != nil {
+	if err := bm.db.Backup(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(backupPath)
 		return "", fmt.Errorf("backup: write snapshot: %w", err)
@@ -198,17 +187,5 @@ func (bm *BackupManager) Prune(retention time.Duration, minKeep int) (int, error
 // BackupToWriter writes a consistent bbolt snapshot to the given writer.
 // Useful for streaming backups over HTTP.
 func (bm *BackupManager) BackupToWriter(w io.Writer) error {
-	db, err := bolt.Open(bm.dbPath, 0o600, &bolt.Options{
-		ReadOnly: true,
-		Timeout:  5 * time.Second,
-	})
-	if err != nil {
-		return fmt.Errorf("backup: open db: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	return db.View(func(tx *bolt.Tx) error {
-		_, err := tx.WriteTo(w)
-		return err
-	})
+	return bm.db.Backup(w)
 }
