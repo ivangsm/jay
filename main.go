@@ -67,6 +67,13 @@ func main() {
 		log.Error("recovery failed", "err", err)
 		os.Exit(1)
 	}
+
+	// Seed token from env vars (idempotent)
+	if err := runSeed(cfg, db, log); err != nil {
+		log.Error("seed failed", "err", err)
+		os.Exit(1)
+	}
+
 	hc.SetReady(true)
 
 	// Build shared components
