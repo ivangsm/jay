@@ -6,8 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -47,9 +47,32 @@ const (
 	authFailureWindow   = 15 * time.Minute
 )
 
+// AdminConfig holds the configuration for the admin API handler.
+type AdminConfig struct {
+	DB            *meta.DB
+	Store         *store.Store
+	Auth          *auth.Auth
+	AdminToken    string
+	Log           *slog.Logger
+	Metrics       *maintenance.Metrics
+	SigningSecret string
+	ListenAddr    string
+	TLSEnabled    bool
+}
+
 // NewHandler creates a new admin API handler.
-func NewHandler(db *meta.DB, adminToken string, log *slog.Logger, metrics *maintenance.Metrics, st *store.Store, signingSecret, listenAddr string, tlsEnabled bool, au *auth.Auth) *Handler {
-	return &Handler{db: db, store: st, auth: au, adminToken: adminToken, log: log, metrics: metrics, signingSecret: signingSecret, listenAddr: listenAddr, tlsEnabled: tlsEnabled}
+func NewHandler(cfg AdminConfig) *Handler {
+	return &Handler{
+		db:            cfg.DB,
+		store:         cfg.Store,
+		auth:          cfg.Auth,
+		adminToken:    cfg.AdminToken,
+		log:           cfg.Log,
+		metrics:       cfg.Metrics,
+		signingSecret: cfg.SigningSecret,
+		listenAddr:    cfg.ListenAddr,
+		tlsEnabled:    cfg.TLSEnabled,
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -91,9 +114,9 @@ func (h *Handler) authenticateAdmin(r *http.Request) bool {
 		return false
 	}
 
-	clientIP := r.RemoteAddr
-	if idx := strings.LastIndex(clientIP, ":"); idx != -1 {
-		clientIP = clientIP[:idx]
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		clientIP = r.RemoteAddr
 	}
 
 	// Check rate limit for this IP
@@ -385,8 +408,27 @@ func (h *Handler) handleRevalidate(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
 	qm := maintenance.NewQuarantineManager(h.db, h.store, h.log)
 
-	body, _ := io.ReadAll(r.Body)
-	if len(body) == 0 || string(body) == "{}" {
+	var body struct {
+		Mode     string `json:"mode"`
+		BucketID string `json:"bucket_id"`
+		Key      string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	if body.BucketID != "" && body.Key != "" {
+		if err := qm.Purge(body.BucketID, body.Key); err != nil {
+			h.log.Error("purge", "err", err)
+			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if body.Mode == "all" {
 		count, err := qm.PurgeAll()
 		if err != nil {
 			h.log.Error("purge all", "err", err)
@@ -400,25 +442,5 @@ func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req quarantineRequest
-	if err := json.Unmarshal(body, &req); err != nil || req.BucketID == "" || req.Key == "" {
-		count, err := qm.PurgeAll()
-		if err != nil {
-			h.log.Error("purge all", "err", err)
-			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]int{"purged": count}); err != nil {
-			h.log.Error("encode purge response", "err", err)
-		}
-		return
-	}
-
-	if err := qm.Purge(req.BucketID, req.Key); err != nil {
-		h.log.Error("purge", "err", err)
-		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	http.Error(w, `{"error":"specify bucket_id+key for single purge, or mode=all for purge all"}`, http.StatusBadRequest)
 }
