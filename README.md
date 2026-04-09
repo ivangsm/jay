@@ -61,6 +61,56 @@ Jay listens on three ports:
 | `JAY_RATE_LIMIT` | `0` (disabled) | Requests/sec per token |
 | `JAY_RATE_BURST` | `200` | Rate limit burst size |
 
+## Seed Token
+
+Jay can create an account and token at startup from environment variables, so a fresh deployment doesn't require a manual admin API call before clients can authenticate.
+
+### Variables
+
+| Variable | Purpose |
+|---|---|
+| `JAY_SEED_TOKEN_ACCOUNT` | Name of the account to create (e.g. `falco`) |
+| `JAY_SEED_TOKEN_ID` | Deterministic token ID used by the client (e.g. `falco-native`) |
+| `JAY_SEED_TOKEN_SECRET` | Plaintext secret; bcrypt-hashed before storage |
+
+### Rules
+
+- **All three set** → Jay creates the account (idempotent by name) and the token (idempotent by ID) with wildcard actions (`"*"`). The same creds can be used against either the S3 or the native protocol.
+- **All three empty** → seed is skipped. Use this mode if you prefer to bootstrap tokens via the admin API.
+- **One or two set** → Jay **refuses to start** with an error. This prevents partially-configured deployments.
+
+### Idempotence and rotation
+
+On every restart, Jay:
+- Looks up the account by name; if it exists, reuses its ID.
+- Looks up the token by ID. If the stored bcrypt hash matches `JAY_SEED_TOKEN_SECRET`, Jay logs `seed: token already present, reusing` and moves on.
+- **If the hash does NOT match**, Jay logs a WARN (`seed: token exists but secret does not match env; refusing to overwrite`) and **keeps the old secret**. Jay never silently overwrites a token.
+
+To rotate the seed secret:
+1. Either change `JAY_SEED_TOKEN_ID` to a new value (the old token stays active; revoke it manually), **or**
+2. Use the admin API to revoke the old token (`DELETE /_jay/tokens/{id}`) first, then set the new `JAY_SEED_TOKEN_SECRET` and restart.
+
+### Example
+
+```bash
+export JAY_SEED_TOKEN_ACCOUNT=myapp
+export JAY_SEED_TOKEN_ID=myapp-primary
+export JAY_SEED_TOKEN_SECRET=$(openssl rand -base64 32)
+./jay
+```
+
+On first boot you'll see:
+```
+seed: account created name=myapp account_id=...
+seed: token created token_id=myapp-primary
+```
+
+On second boot:
+```
+seed: account exists, reusing
+seed: token already present, reusing
+```
+
 ## Authentication
 
 ### Create an Account and Token
