@@ -67,6 +67,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	if err != nil {
 		b.Fatal(err)
 	}
+	db.SetSigningSecret("test-secret")
 	b.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
@@ -84,7 +85,10 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	s3Srv := httptest.NewServer(s3Handler)
 	b.Cleanup(s3Srv.Close)
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false, au)
+	adminHandler := admin.NewHandler(admin.AdminConfig{
+		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
+		Log: log, Metrics: metrics,
+	})
 	adminSrv := httptest.NewServer(adminHandler)
 	b.Cleanup(adminSrv.Close)
 
@@ -153,6 +157,7 @@ func setupNativeBench(b *testing.B) *benchNativeEnv {
 	if err != nil {
 		b.Fatal(err)
 	}
+	db.SetSigningSecret("test-secret")
 	b.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
@@ -184,7 +189,7 @@ func setupNativeBench(b *testing.B) *benchNativeEnv {
 		b.Fatal(err)
 	}
 
-	srv := proto.NewServer(db, st, au, log)
+	srv := proto.NewServer(db, st, au, log, 0, 0)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

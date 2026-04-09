@@ -17,6 +17,7 @@ func openSeedTestDB(t *testing.T) *meta.DB {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	db.SetSigningSecret("test-secret")
 	t.Cleanup(func() { _ = db.Close() })
 	return db
 }

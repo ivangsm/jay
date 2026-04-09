@@ -23,6 +23,7 @@ func setupTestHandler(t *testing.T) (*Handler, *meta.DB, *meta.Token, string) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	db.SetSigningSecret("test-secret")
 	t.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)

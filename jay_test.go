@@ -49,6 +49,7 @@ func setup(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.SetSigningSecret("test-secret")
 	t.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
@@ -66,7 +67,10 @@ func setup(t *testing.T) *testEnv {
 	s3Srv := httptest.NewServer(s3Handler)
 	t.Cleanup(s3Srv.Close)
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false, au)
+	adminHandler := admin.NewHandler(admin.AdminConfig{
+		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
+		Log: log, Metrics: metrics,
+	})
 	adminSrv := httptest.NewServer(adminHandler)
 	t.Cleanup(adminSrv.Close)
 
@@ -471,6 +475,7 @@ func setupWithSigning(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.SetSigningSecret("test-secret")
 	t.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
@@ -489,7 +494,11 @@ func setupWithSigning(t *testing.T) *testEnv {
 	s3Srv := httptest.NewServer(s3Handler)
 	t.Cleanup(s3Srv.Close)
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, signingSecret, s3Srv.Listener.Addr().String(), false, au)
+	adminHandler := admin.NewHandler(admin.AdminConfig{
+		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
+		Log: log, Metrics: metrics, SigningSecret: signingSecret,
+		ListenAddr: s3Srv.Listener.Addr().String(),
+	})
 	adminSrv := httptest.NewServer(adminHandler)
 	t.Cleanup(adminSrv.Close)
 
@@ -914,10 +923,8 @@ func TestBucketPolicyDenyOverridesAllow(t *testing.T) {
 		},
 	}
 
-	allowed, denied := auth.EvaluatePolicy(policy, "any-token", "object:put", "readonly/file.txt", "127.0.0.1")
-	if allowed {
-		t.Fatal("expected not allowed (deny should override)")
-	}
+	// Policies are deny-only overlays: EvaluatePolicyDeny returns true if denied.
+	denied := auth.EvaluatePolicyDeny(policy, "any-token", "object:put", "readonly/file.txt", "127.0.0.1")
 	if !denied {
 		t.Fatal("expected denied")
 	}
@@ -927,18 +934,20 @@ func TestBucketPolicyPrefixMatch(t *testing.T) {
 	policy := &auth.BucketPolicy{
 		Version: "2024-01-01",
 		Statements: []auth.PolicyStatement{
-			{Effect: "allow", Actions: []string{"object:get"}, Subjects: []string{"*"}, Prefixes: []string{"public/"}},
+			{Effect: "deny", Actions: []string{"object:get"}, Subjects: []string{"*"}, Prefixes: []string{"private/"}},
 		},
 	}
 
-	allowed, _ := auth.EvaluatePolicy(policy, "any", "object:get", "public/file.txt", "")
-	if !allowed {
-		t.Fatal("expected allowed for matching prefix")
+	// "public/" prefix is not denied
+	denied := auth.EvaluatePolicyDeny(policy, "any", "object:get", "public/file.txt", "")
+	if denied {
+		t.Fatal("expected not denied for non-matching prefix")
 	}
 
-	allowed, _ = auth.EvaluatePolicy(policy, "any", "object:get", "private/file.txt", "")
-	if allowed {
-		t.Fatal("expected not allowed for non-matching prefix")
+	// "private/" prefix is denied
+	denied = auth.EvaluatePolicyDeny(policy, "any", "object:get", "private/file.txt", "")
+	if !denied {
+		t.Fatal("expected denied for matching prefix")
 	}
 }
 
@@ -947,24 +956,27 @@ func TestBucketPolicyIPCondition(t *testing.T) {
 		Version: "2024-01-01",
 		Statements: []auth.PolicyStatement{
 			{
-				Effect:   "allow",
+				Effect:   "deny",
 				Actions:  []string{"*"},
 				Subjects: []string{"*"},
 				Conditions: &auth.PolicyConditions{
-					IPWhitelist: []string{"10.0.0.0/8"},
+					IPWhitelist: []string{"192.168.0.0/16"},
 				},
 			},
 		},
 	}
+	policy.Compile()
 
-	allowed, _ := auth.EvaluatePolicy(policy, "any", "object:get", "file.txt", "10.1.2.3")
-	if !allowed {
-		t.Fatal("expected allowed from whitelisted IP")
+	// IP in the deny CIDR → denied
+	denied := auth.EvaluatePolicyDeny(policy, "any", "object:get", "file.txt", "192.168.1.1")
+	if !denied {
+		t.Fatal("expected denied from blocked IP")
 	}
 
-	allowed, _ = auth.EvaluatePolicy(policy, "any", "object:get", "file.txt", "192.168.1.1")
-	if allowed {
-		t.Fatal("expected not allowed from non-whitelisted IP")
+	// IP NOT in the deny CIDR → IP condition doesn't match, so not denied
+	denied = auth.EvaluatePolicyDeny(policy, "any", "object:get", "file.txt", "10.1.2.3")
+	if denied {
+		t.Fatal("expected not denied from non-blocked IP")
 	}
 }
 
@@ -972,13 +984,20 @@ func TestBucketPolicyWildcardSubjects(t *testing.T) {
 	policy := &auth.BucketPolicy{
 		Version: "2024-01-01",
 		Statements: []auth.PolicyStatement{
-			{Effect: "allow", Actions: []string{"object:get"}, Subjects: []string{"*"}},
+			{Effect: "deny", Actions: []string{"object:put"}, Subjects: []string{"*"}},
 		},
 	}
 
-	allowed, _ := auth.EvaluatePolicy(policy, "random-token-id", "object:get", "any/key", "")
-	if !allowed {
-		t.Fatal("expected allowed for wildcard subject")
+	// Wildcard subject matches all tokens for deny
+	denied := auth.EvaluatePolicyDeny(policy, "random-token-id", "object:put", "any/key", "")
+	if !denied {
+		t.Fatal("expected denied for wildcard subject")
+	}
+
+	// Different action → no deny
+	denied = auth.EvaluatePolicyDeny(policy, "random-token-id", "object:get", "any/key", "")
+	if denied {
+		t.Fatal("expected not denied for non-matching action")
 	}
 }
 
@@ -986,25 +1005,27 @@ func TestBucketPolicySpecificSubject(t *testing.T) {
 	policy := &auth.BucketPolicy{
 		Version: "2024-01-01",
 		Statements: []auth.PolicyStatement{
-			{Effect: "allow", Actions: []string{"object:get"}, Subjects: []string{"token-abc"}},
+			{Effect: "deny", Actions: []string{"object:get"}, Subjects: []string{"token-abc"}},
 		},
 	}
 
-	allowed, _ := auth.EvaluatePolicy(policy, "token-abc", "object:get", "file.txt", "")
-	if !allowed {
-		t.Fatal("expected allowed for matching subject")
+	// Matching subject → denied
+	denied := auth.EvaluatePolicyDeny(policy, "token-abc", "object:get", "file.txt", "")
+	if !denied {
+		t.Fatal("expected denied for matching subject")
 	}
 
-	allowed, _ = auth.EvaluatePolicy(policy, "token-xyz", "object:get", "file.txt", "")
-	if allowed {
-		t.Fatal("expected not allowed for non-matching subject")
+	// Non-matching subject → not denied
+	denied = auth.EvaluatePolicyDeny(policy, "token-xyz", "object:get", "file.txt", "")
+	if denied {
+		t.Fatal("expected not denied for non-matching subject")
 	}
 }
 
 func TestBucketPolicyNilPolicy(t *testing.T) {
-	allowed, denied := auth.EvaluatePolicy(nil, "any", "object:get", "file.txt", "")
-	if allowed || denied {
-		t.Fatal("nil policy should return false, false")
+	denied := auth.EvaluatePolicyDeny(nil, "any", "object:get", "file.txt", "")
+	if denied {
+		t.Fatal("nil policy should not deny")
 	}
 }
 
@@ -1018,6 +1039,7 @@ func TestQuarantineListAndPurge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.SetSigningSecret("test-secret")
 	defer func() { _ = db.Close() }()
 
 	st, err := store.New(dir)
@@ -1035,7 +1057,10 @@ func TestQuarantineListAndPurge(t *testing.T) {
 	s3Srv := httptest.NewServer(s3Handler)
 	defer s3Srv.Close()
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false, au)
+	adminHandler := admin.NewHandler(admin.AdminConfig{
+		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
+		Log: log, Metrics: metrics,
+	})
 	adminSrv := httptest.NewServer(adminHandler)
 	defer adminSrv.Close()
 
@@ -1135,6 +1160,7 @@ func TestRateLimiting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.SetSigningSecret("test-secret")
 	defer func() { _ = db.Close() }()
 
 	st, err := store.New(dir)
@@ -1155,7 +1181,10 @@ func TestRateLimiting(t *testing.T) {
 	s3Srv := httptest.NewServer(s3Handler)
 	defer s3Srv.Close()
 
-	adminHandler := admin.NewHandler(db, "test-admin", log, metrics, st, "", "", false, au)
+	adminHandler := admin.NewHandler(admin.AdminConfig{
+		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
+		Log: log, Metrics: metrics,
+	})
 	adminSrv := httptest.NewServer(adminHandler)
 	defer adminSrv.Close()
 

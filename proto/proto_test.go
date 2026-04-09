@@ -39,6 +39,7 @@ func setup(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.SetSigningSecret("test-secret")
 	t.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
@@ -71,7 +72,7 @@ func setup(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 
-	srv := proto.NewServer(db, st, au, log)
+	srv := proto.NewServer(db, st, au, log, 0, 0)
 
 	// Use random port
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
