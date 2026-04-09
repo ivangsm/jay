@@ -34,14 +34,20 @@ func (s *Store) validateLocationRef(locationRef string) error {
 	return nil
 }
 
-// SafePath validates locationRef and returns the absolute path. It should be
-// used instead of AbsPath whenever locationRef originates from untrusted or
-// externally-stored input.
+// SafePath validates locationRef and returns the absolute path. Use this
+// whenever locationRef originates from untrusted or externally-stored input.
 func (s *Store) SafePath(locationRef string) (string, error) {
 	if err := s.validateLocationRef(locationRef); err != nil {
 		return "", err
 	}
 	return filepath.Join(s.dataDir, locationRef), nil
+}
+
+// BucketObjectsDir returns the absolute path to a bucket's objects directory.
+// Callers that only need to walk a bucket's directory tree should use this
+// instead of constructing paths manually.
+func (s *Store) BucketObjectsDir(bucketID string) string {
+	return filepath.Join(s.dataDir, "buckets", bucketID, "objects")
 }
 
 // Store manages physical object files on the filesystem.
@@ -65,10 +71,10 @@ func ObjectPath(bucketID, objectID string) string {
 	return filepath.Join("buckets", bucketID, "objects", objectID[:2], objectID[2:4], objectID)
 }
 
-// AbsPath returns the absolute path for a location_ref.
-// Deprecated: AbsPath does not validate the locationRef. Use SafePath for
-// untrusted input to prevent path traversal attacks.
-func (s *Store) AbsPath(locationRef string) string {
+// absPath returns the absolute path for a location_ref without validation.
+// Only use this for internally-constructed refs. Use SafePath for any input
+// that originated outside the store package.
+func (s *Store) absPath(locationRef string) string {
 	return filepath.Join(s.dataDir, locationRef)
 }
 
@@ -76,9 +82,9 @@ func (s *Store) AbsPath(locationRef string) string {
 // moves it to its final location. Returns checksum, size, and locationRef.
 //
 // The sequence ensures durability:
-//  1. Write to temp file
+//  1. Write to temp file (.writing suffix so GC can identify in-flight writes)
 //  2. fsync temp file
-//  3. Rename to final path
+//  3. Rename directly to final path
 //  4. fsync parent directory
 func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum string, size int64, locationRef string, err error) {
 	// Create temp file in same filesystem for atomic rename.
@@ -113,18 +119,9 @@ func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum
 		return "", 0, "", fmt.Errorf("store: close temp: %w", err)
 	}
 
-	// Remove .writing suffix to signal that the write is complete and the file
-	// is ready for rename. This makes the file eligible for GC cleanup if the
-	// final rename below fails and the temp file becomes orphaned.
-	readyPath := strings.TrimSuffix(tmpPath, ".writing")
-	if err = os.Rename(tmpPath, readyPath); err != nil {
-		return "", 0, "", fmt.Errorf("store: mark temp ready: %w", err)
-	}
-	tmpPath = readyPath
-
 	checksum = hex.EncodeToString(h.Sum(nil))
 	locationRef = ObjectPath(bucketID, objectID)
-	finalPath := s.AbsPath(locationRef)
+	finalPath := s.absPath(locationRef)
 
 	// Ensure parent directory exists
 	parentDir := filepath.Dir(finalPath)
@@ -132,10 +129,11 @@ func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum
 		return "", 0, "", fmt.Errorf("store: mkdir: %w", err)
 	}
 
-	// Atomic rename
+	// Atomic rename directly from the .writing temp to the final path.
 	if err = os.Rename(tmpPath, finalPath); err != nil {
 		return "", 0, "", fmt.Errorf("store: rename: %w", err)
 	}
+	tmpPath = finalPath
 
 	// fsync parent directory to make the rename durable
 	if err = fsyncDir(parentDir); err != nil {
@@ -273,9 +271,9 @@ func (s *Store) DataDir() string {
 	return s.dataDir
 }
 
-// objectExists checks if a physical object file exists at the location ref within this store.
+// ObjectExists checks if a physical object file exists at the location ref within this store.
 func (s *Store) ObjectExists(obj *meta.Object) bool {
-	_, err := os.Stat(s.AbsPath(obj.LocationRef))
+	_, err := os.Stat(s.absPath(obj.LocationRef))
 	return err == nil
 }
 

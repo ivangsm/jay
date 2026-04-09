@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // PartPath returns the relative path for a multipart part.
@@ -56,18 +55,13 @@ func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (chec
 		return "", 0, "", fmt.Errorf("store: close part: %w", err)
 	}
 
-	// Remove .writing suffix now that the write is complete.
-	readyPath := strings.TrimSuffix(tmpPath, ".writing")
-	if err = os.Rename(tmpPath, readyPath); err != nil {
-		return "", 0, "", fmt.Errorf("store: mark part ready: %w", err)
-	}
-	tmpPath = readyPath
-
 	checksum = hex.EncodeToString(h.Sum(nil))
 
+	// Atomic rename directly from the .writing temp to the final part path.
 	if err = os.Rename(tmpPath, finalPath); err != nil {
 		return "", 0, "", fmt.Errorf("store: rename part: %w", err)
 	}
+	tmpPath = finalPath
 
 	if err = fsyncDir(filepath.Dir(finalPath)); err != nil {
 		return "", 0, "", fmt.Errorf("store: fsync part dir: %w", err)
@@ -123,13 +117,6 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 		return "", 0, "", fmt.Errorf("store: close assembled: %w", err)
 	}
 
-	// Remove .writing suffix now that the write is complete.
-	readyPath := strings.TrimSuffix(tmpPath, ".writing")
-	if err = os.Rename(tmpPath, readyPath); err != nil {
-		return "", 0, "", fmt.Errorf("store: mark assemble ready: %w", err)
-	}
-	tmpPath = readyPath
-
 	checksum = hex.EncodeToString(h.Sum(nil))
 	locationRef = ObjectPath(bucketID, objectID)
 	finalPath, err := s.SafePath(locationRef)
@@ -141,9 +128,11 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 		return "", 0, "", fmt.Errorf("store: mkdir assembled: %w", err)
 	}
 
+	// Atomic rename directly from the .writing temp to the final object path.
 	if err = os.Rename(tmpPath, finalPath); err != nil {
 		return "", 0, "", fmt.Errorf("store: rename assembled: %w", err)
 	}
+	tmpPath = finalPath
 
 	if err = fsyncDir(filepath.Dir(finalPath)); err != nil {
 		return "", 0, "", fmt.Errorf("store: fsync assembled dir: %w", err)
