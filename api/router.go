@@ -71,6 +71,16 @@ func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
+	// Custom JSON endpoint: GET /buckets/{name}/stats
+	// This is NOT an S3 API path; it returns JSON and is auth'd by bucket:read-meta.
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/buckets/") && strings.HasSuffix(r.URL.Path, "/stats") {
+		name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/buckets/"), "/stats")
+		if name != "" && !strings.Contains(name, "/") {
+			h.handleBucketStats(w, r, name)
+			return
+		}
+	}
+
 	// Parse path: /<bucket> or /<bucket>/<key...>
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
