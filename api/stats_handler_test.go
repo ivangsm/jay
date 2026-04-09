@@ -65,7 +65,7 @@ func TestBucketStatsHandler_Empty(t *testing.T) {
 		t.Fatalf("create bucket: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/buckets/bk1/stats", nil)
+	req := httptest.NewRequest(http.MethodGet, "/_stats/bk1", nil)
 	req.Header.Set("Authorization", "Bearer "+tok.TokenID+":"+secret)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -99,7 +99,7 @@ func TestBucketStatsHandler_WithObjects(t *testing.T) {
 		})
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/buckets/bk2/stats", nil)
+	req := httptest.NewRequest(http.MethodGet, "/_stats/bk2", nil)
 	req.Header.Set("Authorization", "Bearer "+tok.TokenID+":"+secret)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -122,7 +122,7 @@ func TestBucketStatsHandler_Unauthorized(t *testing.T) {
 	b := &meta.Bucket{ID: uuid.New().String(), Name: "bk3", OwnerAccountID: tok.AccountID, Visibility: "private", Status: "active"}
 	_ = db.CreateBucket(b)
 
-	req := httptest.NewRequest(http.MethodGet, "/buckets/bk3/stats", nil)
+	req := httptest.NewRequest(http.MethodGet, "/_stats/bk3", nil)
 	// No Authorization header
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -134,7 +134,7 @@ func TestBucketStatsHandler_Unauthorized(t *testing.T) {
 
 func TestBucketStatsHandler_NonexistentBucket(t *testing.T) {
 	h, _, tok, secret := setupTestHandler(t)
-	req := httptest.NewRequest(http.MethodGet, "/buckets/doesnotexist/stats", nil)
+	req := httptest.NewRequest(http.MethodGet, "/_stats/doesnotexist", nil)
 	req.Header.Set("Authorization", "Bearer "+tok.TokenID+":"+secret)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)

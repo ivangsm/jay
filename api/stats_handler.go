@@ -8,15 +8,17 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
-// BucketStatsResponse is returned by GET /buckets/{name}/stats.
+// BucketStatsResponse is returned by GET /_stats/{name}.
 type BucketStatsResponse struct {
 	Bucket         string `json:"bucket"`
 	ObjectCount    int64  `json:"object_count"`
 	TotalSizeBytes int64  `json:"total_size_bytes"`
 }
 
-// handleBucketStats handles GET /buckets/{name}/stats.
+// handleBucketStats handles GET /_stats/{name}.
 // Requires a regular token with the bucket:read-meta action.
+// The "/_stats/" prefix is non-collidable with S3 bucket paths since Jay
+// bucket names cannot start with an underscore (see api/bucket_handlers.go).
 func (h *Handler) handleBucketStats(w http.ResponseWriter, r *http.Request, bucketName string) {
 	_, ok := h.requireAuth(r, w, meta.ActionBucketReadMeta, bucketName, "")
 	if !ok {

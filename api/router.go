@@ -71,10 +71,13 @@ func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
-	// Custom JSON endpoint: GET /buckets/{name}/stats
+	// Custom JSON endpoint: GET /_stats/{name}
 	// This is NOT an S3 API path; it returns JSON and is auth'd by bucket:read-meta.
-	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/buckets/") && strings.HasSuffix(r.URL.Path, "/stats") {
-		name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/buckets/"), "/stats")
+	// The "/_stats/" prefix cannot collide with S3 bucket routes because Jay bucket
+	// names must match `^[a-z0-9]...[a-z0-9]$` (see api/bucket_handlers.go), so no
+	// valid bucket name starts with an underscore.
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/_stats/") {
+		name := strings.TrimPrefix(r.URL.Path, "/_stats/")
 		if name != "" && !strings.Contains(name, "/") {
 			h.handleBucketStats(w, r, name)
 			return
