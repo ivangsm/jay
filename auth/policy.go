@@ -22,17 +22,44 @@ type PolicyStatement struct {
 
 // PolicyConditions holds optional conditions for a policy statement.
 type PolicyConditions struct {
-	IPWhitelist []string `json:"ip_whitelist,omitempty"` // CIDR notation
+	IPWhitelist []string    `json:"ip_whitelist,omitempty"` // CIDR notation
+	parsedCIDRs []*net.IPNet // pre-parsed from IPWhitelist by Compile()
 }
 
-// EvaluatePolicy checks policy statements against the request context.
-// Returns: explicitly allowed, explicitly denied.
-func EvaluatePolicy(policy *BucketPolicy, tokenID, action, objectKey, clientIP string) (allowed, denied bool) {
+// Compile pre-parses all CIDRs in the policy statements so that
+// matchesIPConditionNets can use them without re-parsing on every request.
+// Call this after unmarshalling a BucketPolicy.
+func (p *BucketPolicy) Compile() {
+	if p == nil {
+		return
+	}
+	for i := range p.Statements {
+		cond := p.Statements[i].Conditions
+		if cond == nil || len(cond.IPWhitelist) == 0 {
+			continue
+		}
+		cond.parsedCIDRs = make([]*net.IPNet, 0, len(cond.IPWhitelist))
+		for _, cidr := range cond.IPWhitelist {
+			_, network, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+			cond.parsedCIDRs = append(cond.parsedCIDRs, network)
+		}
+	}
+}
+
+// EvaluatePolicyDeny checks policy deny statements against the request context.
+// Returns true if any deny statement matches (access should be refused).
+func EvaluatePolicyDeny(policy *BucketPolicy, tokenID, action, objectKey, clientIP string) bool {
 	if policy == nil {
-		return false, false
+		return false
 	}
 
 	for _, stmt := range policy.Statements {
+		if strings.ToLower(stmt.Effect) != "deny" {
+			continue
+		}
 		if !matchesSubject(stmt.Subjects, tokenID) {
 			continue
 		}
@@ -42,23 +69,22 @@ func EvaluatePolicy(policy *BucketPolicy, tokenID, action, objectKey, clientIP s
 		if !matchesPrefix(stmt.Prefixes, objectKey) {
 			continue
 		}
-		if stmt.Conditions != nil && !matchesIPCondition(stmt.Conditions.IPWhitelist, clientIP) {
+		if stmt.Conditions != nil && !matchesIPConditionNets(stmt.Conditions.parsedCIDRs, clientIP) {
 			continue
 		}
-
-		switch strings.ToLower(stmt.Effect) {
-		case "deny":
-			denied = true
-		case "allow":
-			allowed = true
-		}
+		return true
 	}
+	return false
+}
 
-	// Deny takes precedence over allow.
-	if denied {
-		allowed = false
+// EvaluatePolicy is a backward-compatible wrapper around EvaluatePolicyDeny.
+// Deprecated: Use EvaluatePolicyDeny instead. The allowed return value is
+// always false — policies in jay are deny-overlays on token-level permissions.
+func EvaluatePolicy(policy *BucketPolicy, tokenID, action, objectKey, clientIP string) (allowed, denied bool) {
+	if policy != nil {
+		policy.Compile()
 	}
-	return allowed, denied
+	return false, EvaluatePolicyDeny(policy, tokenID, action, objectKey, clientIP)
 }
 
 func matchesSubject(subjects []string, tokenID string) bool {
@@ -91,19 +117,15 @@ func matchesPrefix(prefixes []string, objectKey string) bool {
 	return false
 }
 
-func matchesIPCondition(cidrs []string, clientIP string) bool {
-	if len(cidrs) == 0 {
+func matchesIPConditionNets(networks []*net.IPNet, clientIP string) bool {
+	if len(networks) == 0 {
 		return true
 	}
 	ip := net.ParseIP(clientIP)
 	if ip == nil {
 		return false
 	}
-	for _, cidr := range cidrs {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
+	for _, network := range networks {
 		if network.Contains(ip) {
 			return true
 		}

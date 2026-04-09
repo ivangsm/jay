@@ -125,8 +125,9 @@ func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
 	// HTTP method
 	method := r.Method
 
-	// Canonical URI
-	uri := r.URL.Path
+	// Canonical URI — use EscapedPath per the AWS SigV4 spec so that
+	// keys with special characters (spaces, unicode) are percent-encoded.
+	uri := r.URL.EscapedPath()
 	if uri == "" {
 		uri = "/"
 	}

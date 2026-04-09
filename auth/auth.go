@@ -32,14 +32,19 @@ type authCacheEntry struct {
 
 // Auth handles authentication and authorization.
 type Auth struct {
-	db    *meta.DB
-	mu    sync.RWMutex
-	cache map[[32]byte]authCacheEntry
+	db        *meta.DB
+	mu        sync.RWMutex
+	cache     map[[32]byte]authCacheEntry
+	tokenKeys map[string]map[[32]byte]struct{} // tokenID → set of cache keys
 }
 
 // New creates an Auth instance.
 func New(db *meta.DB) *Auth {
-	return &Auth{db: db, cache: make(map[[32]byte]authCacheEntry)}
+	return &Auth{
+		db:        db,
+		cache:     make(map[[32]byte]authCacheEntry),
+		tokenKeys: make(map[string]map[[32]byte]struct{}),
+	}
 }
 
 // cacheKey produces a SHA-256 hash of tokenID:secret for cache lookup.
@@ -52,10 +57,11 @@ func cacheKey(tokenID, secret string) [32]byte {
 func (a *Auth) InvalidateToken(tokenID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for k, v := range a.cache {
-		if v.token.TokenID == tokenID {
+	if keys, ok := a.tokenKeys[tokenID]; ok {
+		for k := range keys {
 			delete(a.cache, k)
 		}
+		delete(a.tokenKeys, tokenID)
 	}
 }
 
@@ -140,9 +146,16 @@ func (a *Auth) validateToken(tokenID, secret string) (*meta.Token, error) {
 		return nil, ErrAccessDenied
 	}
 
-	// Store in cache.
+	// Store in cache — clone the token and strip SecretKey so the cache
+	// never holds the plaintext secret (Bearer auth only needs bcrypt).
+	cached := *token
+	cached.SecretKey = ""
 	a.mu.Lock()
-	a.cache[key] = authCacheEntry{token: token, expiresAt: now.Add(authCacheTTL)}
+	a.cache[key] = authCacheEntry{token: &cached, expiresAt: now.Add(authCacheTTL)}
+	if a.tokenKeys[token.TokenID] == nil {
+		a.tokenKeys[token.TokenID] = make(map[[32]byte]struct{})
+	}
+	a.tokenKeys[token.TokenID][key] = struct{}{}
 	a.mu.Unlock()
 
 	return token, nil
@@ -220,9 +233,9 @@ func (a *Auth) AuthorizeWithPolicy(token *meta.Token, action, bucketName, object
 		// Malformed policy should not silently grant access.
 		return ErrAccessDenied
 	}
+	policy.Compile()
 
-	_, denied := EvaluatePolicy(&policy, token.TokenID, action, objectKey, clientIP)
-	if denied {
+	if EvaluatePolicyDeny(&policy, token.TokenID, action, objectKey, clientIP) {
 		return ErrAccessDenied
 	}
 
