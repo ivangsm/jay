@@ -612,7 +612,10 @@ func DecodeBucketList(data []byte) (names []string, createdAts []string, err err
 // frameBufPool pools buffers for WriteFrameCombined to avoid per-response allocations.
 // Most meta-only responses (the majority of traffic) fit within 4KB.
 var frameBufPool = sync.Pool{
-	New: func() any { return make([]byte, 0, 4096) },
+	New: func() any {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
 }
 
 // WriteFrameCombined writes header + meta in a single write when possible.
@@ -626,8 +629,9 @@ func WriteFrameCombined(w io.Writer, opOrStatus byte, streamID uint32, meta []by
 
 	var buf []byte
 	if total <= 4096 {
-		buf = frameBufPool.Get().([]byte)[:total]
-		defer frameBufPool.Put(buf[:0])
+		bp := frameBufPool.Get().(*[]byte)
+		buf = (*bp)[:total]
+		defer func() { *bp = buf[:0]; frameBufPool.Put(bp) }()
 	} else {
 		buf = make([]byte, total)
 	}

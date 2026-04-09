@@ -231,7 +231,7 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 		// Check for shutdown before launching a new goroutine.
 		select {
 		case <-s.quit:
-			break
+			goto wait
 		default:
 		}
 
@@ -330,6 +330,7 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 		}(i, bucket, startKey)
 	}
 
+wait:
 	wg.Wait()
 
 	// Aggregate results and update shared state under the lock.
