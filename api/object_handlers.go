@@ -151,7 +151,7 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 			"Failed to read object", "/"+bucketName+"/"+objectKey)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	w.Header().Set("Content-Type", obj.ContentType)
 	w.Header().Set("ETag", formatETag(obj.ETag))
@@ -196,8 +196,12 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 					"location", obj.LocationRef,
 				)
 				h.readChecker.RecordCheck(false)
-				h.db.QuarantineObject(bucket.ID, objectKey)
-				h.store.Quarantine(obj.LocationRef)
+				if err := h.db.QuarantineObject(bucket.ID, objectKey); err != nil {
+					h.log.Error("quarantine object meta", "err", err, "bucket", bucketName, "key", objectKey)
+				}
+				if err := h.store.Quarantine(obj.LocationRef); err != nil {
+					h.log.Error("quarantine object file", "err", err, "location", obj.LocationRef)
+				}
 				writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 					"Object integrity check failed", "/"+bucketName+"/"+objectKey)
 				return
@@ -223,7 +227,9 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 			h.metrics.BytesDownloaded.Add(length)
 		}
 		w.WriteHeader(http.StatusPartialContent)
-		io.CopyN(w, f, length)
+		if _, err := io.CopyN(w, f, length); err != nil {
+			h.log.Warn("send object range", "err", err, "bucket", bucketName, "key", objectKey)
+		}
 		return
 	}
 
@@ -252,15 +258,21 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 				"location", obj.LocationRef,
 			)
 			h.readChecker.RecordCheck(false)
-			h.db.QuarantineObject(bucket.ID, objectKey)
-			h.store.Quarantine(obj.LocationRef)
+			if err := h.db.QuarantineObject(bucket.ID, objectKey); err != nil {
+				h.log.Error("quarantine object meta", "err", err, "bucket", bucketName, "key", objectKey)
+			}
+			if err := h.store.Quarantine(obj.LocationRef); err != nil {
+				h.log.Error("quarantine object file", "err", err, "location", obj.LocationRef)
+			}
 			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 				"Object integrity check failed", "/"+bucketName+"/"+objectKey)
 			return
 		}
 		h.readChecker.RecordCheck(true)
 		w.WriteHeader(http.StatusOK)
-		io.Copy(w, &buf)
+		if _, err := io.Copy(w, &buf); err != nil {
+			h.log.Warn("send verified object", "err", err, "bucket", bucketName, "key", objectKey)
+		}
 		return
 	}
 

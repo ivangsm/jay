@@ -15,9 +15,6 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
-// maxPresignExpiry is the maximum allowed expiration duration for presigned URLs (7 days).
-const maxPresignExpiry = 7 * 24 * time.Hour
-
 // presignedMetaParams are query parameters used by the presigned URL mechanism
 // and excluded from the canonical query string that is signed.
 var presignedMetaParams = map[string]bool{
@@ -57,40 +54,6 @@ func canonicalQuery(q url.Values) string {
 		}
 	}
 	return strings.Join(parts, "&")
-}
-
-func generatePresignedURL(signingSecret, scheme, host, tokenID, method, path string, expires time.Duration) (string, error) {
-	if signingSecret == "" {
-		return "", fmt.Errorf("signing secret not configured")
-	}
-	if tokenID == "" {
-		return "", fmt.Errorf("token_id is required")
-	}
-	if path == "" || path[0] != '/' {
-		return "", fmt.Errorf("path must start with /")
-	}
-	if expires > maxPresignExpiry {
-		return "", fmt.Errorf("expiration exceeds maximum of %d seconds", int(maxPresignExpiry.Seconds()))
-	}
-
-	expiresAt := time.Now().Add(expires).Unix()
-	expiresStr := strconv.FormatInt(expiresAt, 10)
-
-	// No extra query params when generating; canonical query is empty.
-	sig := computeSignature(signingSecret, tokenID, method, path, "", expiresStr)
-
-	u := url.URL{
-		Scheme: scheme,
-		Host:   host,
-		Path:   path,
-	}
-	q := u.Query()
-	q.Set("X-Jay-Token", tokenID)
-	q.Set("X-Jay-Expires", expiresStr)
-	q.Set("X-Jay-Signature", sig)
-	u.RawQuery = q.Encode()
-
-	return u.String(), nil
 }
 
 func validatePresignedRequest(r *http.Request, signingSecret string, db *meta.DB) (*meta.Token, error) {

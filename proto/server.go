@@ -67,7 +67,9 @@ func (s *Server) ListenAndServe(addr string) (func() error, error) {
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown() error {
 	close(s.quit)
-	s.listener.Close()
+	if err := s.listener.Close(); err != nil {
+		s.log.Debug("close listener", "err", err)
+	}
 	s.wg.Wait()
 	return nil
 }
@@ -87,7 +89,7 @@ func (s *Server) acceptLoop() {
 
 		if int(s.active.Load()) >= s.maxConns {
 			s.log.Warn("connection limit reached, rejecting", "remote", conn.RemoteAddr())
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 
@@ -100,34 +102,37 @@ func (s *Server) acceptLoop() {
 }
 
 func (s *Server) handleConn(nc net.Conn) {
-	defer nc.Close()
+	defer func() { _ = nc.Close() }()
 
 	br := bufio.NewReaderSize(nc, 64*1024)
 	bw := bufio.NewWriterSize(nc, 64*1024)
 
 	// Set handshake deadline
-	nc.SetDeadline(time.Now().Add(handshakeTimeout))
+	if err := nc.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		s.log.Debug("set handshake deadline", "err", err, "remote", nc.RemoteAddr())
+		return
+	}
 
 	// Handshake
 	credentials, err := ReadHandshake(br)
 	if err != nil {
 		s.log.Debug("handshake read error", "err", err, "remote", nc.RemoteAddr())
-		WriteHandshakeResponse(bw, HandshakeVersionMismatch)
-		bw.Flush()
+		_ = WriteHandshakeResponse(bw, HandshakeVersionMismatch)
+		_ = bw.Flush()
 		return
 	}
 
 	parts := strings.SplitN(credentials, ":", 2)
 	if len(parts) != 2 {
-		WriteHandshakeResponse(bw, HandshakeAuthFailed)
-		bw.Flush()
+		_ = WriteHandshakeResponse(bw, HandshakeAuthFailed)
+		_ = bw.Flush()
 		return
 	}
 
 	token, err := s.auth.AuthenticateCredentials(parts[0], parts[1])
 	if err != nil {
-		WriteHandshakeResponse(bw, HandshakeAuthFailed)
-		bw.Flush()
+		_ = WriteHandshakeResponse(bw, HandshakeAuthFailed)
+		_ = bw.Flush()
 		return
 	}
 
@@ -139,7 +144,10 @@ func (s *Server) handleConn(nc net.Conn) {
 	}
 
 	// Clear handshake deadline
-	nc.SetDeadline(time.Time{})
+	if err := nc.SetDeadline(time.Time{}); err != nil {
+		s.log.Debug("clear handshake deadline", "err", err, "remote", nc.RemoteAddr())
+		return
+	}
 
 	// Connection handler
 	h := &connHandler{
@@ -162,7 +170,10 @@ func (s *Server) handleConn(nc net.Conn) {
 		}
 
 		// Set idle timeout before waiting for next request header
-		nc.SetReadDeadline(time.Now().Add(idleTimeout))
+		if err := nc.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+			s.log.Debug("set read deadline", "err", err, "remote", nc.RemoteAddr())
+			return
+		}
 
 		if err := h.handleOneRequest(); err != nil {
 			if err != io.EOF && !isConnClosed(err) {
@@ -192,7 +203,9 @@ func (h *connHandler) handleOneRequest() error {
 	}
 
 	// Clear the idle deadline now that we have a request header
-	h.conn.SetReadDeadline(time.Time{})
+	if err := h.conn.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear idle deadline: %w", err)
+	}
 
 	// Read metadata payload
 	var metaPayload []byte
@@ -214,7 +227,9 @@ func (h *connHandler) handleOneRequest() error {
 		if timeout < minDataReadTimeout {
 			timeout = minDataReadTimeout
 		}
-		h.conn.SetReadDeadline(time.Now().Add(timeout))
+		if err := h.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return fmt.Errorf("set data read deadline: %w", err)
+		}
 		dataReader = io.LimitReader(h.br, dataLen)
 	}
 
@@ -231,7 +246,9 @@ func (h *connHandler) handleOneRequest() error {
 	}
 
 	// Clear data read deadline after request is handled
-	h.conn.SetReadDeadline(time.Time{})
+	if err := h.conn.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear data read deadline: %w", err)
+	}
 
 	return h.bw.Flush()
 }

@@ -92,7 +92,7 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 			"Failed to read source", copySource)
 		return
 	}
-	defer srcFile.Close()
+	defer func() { _ = srcFile.Close() }()
 
 	newObjectID := uuid.New().String()
 	checksum, size, locationRef, err := h.store.WriteObject(dstBucketMeta.ID, newObjectID, srcFile)
@@ -120,14 +120,18 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 
 	prev, err := h.db.PutObjectMeta(newObj)
 	if err != nil {
-		h.store.DeleteObject(locationRef)
+		if delErr := h.store.DeleteObject(locationRef); delErr != nil {
+			h.log.Error("copy: rollback delete after meta failure", "err", delErr, "location", locationRef)
+		}
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 			"Failed to store metadata", "/"+dstBucket+"/"+dstKey)
 		return
 	}
 
 	if prev != nil && prev.LocationRef != locationRef {
-		h.store.DeleteObject(prev.LocationRef)
+		if err := h.store.DeleteObject(prev.LocationRef); err != nil {
+			h.log.Error("copy: delete previous version", "err", err, "location", prev.LocationRef)
+		}
 	}
 
 	writeXML(w, r, http.StatusOK, CopyObjectResult{

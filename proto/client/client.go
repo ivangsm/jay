@@ -54,7 +54,7 @@ func (c *Client) Close() error {
 
 	close(c.pool)
 	for cn := range c.pool {
-		cn.nc.Close()
+		_ = cn.nc.Close()
 	}
 	return nil
 }
@@ -83,18 +83,18 @@ func (c *Client) putConn(cn *conn) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		cn.nc.Close()
+		_ = cn.nc.Close()
 		return
 	}
 	select {
 	case c.pool <- cn:
 	default:
-		cn.nc.Close()
+		_ = cn.nc.Close()
 	}
 }
 
 func (c *Client) dropConn(cn *conn) {
-	cn.nc.Close()
+	_ = cn.nc.Close()
 }
 
 func (c *Client) newConn() (*conn, error) {
@@ -109,21 +109,21 @@ func (c *Client) newConn() (*conn, error) {
 	// Handshake
 	credentials := c.tokenID + ":" + c.secret
 	if err := proto.WriteHandshake(bw, credentials); err != nil {
-		nc.Close()
+		_ = nc.Close()
 		return nil, fmt.Errorf("jay client: write handshake: %w", err)
 	}
 	if err := bw.Flush(); err != nil {
-		nc.Close()
+		_ = nc.Close()
 		return nil, fmt.Errorf("jay client: flush handshake: %w", err)
 	}
 
 	status, err := proto.ReadHandshakeResponse(br)
 	if err != nil {
-		nc.Close()
+		_ = nc.Close()
 		return nil, fmt.Errorf("jay client: read handshake response: %w", err)
 	}
 	if status != proto.HandshakeOK {
-		nc.Close()
+		_ = nc.Close()
 		switch status {
 		case proto.HandshakeAuthFailed:
 			return nil, fmt.Errorf("jay client: authentication failed")

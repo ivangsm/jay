@@ -50,7 +50,7 @@ func main() {
 		log.Error("failed to open metadata db", "err", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Initialize object store
 	st, err := store.New(cfg.DataDir)
@@ -95,13 +95,12 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if _, err := backupMgr.Run(); err != nil {
-					log.Error("backup failed", "err", err)
-				}
-				backupMgr.Prune(7*24*time.Hour, 3)
+		for range ticker.C {
+			if _, err := backupMgr.Run(); err != nil {
+				log.Error("backup failed", "err", err)
+			}
+			if _, err := backupMgr.Prune(7*24*time.Hour, 3); err != nil {
+				log.Error("backup prune failed", "err", err)
 			}
 		}
 	}()

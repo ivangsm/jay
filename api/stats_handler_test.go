@@ -23,7 +23,7 @@ func setupTestHandler(t *testing.T) (*Handler, *meta.DB, *meta.Token, string) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
 	if err != nil {

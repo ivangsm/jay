@@ -20,7 +20,9 @@ type BackupManager struct {
 
 // NewBackupManager creates a backup manager.
 func NewBackupManager(dbPath, backupDir string, log *slog.Logger) *BackupManager {
-	os.MkdirAll(backupDir, 0o755)
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		log.Error("create backup dir", "err", err, "path", backupDir)
+	}
 	return &BackupManager{dbPath: dbPath, backupDir: backupDir, log: log}
 }
 
@@ -35,7 +37,7 @@ func (bm *BackupManager) Run() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("backup: open db: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	backupPath := filepath.Join(bm.backupDir, fmt.Sprintf("jay-%s.db", ts))
@@ -50,13 +52,13 @@ func (bm *BackupManager) Run() (string, error) {
 		return err
 	})
 	if err != nil {
-		f.Close()
-		os.Remove(backupPath)
+		_ = f.Close()
+		_ = os.Remove(backupPath)
 		return "", fmt.Errorf("backup: write snapshot: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return "", fmt.Errorf("backup: fsync: %w", err)
 	}
 	if err := f.Close(); err != nil {
@@ -77,7 +79,7 @@ func (bm *BackupManager) Verify(backupPath string) (*BackupVerifyResult, error) 
 	if err != nil {
 		return nil, fmt.Errorf("verify: open: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	result := &BackupVerifyResult{}
 
@@ -91,28 +93,36 @@ func (bm *BackupManager) Verify(backupPath string) (*BackupVerifyResult, error) 
 
 		// Count buckets
 		bk := tx.Bucket([]byte("buckets"))
-		bk.ForEach(func(k, v []byte) error {
+		if err := bk.ForEach(func(k, v []byte) error {
 			result.BucketCount++
 			return nil
-		})
+		}); err != nil {
+			return fmt.Errorf("verify: count buckets: %w", err)
+		}
 
 		// Count tokens
 		tk := tx.Bucket([]byte("tokens"))
-		tk.ForEach(func(k, v []byte) error {
+		if err := tk.ForEach(func(k, v []byte) error {
 			result.TokenCount++
 			return nil
-		})
+		}); err != nil {
+			return fmt.Errorf("verify: count tokens: %w", err)
+		}
 
 		// Count objects across all obj: buckets
-		tx.ForEach(func(name []byte, b *bolt.Bucket) error {
+		if err := tx.ForEach(func(name []byte, b *bolt.Bucket) error {
 			if len(name) > 4 && string(name[:4]) == "obj:" {
-				b.ForEach(func(k, v []byte) error {
+				if err := b.ForEach(func(k, v []byte) error {
 					result.ObjectCount++
 					return nil
-				})
+				}); err != nil {
+					return err
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			return fmt.Errorf("verify: count objects: %w", err)
+		}
 
 		// Check version
 		sys := tx.Bucket([]byte("sys"))
@@ -195,7 +205,7 @@ func (bm *BackupManager) BackupToWriter(w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("backup: open db: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	return db.View(func(tx *bolt.Tx) error {
 		_, err := tx.WriteTo(w)

@@ -31,7 +31,9 @@ func (db *DB) ensureMultipartBucket() error {
 
 // CreateMultipartUpload starts a new multipart upload.
 func (db *DB) CreateMultipartUpload(upload *MultipartUpload) error {
-	db.ensureMultipartBucket()
+	if err := db.ensureMultipartBucket(); err != nil {
+		return fmt.Errorf("ensure multipart bucket: %w", err)
+	}
 
 	if upload.CreatedAt.IsZero() {
 		upload.CreatedAt = time.Now().UTC()
@@ -252,7 +254,7 @@ func (db *DB) CleanupExpiredUploads(maxAge time.Duration) ([]MultipartUpload, er
 			return nil
 		}
 		var toDelete [][]byte
-		bk.ForEach(func(k, v []byte) error {
+		if err := bk.ForEach(func(k, v []byte) error {
 			var u MultipartUpload
 			if err := json.Unmarshal(v, &u); err != nil {
 				slog.Warn("meta: corrupt multipart upload record", "key", string(k), "err", err)
@@ -267,9 +269,13 @@ func (db *DB) CleanupExpiredUploads(maxAge time.Duration) ([]MultipartUpload, er
 				toDelete = append(toDelete, append([]byte{}, k...))
 			}
 			return nil
-		})
+		}); err != nil {
+			return fmt.Errorf("scan multipart uploads: %w", err)
+		}
 		for _, k := range toDelete {
-			bk.Delete(k)
+			if err := bk.Delete(k); err != nil {
+				return fmt.Errorf("delete expired upload: %w", err)
+			}
 		}
 		return nil
 	})

@@ -39,7 +39,7 @@ func setup(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
 	if err != nil {
@@ -79,13 +79,13 @@ func setup(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	shutdown, err := srv.ListenAndServe(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { shutdown() })
+	t.Cleanup(func() { _ = shutdown() })
 
 	return &testEnv{
 		db:       db,
@@ -104,7 +104,7 @@ func dial(t *testing.T, env *testEnv) *client.Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	return c
 }
 
@@ -170,7 +170,9 @@ func TestObjectLifecycle(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	c.CreateBucket("mybucket")
+	if _, err := c.CreateBucket("mybucket"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Put
 	content := "hello native protocol!"
@@ -193,7 +195,7 @@ func TestObjectLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := io.ReadAll(getResult.Body)
-	getResult.Body.Close()
+	_ = getResult.Body.Close()
 	if string(got) != content {
 		t.Fatalf("get: got %q, want %q", got, content)
 	}
@@ -226,20 +228,26 @@ func TestObjectOverwrite(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	c.CreateBucket("mybucket")
+	if _, err := c.CreateBucket("mybucket"); err != nil {
+		t.Fatal(err)
+	}
 
 	v1 := "version1"
-	c.PutObject("mybucket", "data.bin", strings.NewReader(v1), int64(len(v1)), nil)
+	if _, err := c.PutObject("mybucket", "data.bin", strings.NewReader(v1), int64(len(v1)), nil); err != nil {
+		t.Fatal(err)
+	}
 
 	v2 := "version2"
-	c.PutObject("mybucket", "data.bin", strings.NewReader(v2), int64(len(v2)), nil)
+	if _, err := c.PutObject("mybucket", "data.bin", strings.NewReader(v2), int64(len(v2)), nil); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := c.GetObject("mybucket", "data.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, _ := io.ReadAll(result.Body)
-	result.Body.Close()
+	_ = result.Body.Close()
 	if string(got) != v2 {
 		t.Fatalf("overwrite: got %q, want %q", got, v2)
 	}
@@ -249,7 +257,9 @@ func TestLargeObject(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	c.CreateBucket("bigbucket")
+	if _, err := c.CreateBucket("bigbucket"); err != nil {
+		t.Fatal(err)
+	}
 
 	// 1MB object
 	size := int64(1 << 20)
@@ -266,7 +276,7 @@ func TestLargeObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := io.ReadAll(result.Body)
-	result.Body.Close()
+	_ = result.Body.Close()
 
 	if !bytes.Equal(got, data) {
 		t.Fatal("large object data mismatch")
@@ -277,10 +287,14 @@ func TestListObjects(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	c.CreateBucket("listbucket")
+	if _, err := c.CreateBucket("listbucket"); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, key := range []string{"photos/a.jpg", "photos/b.jpg", "docs/readme.md", "root.txt"} {
-		c.PutObject("listbucket", key, strings.NewReader("data"), 4, nil)
+		if _, err := c.PutObject("listbucket", key, strings.NewReader("data"), 4, nil); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// List all
@@ -318,8 +332,12 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	c.CreateBucket("notempty")
-	c.PutObject("notempty", "file.txt", strings.NewReader("data"), 4, nil)
+	if _, err := c.CreateBucket("notempty"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.PutObject("notempty", "file.txt", strings.NewReader("data"), 4, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	err := c.DeleteBucket("notempty")
 	if err == nil {
@@ -350,7 +368,9 @@ func TestUserMetadata(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	c.CreateBucket("metabucket")
+	if _, err := c.CreateBucket("metabucket"); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := c.PutObject("metabucket", "file.txt", strings.NewReader("data"), 4,
 		&client.PutOptions{
@@ -373,7 +393,9 @@ func TestConnectionReuse(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	c.CreateBucket("reuse")
+	if _, err := c.CreateBucket("reuse"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Multiple operations on the same client (reuses connections)
 	for i := range 10 {

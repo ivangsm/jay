@@ -37,8 +37,8 @@ func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (chec
 
 	defer func() {
 		if err != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -88,8 +88,8 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 
 	defer func() {
 		if err != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -108,7 +108,7 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 			return
 		}
 		n, cerr := io.Copy(w, f)
-		f.Close()
+		_ = f.Close()
 		if cerr != nil {
 			err = fmt.Errorf("store: copy part %s: %w", loc, cerr)
 			return

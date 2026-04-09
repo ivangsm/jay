@@ -67,7 +67,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { db.Close() })
+	b.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
 	if err != nil {
@@ -101,7 +101,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 		AccountID string `json:"account_id"`
 	}
 	respBytes, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err := json.Unmarshal(respBytes, &acctResult); err != nil {
 		b.Fatalf("decode account response: %v (body: %s)", err, respBytes)
 	}
@@ -120,7 +120,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 		Secret  string `json:"secret"`
 	}
 	respBytes, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err := json.Unmarshal(respBytes, &tokenResult); err != nil {
 		b.Fatalf("decode token response: %v (body: %s)", err, respBytes)
 	}
@@ -134,7 +134,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	if err != nil {
 		b.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	return &benchS3Env{
 		s3Server:    s3Srv,
@@ -153,7 +153,7 @@ func setupNativeBench(b *testing.B) *benchNativeEnv {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { db.Close() })
+	b.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
 	if err != nil {
@@ -191,19 +191,19 @@ func setupNativeBench(b *testing.B) *benchNativeEnv {
 		b.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	shutdown, err := srv.ListenAndServe(addr)
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { shutdown() })
+	b.Cleanup(func() { _ = shutdown() })
 
 	c, err := client.Dial(addr, "bench-token", secret, 16)
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { c.Close() })
+	b.Cleanup(func() { _ = c.Close() })
 
 	if _, err := c.CreateBucket("benchbucket"); err != nil {
 		b.Fatal(err)
@@ -245,7 +245,7 @@ func BenchmarkS3PutObject(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				if resp.StatusCode != 200 {
 					b.Fatalf("put: status %d", resp.StatusCode)
 				}
@@ -267,7 +267,7 @@ func BenchmarkS3GetObject(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		b.Run(sz.name, func(b *testing.B) {
 			b.SetBytes(sz.size)
@@ -279,8 +279,8 @@ func BenchmarkS3GetObject(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
 				if resp.StatusCode != 200 {
 					b.Fatalf("get: status %d", resp.StatusCode)
 				}
@@ -300,7 +300,7 @@ func BenchmarkS3HeadObject(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	b.ResetTimer()
 	for b.Loop() {
@@ -310,7 +310,7 @@ func BenchmarkS3HeadObject(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != 200 {
 			b.Fatalf("head: status %d", resp.StatusCode)
 		}
@@ -333,7 +333,7 @@ func BenchmarkS3DeleteObject(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		b.StartTimer()
 
 		req, _ = http.NewRequest("DELETE", env.s3Server.URL+key, nil)
@@ -342,7 +342,7 @@ func BenchmarkS3DeleteObject(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		i++
 	}
 }
@@ -358,7 +358,7 @@ func BenchmarkS3ListObjects(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 
 	b.ResetTimer()
@@ -369,8 +369,8 @@ func BenchmarkS3ListObjects(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 		if resp.StatusCode != 200 {
 			b.Fatalf("list: status %d", resp.StatusCode)
 		}
@@ -401,7 +401,7 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 			b.Fatal(err)
 		}
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		// Parse upload ID from XML
 		uploadID := extractXMLValue(string(body), "UploadId")
 		if uploadID == "" {
@@ -419,7 +419,7 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 				b.Fatal(err)
 			}
 			etags[p] = resp.Header.Get("ETag")
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 
 		// Complete
@@ -436,7 +436,7 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != 200 {
 			b.Fatalf("complete: status %d", resp.StatusCode)
 		}
@@ -469,7 +469,7 @@ func BenchmarkS3PutObjectConcurrent(b *testing.B) {
 						if err != nil {
 							b.Fatal(err)
 						}
-						resp.Body.Close()
+						_ = resp.Body.Close()
 					}
 				})
 			})
@@ -488,7 +488,7 @@ func BenchmarkS3GetObjectConcurrent(b *testing.B) {
 			req, _ := http.NewRequest("PUT", env.s3Server.URL+key, bytes.NewReader(data))
 			req.Header.Set("Authorization", env.auth)
 			resp, _ := http.DefaultClient.Do(req)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 
 		for _, conc := range concurrencyLevels {
@@ -507,8 +507,8 @@ func BenchmarkS3GetObjectConcurrent(b *testing.B) {
 						if err != nil {
 							b.Fatal(err)
 						}
-						io.Copy(io.Discard, resp.Body)
-						resp.Body.Close()
+						_, _ = io.Copy(io.Discard, resp.Body)
+						_ = resp.Body.Close()
 					}
 				})
 			})
@@ -562,8 +562,8 @@ func BenchmarkNativeGetObject(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				io.Copy(io.Discard, result.Body)
-				result.Body.Close()
+				_, _ = io.Copy(io.Discard, result.Body)
+				_ = result.Body.Close()
 			}
 		})
 	}
@@ -694,7 +694,7 @@ func BenchmarkNativePutObjectConcurrent(b *testing.B) {
 				}
 				b.Cleanup(func() {
 					for _, c := range clients {
-						c.Close()
+						_ = c.Close()
 					}
 				})
 
@@ -760,7 +760,7 @@ func BenchmarkNativeGetObjectConcurrent(b *testing.B) {
 				}
 				b.Cleanup(func() {
 					for _, c := range clients {
-						c.Close()
+						_ = c.Close()
 					}
 				})
 
@@ -786,8 +786,8 @@ func BenchmarkNativeGetObjectConcurrent(b *testing.B) {
 								b.Error(err)
 								return
 							}
-							io.Copy(io.Discard, result.Body)
-							result.Body.Close()
+							_, _ = io.Copy(io.Discard, result.Body)
+							_ = result.Body.Close()
 						}
 					}(clients[g])
 				}

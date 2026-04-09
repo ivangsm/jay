@@ -210,7 +210,9 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	}
 
 	if prev != nil && prev.LocationRef != locationRef {
-		h.store.DeleteObject(prev.LocationRef)
+		if err := h.store.DeleteObject(prev.LocationRef); err != nil {
+			h.log.Warn("delete previous object version", "err", err, "location", prev.LocationRef)
+		}
 	}
 
 	// Cleanup parts (best-effort)

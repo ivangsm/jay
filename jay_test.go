@@ -49,7 +49,7 @@ func setup(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
 	if err != nil {
@@ -96,11 +96,13 @@ func createTestAccount(t *testing.T, adminURL string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var result struct {
 		AccountID string `json:"account_id"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode account: %v", err)
+	}
 	return result.AccountID
 }
 
@@ -114,12 +116,14 @@ func createTestToken(t *testing.T, adminURL, accountID string) (string, string) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var result struct {
 		TokenID string `json:"token_id"`
 		Secret  string `json:"secret"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
 	return result.TokenID, result.Secret
 }
 
@@ -142,35 +146,35 @@ func TestBucketLifecycle(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("create bucket: got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Head bucket
 	resp = env.s3Request(t, "HEAD", "/test-bucket", nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("head bucket: got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Create duplicate bucket
 	resp = env.s3Request(t, "PUT", "/test-bucket", nil)
 	if resp.StatusCode != 409 {
 		t.Fatalf("duplicate bucket: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Delete bucket
 	resp = env.s3Request(t, "DELETE", "/test-bucket", nil)
 	if resp.StatusCode != 204 {
 		t.Fatalf("delete bucket: got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Head deleted bucket
 	resp = env.s3Request(t, "HEAD", "/test-bucket", nil)
 	if resp.StatusCode != 404 {
 		t.Fatalf("head deleted bucket: expected 404, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestObjectLifecycle(t *testing.T) {
@@ -178,7 +182,7 @@ func TestObjectLifecycle(t *testing.T) {
 
 	// Create bucket
 	resp := env.s3Request(t, "PUT", "/mybucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Put object
 	content := "hello, jay!"
@@ -191,7 +195,7 @@ func TestObjectLifecycle(t *testing.T) {
 	if etag == "" {
 		t.Fatal("put object: missing ETag")
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Get object
 	resp = env.s3Request(t, "GET", "/mybucket/greeting.txt", nil)
@@ -199,7 +203,7 @@ func TestObjectLifecycle(t *testing.T) {
 		t.Fatalf("get object: got %d", resp.StatusCode)
 	}
 	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if string(got) != content {
 		t.Fatalf("get object: got %q, want %q", got, content)
 	}
@@ -212,48 +216,48 @@ func TestObjectLifecycle(t *testing.T) {
 	if resp.Header.Get("Content-Length") != "11" {
 		t.Fatalf("head object: wrong content-length: %s", resp.Header.Get("Content-Length"))
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Delete object
 	resp = env.s3Request(t, "DELETE", "/mybucket/greeting.txt", nil)
 	if resp.StatusCode != 204 {
 		t.Fatalf("delete object: got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Get deleted object
 	resp = env.s3Request(t, "GET", "/mybucket/greeting.txt", nil)
 	if resp.StatusCode != 404 {
 		t.Fatalf("get deleted: expected 404, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Delete non-existent returns 204 (S3 behavior)
 	resp = env.s3Request(t, "DELETE", "/mybucket/nonexistent.txt", nil)
 	if resp.StatusCode != 204 {
 		t.Fatalf("delete non-existent: expected 204, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestObjectOverwrite(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/mybucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Put v1
 	resp = env.s3Request(t, "PUT", "/mybucket/data.bin", strings.NewReader("version1"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Put v2 (overwrite)
 	resp = env.s3Request(t, "PUT", "/mybucket/data.bin", strings.NewReader("version2"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Get should return v2
 	resp = env.s3Request(t, "GET", "/mybucket/data.bin", nil)
 	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if string(got) != "version2" {
 		t.Fatalf("overwrite: got %q, want %q", got, "version2")
 	}
@@ -263,18 +267,18 @@ func TestListObjectsV2(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/listbucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Put several objects
 	for _, key := range []string{"photos/a.jpg", "photos/b.jpg", "docs/readme.md", "root.txt"} {
 		resp = env.s3Request(t, "PUT", "/listbucket/"+key, strings.NewReader("data"))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 
 	// List all
 	resp = env.s3Request(t, "GET", "/listbucket?list-type=2", nil)
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	var result jayapi.ListBucketResult
 	if err := xml.Unmarshal(body, &result); err != nil {
@@ -287,9 +291,11 @@ func TestListObjectsV2(t *testing.T) {
 	// List with prefix
 	resp = env.s3Request(t, "GET", "/listbucket?list-type=2&prefix=photos/", nil)
 	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	result = jayapi.ListBucketResult{}
-	xml.Unmarshal(body, &result)
+	if err := xml.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal prefix list: %v", err)
+	}
 	if len(result.Contents) != 2 {
 		t.Fatalf("list prefix: got %d, want 2", len(result.Contents))
 	}
@@ -297,9 +303,11 @@ func TestListObjectsV2(t *testing.T) {
 	// List with delimiter
 	resp = env.s3Request(t, "GET", "/listbucket?list-type=2&delimiter=/", nil)
 	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	result = jayapi.ListBucketResult{}
-	xml.Unmarshal(body, &result)
+	if err := xml.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal delimiter list: %v", err)
+	}
 	if len(result.Contents) != 1 {
 		t.Fatalf("list delimiter objects: got %d, want 1 (root.txt)", len(result.Contents))
 	}
@@ -312,16 +320,16 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/notempty", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	resp = env.s3Request(t, "PUT", "/notempty/file.txt", strings.NewReader("data"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	resp = env.s3Request(t, "DELETE", "/notempty", nil)
 	if resp.StatusCode != 409 {
 		t.Fatalf("delete non-empty bucket: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestUnauthorized(t *testing.T) {
@@ -336,7 +344,7 @@ func TestUnauthorized(t *testing.T) {
 	if resp.StatusCode != 403 {
 		t.Fatalf("no auth: expected 403, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Request with bad token
 	req, _ = http.NewRequest("PUT", env.s3Server.URL+"/anybucket", nil)
@@ -348,7 +356,7 @@ func TestUnauthorized(t *testing.T) {
 	if resp.StatusCode != 403 {
 		t.Fatalf("bad auth: expected 403, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestListBuckets(t *testing.T) {
@@ -356,13 +364,13 @@ func TestListBuckets(t *testing.T) {
 
 	// Create two buckets
 	resp := env.s3Request(t, "PUT", "/alpha-bucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	resp = env.s3Request(t, "PUT", "/beta-bucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	resp = env.s3Request(t, "GET", "/", nil)
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	var result jayapi.ListAllMyBucketsResult
 	if err := xml.Unmarshal(body, &result); err != nil {
@@ -377,7 +385,7 @@ func TestUserMetadata(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/metabucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Put with custom metadata
 	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/metabucket/file.txt",
@@ -385,7 +393,7 @@ func TestUserMetadata(t *testing.T) {
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-meta-custom", "myvalue")
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Head should return custom metadata
 	resp = env.s3Request(t, "HEAD", "/metabucket/file.txt", nil)
@@ -393,7 +401,7 @@ func TestUserMetadata(t *testing.T) {
 		t.Fatalf("metadata: got %q, want %q",
 			resp.Header.Get("x-amz-meta-custom"), "myvalue")
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestRecoveryOrphanedFiles(t *testing.T) {
@@ -404,7 +412,7 @@ func TestRecoveryOrphanedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	st, err := store.New(dir)
 	if err != nil {
@@ -433,13 +441,13 @@ func TestChecksumOnWrite(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/checkbucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	content := "checksum test content"
 	resp = env.s3Request(t, "PUT", "/checkbucket/file.bin",
 		bytes.NewReader([]byte(content)))
 	checksum := resp.Header.Get("x-amz-checksum-sha256")
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if checksum == "" {
 		t.Fatal("missing checksum in response")
@@ -450,7 +458,7 @@ func TestChecksumOnWrite(t *testing.T) {
 	if resp.Header.Get("x-amz-checksum-sha256") != checksum {
 		t.Fatal("checksum mismatch between put and head")
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // setupWithSigning creates a test env with a signing secret configured.
@@ -463,7 +471,7 @@ func setupWithSigning(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 
 	st, err := store.New(dir)
 	if err != nil {
@@ -515,9 +523,9 @@ func TestPresignedURLGet(t *testing.T) {
 
 	// Create bucket and object
 	resp := env.s3Request(t, "PUT", "/presign-bucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	resp = env.s3Request(t, "PUT", "/presign-bucket/secret.txt", strings.NewReader("presigned content"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Generate presigned URL
 	expiresAt := time.Now().Add(5 * time.Minute).Unix()
@@ -534,7 +542,7 @@ func TestPresignedURLGet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
@@ -551,9 +559,9 @@ func TestPresignedURLExpired(t *testing.T) {
 	signingSecret := "test-signing-secret"
 
 	resp := env.s3Request(t, "PUT", "/presign-bucket2", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	resp = env.s3Request(t, "PUT", "/presign-bucket2/file.txt", strings.NewReader("data"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Expired 1 minute ago
 	expiresAt := time.Now().Add(-1 * time.Minute).Unix()
@@ -565,8 +573,11 @@ func TestPresignedURLExpired(t *testing.T) {
 		env.s3Server.URL, path, env.tokenID, expiresStr, sig)
 
 	req, _ := http.NewRequest("GET", url, nil)
-	resp, _ = http.DefaultClient.Do(req)
-	defer resp.Body.Close()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("expired presigned request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 403 {
 		t.Fatalf("expired presigned: expected 403, got %d", resp.StatusCode)
@@ -577,9 +588,9 @@ func TestPresignedURLBadSignature(t *testing.T) {
 	env := setupWithSigning(t)
 
 	resp := env.s3Request(t, "PUT", "/presign-bucket3", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	resp = env.s3Request(t, "PUT", "/presign-bucket3/file.txt", strings.NewReader("data"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	expiresAt := time.Now().Add(5 * time.Minute).Unix()
 	expiresStr := strconv.FormatInt(expiresAt, 10)
@@ -589,8 +600,11 @@ func TestPresignedURLBadSignature(t *testing.T) {
 		env.s3Server.URL, path, env.tokenID, expiresStr, "badsignature")
 
 	req, _ := http.NewRequest("GET", url, nil)
-	resp, _ = http.DefaultClient.Do(req)
-	defer resp.Body.Close()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("bad signature request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 403 {
 		t.Fatalf("bad signature: expected 403, got %d", resp.StatusCode)
@@ -604,9 +618,9 @@ func TestCopyObject(t *testing.T) {
 
 	// Create source bucket and object
 	resp := env.s3Request(t, "PUT", "/src-bucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	resp = env.s3Request(t, "PUT", "/dst-bucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	content := "copy me!"
 	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/src-bucket/original.txt",
@@ -614,7 +628,7 @@ func TestCopyObject(t *testing.T) {
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-meta-author", "test")
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Copy to different bucket
 	req, _ = http.NewRequest("PUT", env.s3Server.URL+"/dst-bucket/copied.txt", nil)
@@ -625,7 +639,7 @@ func TestCopyObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		t.Fatalf("copy object: expected 200, got %d: %s", resp.StatusCode, body)
@@ -643,7 +657,7 @@ func TestCopyObject(t *testing.T) {
 	// Get copied object
 	resp = env.s3Request(t, "GET", "/dst-bucket/copied.txt", nil)
 	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if string(got) != content {
 		t.Fatalf("copied content: got %q, want %q", got, content)
 	}
@@ -653,22 +667,22 @@ func TestCopyObject(t *testing.T) {
 	if resp.Header.Get("x-amz-meta-author") != "test" {
 		t.Fatalf("copy metadata not preserved: got %q", resp.Header.Get("x-amz-meta-author"))
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestCopyObjectSameBucket(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/copybucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	resp = env.s3Request(t, "PUT", "/copybucket/a.txt", strings.NewReader("hello"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/copybucket/b.txt", nil)
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-copy-source", "/copybucket/a.txt")
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		t.Fatalf("copy same bucket: expected 200, got %d", resp.StatusCode)
@@ -676,7 +690,7 @@ func TestCopyObjectSameBucket(t *testing.T) {
 
 	resp = env.s3Request(t, "GET", "/copybucket/b.txt", nil)
 	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if string(got) != "hello" {
 		t.Fatalf("copy same bucket content: got %q", got)
 	}
@@ -686,13 +700,13 @@ func TestCopyObjectNonExistentSource(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/copybucket2", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/copybucket2/dest.txt", nil)
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-copy-source", "/copybucket2/nonexistent.txt")
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != 404 {
 		t.Fatalf("copy non-existent: expected 404, got %d", resp.StatusCode)
@@ -705,12 +719,12 @@ func TestRangeRequests(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/rangebucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Upload a known content
 	content := "0123456789abcdefghij" // 20 bytes
 	resp = env.s3Request(t, "PUT", "/rangebucket/data.txt", strings.NewReader(content))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	tests := []struct {
 		name       string
@@ -735,7 +749,7 @@ func TestRangeRequests(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			if resp.StatusCode != tt.wantStatus {
 				t.Fatalf("status: got %d, want %d", resp.StatusCode, tt.wantStatus)
@@ -757,16 +771,16 @@ func TestRangeRequestInvalid(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/rangebucket2", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	resp = env.s3Request(t, "PUT", "/rangebucket2/small.txt", strings.NewReader("tiny"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Range beyond file size
 	req, _ := http.NewRequest("GET", env.s3Server.URL+"/rangebucket2/small.txt", nil)
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("Range", "bytes=100-200")
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != 416 {
 		t.Fatalf("invalid range: expected 416, got %d", resp.StatusCode)
@@ -779,15 +793,17 @@ func TestMultipartUploadComplete(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/mpbucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Create multipart upload
 	resp = env.s3Request(t, "POST", "/mpbucket/bigfile.bin?uploads", nil)
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	var initResult jayapi.InitiateMultipartUploadResult
-	xml.Unmarshal(body, &initResult)
+	if err := xml.Unmarshal(body, &initResult); err != nil {
+		t.Fatalf("unmarshal multipart init: %v", err)
+	}
 	uploadID := initResult.UploadId
 	if uploadID == "" {
 		t.Fatal("missing upload ID")
@@ -801,22 +817,24 @@ func TestMultipartUploadComplete(t *testing.T) {
 		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s&partNumber=1", uploadID),
 		strings.NewReader(part1))
 	etag1 := resp.Header.Get("ETag")
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	resp = env.s3Request(t, "PUT",
 		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s&partNumber=2", uploadID),
 		strings.NewReader(part2))
 	etag2 := resp.Header.Get("ETag")
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// List parts
 	resp = env.s3Request(t, "GET",
 		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s", uploadID), nil)
 	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	var listParts jayapi.ListPartsResult
-	xml.Unmarshal(body, &listParts)
+	if err := xml.Unmarshal(body, &listParts); err != nil {
+		t.Fatalf("unmarshal list parts: %v", err)
+	}
 	if len(listParts.Parts) != 2 {
 		t.Fatalf("list parts: got %d, want 2", len(listParts.Parts))
 	}
@@ -834,12 +852,12 @@ func TestMultipartUploadComplete(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("complete: expected 200, got %d: %s", resp.StatusCode, body)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Verify assembled object
 	resp = env.s3Request(t, "GET", "/mpbucket/bigfile.bin", nil)
 	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	expected := part1 + part2
 	if string(got) != expected {
 		t.Fatalf("assembled object: got %d bytes, want %d", len(got), len(expected))
@@ -850,22 +868,24 @@ func TestMultipartUploadAbort(t *testing.T) {
 	env := setup(t)
 
 	resp := env.s3Request(t, "PUT", "/mpabortbucket", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Create multipart upload
 	resp = env.s3Request(t, "POST", "/mpabortbucket/file.bin?uploads", nil)
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	var initResult jayapi.InitiateMultipartUploadResult
-	xml.Unmarshal(body, &initResult)
+	if err := xml.Unmarshal(body, &initResult); err != nil {
+		t.Fatalf("unmarshal multipart init: %v", err)
+	}
 	uploadID := initResult.UploadId
 
 	// Upload a part
 	resp = env.s3Request(t, "PUT",
 		fmt.Sprintf("/mpabortbucket/file.bin?uploadId=%s&partNumber=1", uploadID),
 		strings.NewReader("partial data"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Abort
 	resp = env.s3Request(t, "DELETE",
@@ -873,14 +893,14 @@ func TestMultipartUploadAbort(t *testing.T) {
 	if resp.StatusCode != 204 {
 		t.Fatalf("abort: expected 204, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Object should not exist
 	resp = env.s3Request(t, "GET", "/mpabortbucket/file.bin", nil)
 	if resp.StatusCode != 404 {
 		t.Fatalf("after abort: expected 404, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // === Bucket Policy Tests ===
@@ -998,7 +1018,7 @@ func TestQuarantineListAndPurge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	st, err := store.New(dir)
 	if err != nil {
@@ -1027,18 +1047,20 @@ func TestQuarantineListAndPurge(t *testing.T) {
 	req, _ := http.NewRequest("PUT", s3Srv.URL+"/qbucket", nil)
 	req.Header.Set("Authorization", authHdr)
 	resp, _ := http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	req, _ = http.NewRequest("PUT", s3Srv.URL+"/qbucket/file.txt", strings.NewReader("quarantine test"))
 	req.Header.Set("Authorization", authHdr)
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Get bucket ID
 	bucket, _ := db.GetBucket("qbucket")
 
 	// Quarantine the object
-	db.QuarantineObject(bucket.ID, "file.txt")
+	if err := db.QuarantineObject(bucket.ID, "file.txt"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
 
 	// List quarantined via QuarantineManager
 	qm := maintenance.NewQuarantineManager(db, st, log)
@@ -1079,13 +1101,15 @@ func TestQuarantineListAndPurge(t *testing.T) {
 	req.Header.Set("Authorization", authHdr)
 	resp, _ = http.DefaultClient.Do(req)
 	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if string(got) != "quarantine test" {
 		t.Fatalf("after revalidation: got %q", got)
 	}
 
 	// Quarantine again and purge
-	db.QuarantineObject(bucket.ID, "file.txt")
+	if err := db.QuarantineObject(bucket.ID, "file.txt"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
 	purged, err := qm.PurgeAll()
 	if err != nil {
 		t.Fatal(err)
@@ -1111,7 +1135,7 @@ func TestRateLimiting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	st, err := store.New(dir)
 	if err != nil {
@@ -1143,7 +1167,7 @@ func TestRateLimiting(t *testing.T) {
 	req, _ := http.NewRequest("PUT", s3Srv.URL+"/rl-bucket", nil)
 	req.Header.Set("Authorization", authHdr)
 	resp, _ := http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Exhaust burst (3 requests should pass, then fail)
 	var got429 bool
@@ -1154,7 +1178,7 @@ func TestRateLimiting(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode == 429 {
 			got429 = true
 			if resp.Header.Get("Retry-After") == "" {

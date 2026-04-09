@@ -159,7 +159,9 @@ func (h *Handler) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(account)
+	if err := json.NewEncoder(w).Encode(account); err != nil {
+		h.log.Error("encode create-account response", "err", err)
+	}
 }
 
 type createTokenRequest struct {
@@ -237,10 +239,12 @@ func (h *Handler) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(createTokenResponse{
+	if err := json.NewEncoder(w).Encode(createTokenResponse{
 		TokenID: token.TokenID,
 		Secret:  secret,
-	})
+	}); err != nil {
+		h.log.Error("encode create-token response", "err", err)
+	}
 }
 
 func (h *Handler) handleListTokens(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +257,9 @@ func (h *Handler) handleListTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tokens)
+	if err := json.NewEncoder(w).Encode(tokens); err != nil {
+		h.log.Error("encode list-tokens response", "err", err)
+	}
 }
 
 func (h *Handler) handleRevokeToken(w http.ResponseWriter, _ *http.Request, tokenID string) {
@@ -274,7 +280,9 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(h.metrics.Snapshot())
+	if err := json.NewEncoder(w).Encode(h.metrics.Snapshot()); err != nil {
+		h.log.Error("encode metrics response", "err", err)
+	}
 }
 
 type presignRequest struct {
@@ -329,7 +337,9 @@ func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(presignResponse{URL: presignedURL})
+	if err := json.NewEncoder(w).Encode(presignResponse{URL: presignedURL}); err != nil {
+		h.log.Error("encode presign response", "err", err)
+	}
 }
 
 // Quarantine handlers
@@ -343,7 +353,9 @@ func (h *Handler) handleListQuarantined(w http.ResponseWriter, _ *http.Request) 
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(objects)
+	if err := json.NewEncoder(w).Encode(objects); err != nil {
+		h.log.Error("encode quarantined list", "err", err)
+	}
 }
 
 type quarantineRequest struct {
@@ -365,7 +377,9 @@ func (h *Handler) handleRevalidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]bool{"restored": restored})
+	if err := json.NewEncoder(w).Encode(map[string]bool{"restored": restored}); err != nil {
+		h.log.Error("encode revalidate response", "err", err)
+	}
 }
 
 func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
@@ -380,7 +394,9 @@ func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int{"purged": count})
+		if err := json.NewEncoder(w).Encode(map[string]int{"purged": count}); err != nil {
+			h.log.Error("encode purge response", "err", err)
+		}
 		return
 	}
 
@@ -393,7 +409,9 @@ func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int{"purged": count})
+		if err := json.NewEncoder(w).Encode(map[string]int{"purged": count}); err != nil {
+			h.log.Error("encode purge response", "err", err)
+		}
 		return
 	}
 

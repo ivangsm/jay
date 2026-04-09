@@ -41,7 +41,7 @@ func Open(path string) (*DB, error) {
 
 	db := &DB{bolt: b, path: path}
 	if err := db.bootstrap(); err != nil {
-		b.Close()
+		_ = b.Close()
 		return nil, err
 	}
 	return db, nil

@@ -70,7 +70,7 @@ func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
 	}
 	if err := checkError(status, respMeta); err != nil {
 		if dataReader != nil {
-			dataReader.Close()
+			_ = dataReader.Close()
 		}
 		return nil, err
 	}
@@ -78,7 +78,7 @@ func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
 	contentType, size, etag, checksum, lastModified, metadata, err := proto.DecodeObjectInfo(respMeta)
 	if err != nil {
 		if dataReader != nil {
-			dataReader.Close()
+			_ = dataReader.Close()
 		}
 		return nil, fmt.Errorf("decode get response: %w", err)
 	}

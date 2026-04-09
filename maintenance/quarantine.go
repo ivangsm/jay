@@ -112,7 +112,7 @@ func (qm *QuarantineManager) Inspect(bucketID, key string) (*InspectionResult, e
 	if err != nil {
 		return result, nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {

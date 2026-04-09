@@ -37,7 +37,7 @@ func (h *connHandler) dispatch(req *request) error {
 	default:
 		// Drain any data (bounded by dataLen to prevent unbounded reads)
 		if req.dataLen > 0 && req.data != nil {
-			io.CopyN(io.Discard, req.data, req.dataLen)
+			_, _ = io.CopyN(io.Discard, req.data, req.dataLen)
 		}
 		return h.writeError(StatusBadRequest, req.streamID, "unknown operation", "UnknownOp")
 	}

@@ -117,31 +117,8 @@ func (gc *GC) cleanOldTempFiles() {
 }
 
 func (gc *GC) cleanEmptyDirs() {
-	bucketsDir := filepath.Join(gc.dataDir, "buckets")
-	entries, err := os.ReadDir(bucketsDir)
-	if err != nil {
-		return
-	}
-
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		objDir := filepath.Join(bucketsDir, e.Name(), "objects")
-		if isEmpty, _ := isDirEmpty(objDir); isEmpty {
-			// Check if the bucket dir itself is empty (no objects subdir content)
-			// Don't remove — the bucket might still exist in metadata
-		}
-	}
-}
-
-func isDirEmpty(path string) (bool, error) {
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return true, nil
-		}
-		return false, err
-	}
-	return len(entries) == 0, nil
+	// TODO: implement empty-bucket-dir GC.
+	// Currently a no-op: an empty objects/ subdir does not imply the bucket is
+	// gone — it may still exist in metadata — so we leave these directories
+	// alone until we have a cross-check against the metadata DB.
 }

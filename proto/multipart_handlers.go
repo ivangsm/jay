@@ -189,7 +189,9 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 	}
 
 	if prev != nil && prev.LocationRef != locationRef {
-		h.store.DeleteObject(prev.LocationRef)
+		if err := h.store.DeleteObject(prev.LocationRef); err != nil {
+			h.log.Warn("delete previous object version", "err", err, "location", prev.LocationRef)
+		}
 	}
 
 	if err := h.store.CleanupUploadParts(uploadID); err != nil {

@@ -121,7 +121,7 @@ func (s *Scrubber) RunOnce() ScrubResult {
 		}
 		var toQuarantine []quarantineAction
 
-		s.db.ForEachObject(bucket.ID, func(obj meta.Object) error {
+		if err := s.db.ForEachObject(bucket.ID, func(obj meta.Object) error {
 			if obj.State != "active" {
 				return nil
 			}
@@ -172,13 +172,20 @@ func (s *Scrubber) RunOnce() ScrubResult {
 
 			result.Healthy++
 			return nil
-		})
+		}); err != nil {
+			s.log.Error("scrub: iterate objects", "err", err, "bucket", bucket.Name)
+			result.Errors++
+		}
 
 		// Quarantine outside the View transaction to avoid deadlock.
 		for _, qa := range toQuarantine {
-			s.db.QuarantineObject(bucket.ID, qa.key)
+			if err := s.db.QuarantineObject(bucket.ID, qa.key); err != nil {
+				s.log.Error("scrub: quarantine meta", "err", err, "bucket", bucket.Name, "key", qa.key)
+			}
 			if qa.isMismatch {
-				s.store.Quarantine(qa.locationRef)
+				if err := s.store.Quarantine(qa.locationRef); err != nil {
+					s.log.Error("scrub: quarantine file", "err", err, "location", qa.locationRef)
+				}
 			}
 		}
 
@@ -270,9 +277,13 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 
 		// Quarantine outside the View transaction to avoid deadlock.
 		for _, qa := range toQuarantine {
-			s.db.QuarantineObject(bucket.ID, qa.key)
+			if qerr := s.db.QuarantineObject(bucket.ID, qa.key); qerr != nil {
+				s.log.Error("incremental scrub: quarantine meta", "err", qerr, "bucket", bucket.Name, "key", qa.key)
+			}
 			if qa.isMismatch {
-				s.store.Quarantine(qa.locationRef)
+				if qerr := s.store.Quarantine(qa.locationRef); qerr != nil {
+					s.log.Error("incremental scrub: quarantine file", "err", qerr, "location", qa.locationRef)
+				}
 			}
 		}
 

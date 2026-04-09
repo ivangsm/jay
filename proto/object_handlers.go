@@ -84,7 +84,9 @@ func (h *connHandler) handlePutObject(req *request) error {
 	}
 
 	if prev != nil && prev.LocationRef != locationRef {
-		h.store.DeleteObject(prev.LocationRef)
+		if err := h.store.DeleteObject(prev.LocationRef); err != nil {
+			h.log.Warn("delete previous object version", "err", err, "location", prev.LocationRef)
+		}
 	}
 
 	return h.writeResponseCombined(StatusOK, req.streamID, EncodePutResponse(etag, checksum))
@@ -121,7 +123,7 @@ func (h *connHandler) handleGetObject(req *request) error {
 		h.log.Error("read object", "err", err, "location", obj.LocationRef)
 		return h.writeError(StatusInternal, req.streamID, "failed to read object", "InternalError")
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	resp := EncodeObjectInfo(
 		obj.ContentType, obj.SizeBytes,

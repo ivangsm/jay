@@ -140,9 +140,13 @@ func (db *DB) DeleteBucket(name string) error {
 		if err := bk.Delete([]byte(name)); err != nil {
 			return err
 		}
-		tx.Bucket(bucketBucketsID).Delete([]byte(b.ID))
+		if err := tx.Bucket(bucketBucketsID).Delete([]byte(b.ID)); err != nil {
+			return err
+		}
 		if objBucket != nil {
-			tx.DeleteBucket(objectsBucketName(b.ID))
+			if err := tx.DeleteBucket(objectsBucketName(b.ID)); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

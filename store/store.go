@@ -92,8 +92,8 @@ func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum
 	// Cleanup on error
 	defer func() {
 		if err != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -229,7 +229,7 @@ func (s *Store) VerifyChecksum(locationRef, expected string) (bool, string, erro
 	if err != nil {
 		return false, "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
@@ -287,6 +287,6 @@ func fsyncDir(path string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	return d.Sync()
 }

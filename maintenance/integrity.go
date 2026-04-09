@@ -14,7 +14,6 @@ type ReadVerifier struct {
 	r        io.Reader
 	h        io.Writer
 	expected string
-	buf      []byte
 	sum      []byte
 	done     bool
 }

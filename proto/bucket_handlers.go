@@ -46,7 +46,9 @@ func (h *connHandler) handleCreateBucket(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	h.store.EnsureBucketDir(b.ID)
+	if err := h.store.EnsureBucketDir(b.ID); err != nil {
+		h.log.Error("ensure bucket dir", "err", err, "bucket", b.Name)
+	}
 
 	resp := EncodeBucketInfo(b.ID, b.Name, b.CreatedAt.Format(time.RFC3339), b.Visibility)
 	return h.writeResponseCombined(StatusOK, req.streamID, resp)
@@ -77,7 +79,9 @@ func (h *connHandler) handleDeleteBucket(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	h.store.RemoveBucketDir(bkt.ID)
+	if err := h.store.RemoveBucketDir(bkt.ID); err != nil {
+		h.log.Error("remove bucket dir", "err", err, "bucket", bucket)
+	}
 	return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 }
 

@@ -150,8 +150,8 @@ func writeS3Error(w http.ResponseWriter, r *http.Request, httpCode int, s3Code, 
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("x-amz-request-id", reqID)
 	w.WriteHeader(httpCode)
-	w.Write([]byte(xml.Header))
-	xml.NewEncoder(w).Encode(errResp)
+	_, _ = w.Write([]byte(xml.Header))
+	_ = xml.NewEncoder(w).Encode(errResp)
 }
 
 // writeXML writes an XML response with proper headers.
@@ -160,8 +160,8 @@ func writeXML(w http.ResponseWriter, r *http.Request, httpCode int, v any) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("x-amz-request-id", reqID)
 	w.WriteHeader(httpCode)
-	w.Write([]byte(xml.Header))
-	xml.NewEncoder(w).Encode(v)
+	_, _ = w.Write([]byte(xml.Header))
+	_ = xml.NewEncoder(w).Encode(v)
 }
 
 // formatS3Time formats a time as S3 expects.
