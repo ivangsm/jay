@@ -24,8 +24,24 @@ type Config struct {
 }
 
 func LoadConfig() Config {
-	rateLimit, _ := strconv.ParseFloat(envOr("JAY_RATE_LIMIT", "100"), 64)
-	rateBurst, _ := strconv.Atoi(envOr("JAY_RATE_BURST", "200"))
+	rateLimit := float64(100)
+	if v := os.Getenv("JAY_RATE_LIMIT"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			slog.Error("invalid JAY_RATE_LIMIT, using default", "value", v, "err", err)
+		} else {
+			rateLimit = parsed
+		}
+	}
+	rateBurst := 200
+	if v := os.Getenv("JAY_RATE_BURST"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			slog.Error("invalid JAY_RATE_BURST, using default", "value", v, "err", err)
+		} else {
+			rateBurst = parsed
+		}
+	}
 
 	if adminToken := os.Getenv("JAY_ADMIN_TOKEN"); adminToken != "" && len(adminToken) < 16 {
 		slog.Warn("JAY_ADMIN_TOKEN is too short, minimum 16 characters recommended")

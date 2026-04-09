@@ -52,6 +52,20 @@ func main() {
 	}
 	defer func() { _ = db.Close() }()
 
+	if cfg.SigningSecret != "" {
+		db.SetSigningSecret(cfg.SigningSecret)
+		migrated, err := db.MigrateTokenSecrets()
+		if err != nil {
+			log.Error("failed to migrate token secrets", "err", err)
+			os.Exit(1)
+		}
+		if migrated > 0 {
+			log.Info("migrated token secrets to encrypted format", "count", migrated)
+		}
+	} else {
+		log.Warn("JAY_SIGNING_SECRET not set — token SecretKey will not be encrypted at rest")
+	}
+
 	// Initialize object store
 	st, err := store.New(cfg.DataDir)
 	if err != nil {
@@ -74,8 +88,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	hc.SetReady(true)
-
 	// Build shared components
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
@@ -91,7 +103,7 @@ func main() {
 	defer gc.Stop()
 
 	// Start background backup (every 1 hour, keep 24, prune after 7 days)
-	backupMgr := maintenance.NewBackupManager(dbPath, filepath.Join(cfg.DataDir, "backups"), log)
+	backupMgr := maintenance.NewBackupManager(db, filepath.Join(cfg.DataDir, "backups"), log)
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
@@ -115,7 +127,17 @@ func main() {
 	// Admin API handler (on separate port)
 	adminMux := http.NewServeMux()
 	tlsEnabled := cfg.TLSCert != "" && cfg.TLSKey != ""
-	adminHandler := admin.NewHandler(db, cfg.AdminToken, log, metrics, st, cfg.SigningSecret, cfg.ListenAddr, tlsEnabled, au)
+	adminHandler := admin.NewHandler(admin.AdminConfig{
+		DB:            db,
+		Store:         st,
+		Auth:          au,
+		AdminToken:    cfg.AdminToken,
+		Log:           log,
+		Metrics:       metrics,
+		SigningSecret: cfg.SigningSecret,
+		ListenAddr:    cfg.ListenAddr,
+		TLSEnabled:    tlsEnabled,
+	})
 	adminMux.Handle("/_jay/", adminHandler)
 
 	// Health checks
@@ -130,7 +152,7 @@ func main() {
 	// Start native TCP server
 	var shutdownNative func() error
 	if cfg.NativeAddr != "" {
-		nativeServer := jayproto.NewServer(db, st, au, log)
+		nativeServer := jayproto.NewServer(db, st, au, log, int(cfg.RateLimit), cfg.RateBurst)
 		var err error
 		shutdownNative, err = nativeServer.ListenAndServe(cfg.NativeAddr)
 		if err != nil {
@@ -138,6 +160,9 @@ func main() {
 			os.Exit(1)
 		}
 	}
+
+	// All listeners are bound — mark the service as ready
+	hc.SetReady(true)
 
 	// Wait for signal
 	sig := make(chan os.Signal, 1)
