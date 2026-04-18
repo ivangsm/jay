@@ -42,29 +42,15 @@ func (db *DB) SetSigningSecret(s string) {
 	db.kekMu.Unlock()
 }
 
-func (db *DB) aead() (cipher.AEAD, error) {
-	db.kekMu.RLock()
-	defer db.kekMu.RUnlock()
-	if !db.kekSet {
-		return nil, fmt.Errorf("meta: signing secret not set — cannot decrypt token.SecretKey")
-	}
-	block, err := aes.NewCipher(db.kek[:])
+// aesGCMEncrypt encrypts plain with kek, returning an "enc:v1:" prefixed value.
+func aesGCMEncrypt(kek [32]byte, plain string) (string, error) {
+	block, err := aes.NewCipher(kek[:])
 	if err != nil {
-		return nil, fmt.Errorf("meta: aes.NewCipher: %w", err)
+		return "", fmt.Errorf("meta: aes.NewCipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("meta: cipher.NewGCM: %w", err)
-	}
-	return gcm, nil
-}
-
-// encryptSecret encrypts a plaintext secret and returns the "enc:v1:" prefixed
-// representation for on-disk storage.
-func (db *DB) encryptSecret(plain string) (string, error) {
-	gcm, err := db.aead()
-	if err != nil {
-		return "", err
+		return "", fmt.Errorf("meta: cipher.NewGCM: %w", err)
 	}
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
@@ -74,15 +60,19 @@ func (db *DB) encryptSecret(plain string) (string, error) {
 	return encryptedPrefix + base64.StdEncoding.EncodeToString(sealed), nil
 }
 
-// decryptSecret takes a stored value and returns the plaintext secret.
-// Unencrypted (legacy) values are returned as-is.
-func (db *DB) decryptSecret(stored string) (string, error) {
+// aesGCMDecrypt decrypts a stored "enc:v1:" value with kek.
+// Values without the prefix are returned as-is (legacy plaintext).
+func aesGCMDecrypt(kek [32]byte, stored string) (string, error) {
 	if !strings.HasPrefix(stored, encryptedPrefix) {
 		return stored, nil
 	}
-	gcm, err := db.aead()
+	block, err := aes.NewCipher(kek[:])
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("meta: aes.NewCipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("meta: cipher.NewGCM: %w", err)
 	}
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, encryptedPrefix))
 	if err != nil {
@@ -98,6 +88,87 @@ func (db *DB) decryptSecret(stored string) (string, error) {
 		return "", fmt.Errorf("meta: decrypt secret: %w", err)
 	}
 	return string(plain), nil
+}
+
+func (db *DB) encryptSecret(plain string) (string, error) {
+	db.kekMu.RLock()
+	defer db.kekMu.RUnlock()
+	if !db.kekSet {
+		return "", fmt.Errorf("meta: signing secret not set — cannot encrypt token.SecretKey")
+	}
+	return aesGCMEncrypt(db.kek, plain)
+}
+
+func (db *DB) decryptSecret(stored string) (string, error) {
+	db.kekMu.RLock()
+	defer db.kekMu.RUnlock()
+	if !db.kekSet {
+		return "", fmt.Errorf("meta: signing secret not set — cannot decrypt token.SecretKey")
+	}
+	return aesGCMDecrypt(db.kek, stored)
+}
+
+// RekeyTokens decrypts every token secret with oldSecret and re-encrypts it
+// with newSecret. Jay must be stopped before calling this — bbolt enforces an
+// exclusive file lock that will block if another process has the DB open.
+// Returns the number of tokens rekeyed. Idempotent if run again with same args.
+func (db *DB) RekeyTokens(oldSecret, newSecret string) (int, error) {
+	oldKEK := DeriveKEK(oldSecret)
+	newKEK := DeriveKEK(newSecret)
+
+	type pending struct {
+		id   string
+		data []byte
+	}
+	var toUpdate []pending
+
+	err := db.bolt.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
+			var t Token
+			if err := json.Unmarshal(v, &t); err != nil {
+				return nil
+			}
+			if !strings.HasPrefix(t.SecretKey, encryptedPrefix) {
+				return nil // plaintext legacy entry — MigrateTokenSecrets handles these
+			}
+			plain, err := aesGCMDecrypt(oldKEK, t.SecretKey)
+			if err != nil {
+				return fmt.Errorf("rekey: decrypt token %s: %w", t.TokenID, err)
+			}
+			enc, err := aesGCMEncrypt(newKEK, plain)
+			if err != nil {
+				return fmt.Errorf("rekey: encrypt token %s: %w", t.TokenID, err)
+			}
+			t.SecretKey = enc
+			updated, err := json.Marshal(&t)
+			if err != nil {
+				return err
+			}
+			toUpdate = append(toUpdate, pending{id: t.TokenID, data: updated})
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	if len(toUpdate) == 0 {
+		return 0, nil
+	}
+
+	err = db.bolt.Update(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(bucketTokens)
+		for _, p := range toUpdate {
+			if err := bk.Put([]byte(p.id), p.data); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("meta: write rekeyed tokens: %w", err)
+	}
+	return len(toUpdate), nil
 }
 
 // MigrateTokenSecrets scans the tokens bucket and re-encrypts any token where
