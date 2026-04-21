@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -15,6 +16,33 @@ import (
 var (
 	ErrObjectNotFound = errors.New("object not found")
 )
+
+// deletionHooks holds per-DB deletion callbacks. Stored in a package-level
+// sync.Map to avoid mutating the DB struct definition (owned elsewhere).
+// The callback fires after a successful DeleteObjectMeta commit and is used
+// by the maintenance GC to wake immediately instead of polling.
+var deletionHooks sync.Map // key: *DB, value: func()
+
+// SetDeletionHook registers a callback invoked after a successful
+// DeleteObjectMeta commit. Safe to call with nil to clear. Single callback
+// per DB instance — a second call overwrites.
+func (db *DB) SetDeletionHook(fn func()) {
+	if fn == nil {
+		deletionHooks.Delete(db)
+		return
+	}
+	deletionHooks.Store(db, fn)
+}
+
+func (db *DB) fireDeletionHook() {
+	v, ok := deletionHooks.Load(db)
+	if !ok {
+		return
+	}
+	if fn, ok := v.(func()); ok && fn != nil {
+		fn()
+	}
+}
 
 // PutObjectMeta creates or updates object metadata within a bbolt write transaction.
 // Returns the previous object (if overwriting) for GC of the old physical file.
@@ -130,6 +158,9 @@ func (db *DB) DeleteObjectMeta(bucketID, key string) (*Object, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Fire the deletion hook outside the bbolt tx so consumers (GC) can
+	// wake without blocking the transaction.
+	db.fireDeletionHook()
 	return &obj, nil
 }
 
@@ -141,23 +172,19 @@ type ListObjectsResult struct {
 	NextStartAfter string
 }
 
-// listObjectsRaw is a per-match record collected inside the read tx and
-// decoded afterwards. Keeping key+value as owned []byte copies lets us close
-// the transaction before touching JSON.
-type listObjectsRaw struct {
-	key []byte
-	val []byte
-}
-
 // ListObjects lists objects in a bucket with prefix, delimiter, pagination support.
-// The implementation is two-phase: all matching raw records are copied inside
-// the read transaction, then the tx is closed before any JSON decoding happens.
+// Pagination is applied inside the cursor loop: iteration stops as soon as
+// maxKeys is reached, so cost is bounded by maxKeys rather than by the bucket
+// size. Preserves IsTruncated and NextStartAfter semantics expected by callers.
 func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKeys int) (*ListObjectsResult, error) {
 	if maxKeys <= 0 {
 		maxKeys = 1000
 	}
 
-	var raws []listObjectsRaw
+	result := &ListObjectsResult{}
+	prefixSet := make(map[string]bool)
+	count := 0
+
 	err := db.bolt.View(func(tx *bolt.Tx) error {
 		bk := tx.Bucket(objectsBucketName(bucketID))
 		if bk == nil {
@@ -180,59 +207,52 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 			if prefix != "" && !bytes.HasPrefix(k, []byte(prefix)) {
 				break
 			}
-			raws = append(raws, listObjectsRaw{
-				key: append([]byte{}, k...),
-				val: append([]byte{}, v...),
-			})
+
+			key := string(k)
+
+			var obj Object
+			if err := json.Unmarshal(v, &obj); err != nil {
+				slog.Warn("meta: corrupt object record", "key", key, "err", err)
+				continue
+			}
+			if obj.State != "active" {
+				continue
+			}
+
+			if delimiter != "" {
+				rest := key[len(prefix):]
+				idx := strings.Index(rest, delimiter)
+				if idx >= 0 {
+					cp := prefix + rest[:idx+len(delimiter)]
+					if prefixSet[cp] {
+						continue
+					}
+					if count >= maxKeys {
+						result.IsTruncated = true
+						return nil
+					}
+					prefixSet[cp] = true
+					result.CommonPrefixes = append(result.CommonPrefixes, cp)
+					count++
+					continue
+				}
+			}
+
+			if count >= maxKeys {
+				result.IsTruncated = true
+				return nil
+			}
+
+			// Copy fields we expose; Object itself is value-type and safe to
+			// retain after the tx closes (no unsafe references into bbolt pages).
+			result.Objects = append(result.Objects, obj)
+			result.NextStartAfter = key
+			count++
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	result := &ListObjectsResult{}
-	prefixSet := make(map[string]bool)
-	count := 0
-
-	for _, raw := range raws {
-		key := string(raw.key)
-
-		var obj Object
-		if err := json.Unmarshal(raw.val, &obj); err != nil {
-			slog.Warn("meta: corrupt object record", "key", key, "err", err)
-			continue
-		}
-		if obj.State != "active" {
-			continue
-		}
-
-		if delimiter != "" {
-			rest := key[len(prefix):]
-			idx := strings.Index(rest, delimiter)
-			if idx >= 0 {
-				cp := prefix + rest[:idx+len(delimiter)]
-				if !prefixSet[cp] {
-					if count >= maxKeys {
-						result.IsTruncated = true
-						break
-					}
-					prefixSet[cp] = true
-					result.CommonPrefixes = append(result.CommonPrefixes, cp)
-					count++
-				}
-				continue
-			}
-		}
-
-		if count >= maxKeys {
-			result.IsTruncated = true
-			break
-		}
-
-		result.Objects = append(result.Objects, obj)
-		result.NextStartAfter = key
-		count++
 	}
 
 	return result, nil

@@ -196,9 +196,33 @@ func (db *DB) CreateTokenIfNotExists(tokenID, accountID, name, secretHash, plain
 	return tok, TokenSeedCreated, nil
 }
 
+// SetTokenInvalidateHook registers a callback invoked after a token is
+// persisted with a mutated state (revoke/update/delete). The auth layer
+// wires its cache invalidator here so stale cache entries are purged
+// immediately instead of waiting for TTL expiration.
+//
+// Passing nil clears the hook. Safe to call at any time; invocations are
+// serialized via hookMu.
+func (db *DB) SetTokenInvalidateHook(fn func(tokenID string)) {
+	db.hookMu.Lock()
+	db.tokenInvalidateHook = fn
+	db.hookMu.Unlock()
+}
+
+// fireTokenInvalidate invokes the registered hook (if any) for tokenID.
+// Callers MUST only call this after a successful bbolt commit.
+func (db *DB) fireTokenInvalidate(tokenID string) {
+	db.hookMu.RLock()
+	fn := db.tokenInvalidateHook
+	db.hookMu.RUnlock()
+	if fn != nil {
+		fn(tokenID)
+	}
+}
+
 // RevokeToken marks a token as revoked.
 func (db *DB) RevokeToken(tokenID string) error {
-	return db.bolt.Update(func(tx *bolt.Tx) error {
+	err := db.bolt.Update(func(tx *bolt.Tx) error {
 		bk := tx.Bucket(bucketTokens)
 		data := bk.Get([]byte(tokenID))
 		if data == nil {
@@ -215,4 +239,9 @@ func (db *DB) RevokeToken(tokenID string) error {
 		}
 		return bk.Put([]byte(tokenID), updated)
 	})
+	if err != nil {
+		return err
+	}
+	db.fireTokenInvalidate(tokenID)
+	return nil
 }

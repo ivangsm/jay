@@ -35,6 +35,9 @@ type DB struct {
 	kekMu  sync.RWMutex
 	kekSet bool
 	kek    [32]byte
+
+	hookMu              sync.RWMutex
+	tokenInvalidateHook func(tokenID string)
 }
 
 // Open opens or creates the bbolt database at the given path.
