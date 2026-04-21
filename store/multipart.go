@@ -49,6 +49,7 @@ func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (chec
 	}
 
 	if err = tmpFile.Sync(); err != nil {
+		s.reportFsyncErr(err)
 		return "", 0, "", fmt.Errorf("store: fsync part: %w", err)
 	}
 	if err = tmpFile.Close(); err != nil {
@@ -64,6 +65,7 @@ func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (chec
 	tmpPath = finalPath
 
 	if err = fsyncDir(filepath.Dir(finalPath)); err != nil {
+		s.reportFsyncErr(err)
 		return "", 0, "", fmt.Errorf("store: fsync part dir: %w", err)
 	}
 
@@ -111,6 +113,7 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 	}
 
 	if err = tmpFile.Sync(); err != nil {
+		s.reportFsyncErr(err)
 		return "", 0, "", fmt.Errorf("store: fsync assembled: %w", err)
 	}
 	if err = tmpFile.Close(); err != nil {
@@ -135,6 +138,7 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 	tmpPath = finalPath
 
 	if err = fsyncDir(filepath.Dir(finalPath)); err != nil {
+		s.reportFsyncErr(err)
 		return "", 0, "", fmt.Errorf("store: fsync assembled dir: %w", err)
 	}
 

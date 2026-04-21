@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/ivangsm/jay/meta"
+	"golang.org/x/time/rate"
 )
 
 // errInvalidLocationRef is returned when a location ref contains path traversal
@@ -53,6 +56,10 @@ func (s *Store) BucketObjectsDir(bucketID string) string {
 // Store manages physical object files on the filesystem.
 type Store struct {
 	dataDir string
+
+	// fsyncErrorHook is invoked (nil-safe) whenever an fsync call fails
+	// anywhere in the store. Used to increment the FsyncFailures metric.
+	fsyncErrorHook func(err error)
 }
 
 // New creates a Store and ensures the required directory structure exists.
@@ -63,6 +70,21 @@ func New(dataDir string) (*Store, error) {
 		}
 	}
 	return &Store{dataDir: dataDir}, nil
+}
+
+// SetFsyncErrorHook registers a callback invoked after any fsync failure in
+// the store. Safe to call with nil to clear. Callers typically wire this to
+// a metrics counter.
+func (s *Store) SetFsyncErrorHook(fn func(err error)) {
+	s.fsyncErrorHook = fn
+}
+
+// reportFsyncErr invokes the fsync hook if set. Non-blocking, nil-safe.
+func (s *Store) reportFsyncErr(err error) {
+	if s == nil || s.fsyncErrorHook == nil || err == nil {
+		return
+	}
+	s.fsyncErrorHook(err)
 }
 
 // ObjectPath returns the relative location_ref for a given bucket and object ID.
@@ -113,6 +135,7 @@ func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum
 
 	// fsync the temp file
 	if err = tmpFile.Sync(); err != nil {
+		s.reportFsyncErr(err)
 		return "", 0, "", fmt.Errorf("store: fsync temp: %w", err)
 	}
 	if err = tmpFile.Close(); err != nil {
@@ -137,6 +160,7 @@ func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum
 
 	// fsync parent directory to make the rename durable
 	if err = fsyncDir(parentDir); err != nil {
+		s.reportFsyncErr(err)
 		return "", 0, "", fmt.Errorf("store: fsync dir: %w", err)
 	}
 
@@ -181,7 +205,9 @@ func (s *Store) Quarantine(locationRef string) error {
 	return nil
 }
 
-// CleanTmp removes all files in the tmp directory.
+// CleanTmp removes all files in the tmp directory. Best-effort: an error on
+// one entry is logged and the remaining entries are still attempted. Returns
+// the count of files actually removed and the first error observed (if any).
 func (s *Store) CleanTmp() (int, error) {
 	tmpDir := filepath.Join(s.dataDir, "tmp")
 	entries, err := os.ReadDir(tmpDir)
@@ -189,16 +215,22 @@ func (s *Store) CleanTmp() (int, error) {
 		return 0, fmt.Errorf("store: read tmp: %w", err)
 	}
 	count := 0
+	var firstErr error
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		if err := os.Remove(filepath.Join(tmpDir, e.Name())); err != nil {
-			return count, fmt.Errorf("store: clean tmp: %w", err)
+		path := filepath.Join(tmpDir, e.Name())
+		if rerr := os.Remove(path); rerr != nil {
+			slog.Warn("store: clean tmp entry", "file", e.Name(), "err", rerr)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("store: clean tmp: %w", rerr)
+			}
+			continue
 		}
 		count++
 	}
-	return count, nil
+	return count, firstErr
 }
 
 // EnsureBucketDir creates the objects directory for a bucket and fsyncs the
@@ -208,7 +240,11 @@ func (s *Store) EnsureBucketDir(bucketID string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return fsyncDir(filepath.Join(s.dataDir, "buckets", bucketID))
+	if err := fsyncDir(filepath.Join(s.dataDir, "buckets", bucketID)); err != nil {
+		s.reportFsyncErr(err)
+		return err
+	}
+	return nil
 }
 
 // RemoveBucketDir removes the bucket's directory tree. Only call after confirming no objects remain.
@@ -217,8 +253,18 @@ func (s *Store) RemoveBucketDir(bucketID string) error {
 	return os.RemoveAll(dir)
 }
 
-// VerifyChecksum reads the file at locationRef and returns whether its SHA-256 matches expected.
+// VerifyChecksum reads the file at locationRef and returns whether its SHA-256
+// matches expected. Uses a 1 MiB buffered reader to reduce syscall overhead
+// on large objects.
 func (s *Store) VerifyChecksum(locationRef, expected string) (bool, string, error) {
+	return s.VerifyChecksumRateLimited(locationRef, expected, nil)
+}
+
+// VerifyChecksumRateLimited behaves like VerifyChecksum but throttles read
+// bandwidth via limiter. If limiter is nil the read is unbounded.
+// The limiter's burst size must be >= the chunk size (1 MiB); callers that
+// construct the limiter should size the burst accordingly.
+func (s *Store) VerifyChecksumRateLimited(locationRef, expected string, limiter *rate.Limiter) (bool, string, error) {
 	p, err := s.SafePath(locationRef)
 	if err != nil {
 		return false, "", err
@@ -229,10 +275,36 @@ func (s *Store) VerifyChecksum(locationRef, expected string) (bool, string, erro
 	}
 	defer func() { _ = f.Close() }()
 
+	const chunkSize = 1 << 20 // 1 MiB
+	buf := bufio.NewReaderSize(f, chunkSize)
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return false, "", err
+
+	if limiter == nil {
+		if _, err := io.Copy(h, buf); err != nil {
+			return false, "", err
+		}
+	} else {
+		ctx := context.Background()
+		scratch := make([]byte, chunkSize)
+		for {
+			n, rerr := buf.Read(scratch)
+			if n > 0 {
+				if werr := limiter.WaitN(ctx, n); werr != nil {
+					return false, "", werr
+				}
+				if _, werr := h.Write(scratch[:n]); werr != nil {
+					return false, "", werr
+				}
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return false, "", rerr
+			}
+		}
 	}
+
 	actual := hex.EncodeToString(h.Sum(nil))
 	return actual == expected, actual, nil
 }
@@ -246,7 +318,10 @@ func (s *Store) ListBucketFiles(bucketID string) ([]string, error) {
 			return err
 		}
 		if !info.IsDir() {
-			rel, _ := filepath.Rel(s.dataDir, path)
+			rel, rerr := filepath.Rel(s.dataDir, path)
+			if rerr != nil {
+				return fmt.Errorf("store: list bucket files: rel path %q: %w", path, rerr)
+			}
 			files = append(files, rel)
 		}
 		return nil

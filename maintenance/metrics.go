@@ -34,6 +34,15 @@ func NewMetrics() *Metrics {
 	return &Metrics{startedAt: time.Now()}
 }
 
+// RecordFsyncFailure increments the fsync failure counter. Nil-safe so
+// store hooks can call it unconditionally.
+func (m *Metrics) RecordFsyncFailure() {
+	if m == nil {
+		return
+	}
+	m.FsyncFailures.Add(1)
+}
+
 // Snapshot returns a JSON-serializable snapshot of all metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return MetricsSnapshot{

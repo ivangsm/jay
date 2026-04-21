@@ -17,9 +17,10 @@ type GC struct {
 	quit     chan struct{}
 	running  atomic.Bool
 
-	// hasPendingWork is set by NotifyDeletion when an object is deleted.
-	// Future optimizations can check this flag to skip unnecessary GC cycles.
-	hasPendingWork atomic.Bool
+	// deleted is signalled (non-blocking send) by NotifyDeletion whenever an
+	// object is deleted. The GC loop listens on this to run an immediate pass
+	// instead of waiting the full interval.
+	deleted chan struct{}
 
 	FilesCollected atomic.Int64
 }
@@ -31,6 +32,7 @@ func NewGC(dataDir string, log *slog.Logger, interval time.Duration) *GC {
 		log:      log,
 		interval: interval,
 		quit:     make(chan struct{}),
+		deleted:  make(chan struct{}, 1),
 	}
 }
 
@@ -49,12 +51,14 @@ func (gc *GC) Stop() {
 	}
 }
 
-// NotifyDeletion signals the GC that an object has been deleted and there may
-// be work to do. The caller (e.g. the delete handler in the API layer) should
-// call this after successfully deleting an object. The flag is consumed by
-// future GC cycles.
+// NotifyDeletion signals the GC that an object has been deleted. The GC loop
+// is woken and performs an immediate pass. Non-blocking: if a prior signal is
+// still pending, the new signal is coalesced into it.
 func (gc *GC) NotifyDeletion() {
-	gc.hasPendingWork.Store(true)
+	select {
+	case gc.deleted <- struct{}{}:
+	default:
+	}
 }
 
 func (gc *GC) loop() {
@@ -67,6 +71,16 @@ func (gc *GC) loop() {
 		case <-gc.quit:
 			return
 		case <-timer.C:
+			gc.RunOnce()
+			timer.Reset(gc.interval)
+		case <-gc.deleted:
+			// Drain the timer before resetting to avoid a spurious firing.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			gc.RunOnce()
 			timer.Reset(gc.interval)
 		}

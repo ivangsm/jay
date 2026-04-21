@@ -10,6 +10,7 @@ import (
 
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
+	"golang.org/x/time/rate"
 )
 
 // ScrubResult contains the results of a scrub run.
@@ -38,6 +39,10 @@ type Scrubber struct {
 	quit     chan struct{}
 	running  atomic.Bool
 
+	// bytesLimiter throttles scrub read bandwidth to avoid starving
+	// production reads. nil = unlimited.
+	bytesLimiter *rate.Limiter
+
 	mu           sync.Mutex
 	lastKey      map[string]string // bucketID -> last checked key
 	totalChecked int64
@@ -47,19 +52,30 @@ type Scrubber struct {
 
 // NewScrubber creates a new scrubber.
 // sampleRate controls what fraction of objects are checked per run (1.0 = full scan).
-func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.Duration, sampleRate float64) *Scrubber {
+// scrubBytesPerSec bounds checksum-read bandwidth; <=0 disables the limiter.
+func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.Duration, sampleRate float64, scrubBytesPerSec int64) *Scrubber {
 	if sampleRate <= 0 || sampleRate > 1.0 {
 		sampleRate = 0.1 // default 10% per run
 	}
+	var limiter *rate.Limiter
+	if scrubBytesPerSec > 0 {
+		// Burst of 50 MiB gives headroom for a single large object read.
+		burst := int64(50 << 20)
+		if scrubBytesPerSec > burst {
+			burst = scrubBytesPerSec
+		}
+		limiter = rate.NewLimiter(rate.Limit(scrubBytesPerSec), int(burst))
+	}
 	return &Scrubber{
-		db:         db,
-		store:      st,
-		log:        log,
-		interval:   interval,
-		sampleRate: sampleRate,
-		quit:       make(chan struct{}),
-		lastKey:    make(map[string]string),
-		maxPerRun:  100,
+		db:           db,
+		store:        st,
+		log:          log,
+		interval:     interval,
+		sampleRate:   sampleRate,
+		bytesLimiter: limiter,
+		quit:         make(chan struct{}),
+		lastKey:      make(map[string]string),
+		maxPerRun:    100,
 	}
 }
 
@@ -227,6 +243,15 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 	var wg sync.WaitGroup
 	results := make([]bucketResult, len(buckets))
 
+	// Snapshot lastKey once under a single lock so goroutine dispatch below
+	// doesn't serialize on s.mu.
+	s.mu.Lock()
+	startKeys := make(map[string]string, len(s.lastKey))
+	for k, v := range s.lastKey {
+		startKeys[k] = v
+	}
+	s.mu.Unlock()
+
 	for i, bucket := range buckets {
 		// Check for shutdown before launching a new goroutine.
 		select {
@@ -235,9 +260,7 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 		default:
 		}
 
-		s.mu.Lock()
-		startKey := s.lastKey[bucket.ID]
-		s.mu.Unlock()
+		startKey := startKeys[bucket.ID]
 
 		wg.Add(1)
 		sem <- struct{}{} // acquire semaphore slot
@@ -273,7 +296,7 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 					return nil
 				}
 
-				match, actual, verifyErr := s.store.VerifyChecksum(obj.LocationRef, obj.ChecksumSHA256)
+				match, actual, verifyErr := s.store.VerifyChecksumRateLimited(obj.LocationRef, obj.ChecksumSHA256, s.bytesLimiter)
 				if verifyErr != nil {
 					s.log.Error("scrub: verify checksum",
 						"err", verifyErr,

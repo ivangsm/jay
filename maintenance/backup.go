@@ -22,7 +22,7 @@ type BackupManager struct {
 
 // NewBackupManager creates a backup manager.
 func NewBackupManager(db *meta.DB, backupDir string, log *slog.Logger) *BackupManager {
-	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
 		log.Error("create backup dir", "err", err, "path", backupDir)
 	}
 	return &BackupManager{db: db, backupDir: backupDir, log: log}
@@ -35,7 +35,7 @@ func (bm *BackupManager) Run() (string, error) {
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	backupPath := filepath.Join(bm.backupDir, fmt.Sprintf("jay-%s.db", ts))
 
-	f, err := os.Create(backupPath)
+	f, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("backup: create file: %w", err)
 	}
