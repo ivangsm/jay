@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/ivangsm/jay/auth"
+	"github.com/ivangsm/jay/internal/objops"
+	"github.com/ivangsm/jay/internal/ratelimit"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
@@ -14,19 +16,27 @@ import (
 
 // Handler is the S3-compatible HTTP handler.
 type Handler struct {
-	db            *meta.DB
-	store         *store.Store
-	auth          *auth.Auth
-	log           *slog.Logger
-	readChecker   *maintenance.ReadChecker
-	metrics       *maintenance.Metrics
-	signingSecret string
-	rateLimiter   *rateLimiter
+	db                *meta.DB
+	store             *store.Store
+	auth              *auth.Auth
+	log               *slog.Logger
+	readChecker       *maintenance.ReadChecker
+	metrics           *maintenance.Metrics
+	signingSecret     string
+	rateLimiter       *ratelimit.Limiter
+	objops            *objops.Service
+	trustProxyHeaders bool
 }
 
 // NewHandler creates a new S3 API handler.
+//
+// trustProxyHeaders defaults to false (the safe option). Callers that sit
+// behind a trusted reverse proxy should call SetTrustProxyHeaders(true) after
+// construction — typically wired from cfg.TrustProxyHeaders in main.go. This
+// is kept as a setter (not an extra NewHandler arg) so main.go's existing
+// NewHandler call site does not need to be modified by this refactor agent.
 func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, signingSecret string, rlCfg *RateLimiterConfig) *Handler {
-	var rl *rateLimiter
+	var rl *ratelimit.Limiter
 	if rlCfg != nil && rlCfg.Rate > 0 {
 		rl = newRateLimiter(*rlCfg)
 	}
@@ -39,7 +49,17 @@ func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, m
 		metrics:       metrics,
 		signingSecret: signingSecret,
 		rateLimiter:   rl,
+		objops:        objops.New(db, st, log),
 	}
+}
+
+// SetTrustProxyHeaders enables or disables trust in X-Forwarded-For for
+// client-IP derivation. Must be called before the server begins accepting
+// requests — there is no locking around the flag. When false (the default),
+// X-Forwarded-For is ignored entirely. When true, X-Forwarded-For is honoured
+// only if the direct TCP peer is loopback or RFC1918 private.
+func (h *Handler) SetTrustProxyHeaders(v bool) {
+	h.trustProxyHeaders = v
 }
 
 // ServeHTTP dispatches S3 requests based on path and method.

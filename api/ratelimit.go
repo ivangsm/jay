@@ -6,99 +6,29 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
+
+	"github.com/ivangsm/jay/internal/ratelimit"
 )
 
-// RateLimiterConfig holds rate limiting configuration.
+// RateLimiterConfig is retained for backward compatibility with existing
+// main.go wiring. It is a thin alias over internal/ratelimit.Config.
 type RateLimiterConfig struct {
 	Rate  float64 // requests per second per token (0 = disabled)
 	Burst int     // maximum burst size
 }
 
-// rateLimiter implements per-token token bucket rate limiting.
-type rateLimiter struct {
-	config  RateLimiterConfig
-	buckets sync.Map // map[string]*tokenBucket (key = token ID or "ip:<addr>")
+// newRateLimiter constructs the shared token-bucket limiter. The proto server
+// instantiates the same type via the internal/ratelimit package directly.
+func newRateLimiter(cfg RateLimiterConfig) *ratelimit.Limiter {
+	return ratelimit.New(ratelimit.Config{Rate: cfg.Rate, Burst: cfg.Burst})
 }
 
-type tokenBucket struct {
-	mu       sync.Mutex
-	tokens   float64
-	maxBurst float64
-	rate     float64
-	lastTime time.Time
-}
-
-func newRateLimiter(cfg RateLimiterConfig) *rateLimiter {
-	if cfg.Burst <= 0 {
-		cfg.Burst = int(cfg.Rate * 2)
-	}
-	rl := &rateLimiter{config: cfg}
-	rl.startCleanup()
-	return rl
-}
-
-func (rl *rateLimiter) startCleanup() {
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			cutoff := time.Now().Add(-1 * time.Hour)
-			rl.buckets.Range(func(key, value any) bool {
-				bucket := value.(*tokenBucket)
-				bucket.mu.Lock()
-				idle := bucket.lastTime.Before(cutoff)
-				bucket.mu.Unlock()
-				if idle {
-					rl.buckets.Delete(key)
-				}
-				return true
-			})
-		}
-	}()
-}
-
-func (rl *rateLimiter) allow(key string) bool {
-	if rl == nil || rl.config.Rate <= 0 {
-		return true
-	}
-
-	val, _ := rl.buckets.LoadOrStore(key, &tokenBucket{
-		tokens:   float64(rl.config.Burst),
-		maxBurst: float64(rl.config.Burst),
-		rate:     rl.config.Rate,
-		lastTime: time.Now(),
-	})
-	bucket := val.(*tokenBucket)
-
-	bucket.mu.Lock()
-	defer bucket.mu.Unlock()
-
-	now := time.Now()
-	elapsed := now.Sub(bucket.lastTime).Seconds()
-	bucket.tokens = math.Min(bucket.maxBurst, bucket.tokens+elapsed*bucket.rate)
-	bucket.lastTime = now
-
-	if bucket.tokens < 1 {
-		return false
-	}
-	bucket.tokens--
-	return true
-}
-
-func (rl *rateLimiter) retryAfter(key string) float64 {
-	if rl == nil || rl.config.Rate <= 0 {
-		return 0
-	}
-	return 1.0 / rl.config.Rate
-}
-
-// withRateLimit is the rate limiting middleware. Must be called after auth
-// so the token ID is available in context.
+// withRateLimit is the HTTP rate-limiting middleware. Must run after auth so
+// that the token ID is available in context. For anonymous requests the limit
+// key falls back to the client IP.
 func (h *Handler) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.rateLimiter == nil || h.rateLimiter.config.Rate <= 0 {
+		if !h.rateLimiter.Enabled() {
 			next(w, r)
 			return
 		}
@@ -107,12 +37,12 @@ func (h *Handler) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 		if token := tokenFromContext(r.Context()); token != nil {
 			key = token.TokenID
 		} else {
-			key = "ip:" + clientIP(r)
+			key = "ip:" + clientIP(r, h.trustProxyHeaders)
 		}
 
-		if !h.rateLimiter.allow(key) {
-			retryAfter := h.rateLimiter.retryAfter(key)
-			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter))))
+		if !h.rateLimiter.Allow(key) {
+			retry := h.rateLimiter.RetryAfterSeconds()
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Max(float64(retry), 1))))
 			writeS3Error(w, r, http.StatusTooManyRequests, "SlowDown", "Rate limit exceeded", r.URL.Path)
 			return
 		}
@@ -120,33 +50,42 @@ func (h *Handler) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// clientIP extracts the client IP address from the request.
-// It only trusts X-Forwarded-For when the direct connection (RemoteAddr)
-// comes from a trusted proxy (loopback or private network). Otherwise it
-// uses RemoteAddr with the port stripped.
-func clientIP(r *http.Request) string {
+// clientIP extracts the client IP from the request.
+//
+// When trustProxyHeaders is false, X-Forwarded-For is IGNORED entirely and
+// the direct TCP peer (RemoteAddr) is used. This is the safe default — the
+// old behaviour, which auto-trusted XFF whenever RemoteAddr looked "private
+// or loopback", was a spoofable heuristic that bypassed rate limiting and
+// source-IP policies for any caller able to reach jay over a private network
+// (which is... every deployment behind a docker-compose network).
+//
+// When trustProxyHeaders is true, XFF is honoured only when the direct peer
+// is loopback or RFC1918 private — the standard "trust the proxy that
+// terminates TLS for us" arrangement. Set JAY_TRUST_PROXY_HEADERS=1 only
+// when you actually front jay with a reverse proxy you control.
+func clientIP(r *http.Request, trustProxyHeaders bool) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-
-	// Only trust X-Forwarded-For if the direct connection is from a trusted network.
+	if !trustProxyHeaders {
+		return host
+	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" && isTrustedProxy(host) {
-		// X-Forwarded-For: "client, proxy1, proxy2" — leftmost is the original client.
-		parts := strings.Split(xff, ",")
-		for _, part := range parts {
+		// Leftmost non-empty token is the original client IP.
+		for _, part := range strings.Split(xff, ",") {
 			ip := strings.TrimSpace(part)
 			if ip != "" {
 				return ip
 			}
 		}
 	}
-
 	return host
 }
 
-// isTrustedProxy reports whether the given IP is a loopback or private address,
-// indicating the request arrived through a local/trusted reverse proxy.
+// isTrustedProxy reports whether ip is loopback or RFC1918 private, indicating
+// the connection came through a trusted reverse proxy. Only consulted when
+// trustProxyHeaders is true.
 func isTrustedProxy(ip string) bool {
 	parsed := net.ParseIP(ip)
 	if parsed == nil {
@@ -154,4 +93,3 @@ func isTrustedProxy(ip string) bool {
 	}
 	return parsed.IsLoopback() || parsed.IsPrivate()
 }
-

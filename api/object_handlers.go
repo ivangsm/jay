@@ -1,73 +1,69 @@
 package api
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/google/uuid"
-	"github.com/ivangsm/jay/maintenance"
+	"github.com/ivangsm/jay/internal/objops"
 	"github.com/ivangsm/jay/meta"
 )
 
-var md5Pool = sync.Pool{
-	New: func() any { return md5.New() },
+// buildIdentity snapshots the request-bound context needed by objops for
+// bucket-policy evaluation. It is called by every object handler after
+// requireAuth has populated the token (or confirmed public-read fallback).
+//
+// TokenID / AccountID may be empty when the request is an anonymous read on
+// a public-read bucket — in that case policy statements that match "*" as
+// subject still apply with an empty token ID, which is the intended S3-like
+// behaviour for deny-over-anonymous.
+func (h *Handler) buildIdentity(r *http.Request, action string) objops.Identity {
+	id := objops.Identity{
+		SourceIP: clientIP(r, h.trustProxyHeaders),
+		Action:   action,
+	}
+	if tok := tokenFromContext(r.Context()); tok != nil {
+		id.TokenID = tok.TokenID
+		id.AccountID = tok.AccountID
+	}
+	return id
 }
 
-// handlePutObject handles PUT /<bucket>/<key>
+// mapObjopsErr translates an objops.* error into an S3 HTTP response. Returns
+// true if the error was handled (and a response written), false otherwise —
+// in the latter case the caller should emit a generic 500.
+func (h *Handler) mapObjopsErr(w http.ResponseWriter, r *http.Request, err error, bucketName, objectKey string) bool {
+	switch {
+	case errors.Is(err, objops.ErrBucketNotFound):
+		writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchBucket, "Bucket not found", "/"+bucketName)
+	case errors.Is(err, objops.ErrObjectNotFound):
+		writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchKey, "Object not found", "/"+bucketName+"/"+objectKey)
+	case errors.Is(err, objops.ErrPolicyDenied), errors.Is(err, objops.ErrAccessDenied):
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", "/"+bucketName+"/"+objectKey)
+	default:
+		return false
+	}
+	return true
+}
+
+// handlePutObject handles PUT /<bucket>/<key>. Delegates to objops.Service for
+// the authorize → write → commit path. Preserves the existing response
+// headers: ETag (quoted per S3), x-amz-checksum-sha256, 200 OK.
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
-	_, ok := h.requireAuth(r, w, meta.ActionObjectPut, bucketName, objectKey)
+	token, ok := h.requireAuth(r, w, meta.ActionObjectPut, bucketName, objectKey)
 	if !ok {
 		return
 	}
 
-	bucket, err := h.db.GetBucket(bucketName)
-	if err != nil {
-		if errors.Is(err, meta.ErrBucketNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchBucket,
-				"Bucket not found", "/"+bucketName)
-			return
-		}
-		h.log.Error("get bucket", "err", err)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-			"Internal error", "/"+bucketName+"/"+objectKey)
-		return
-	}
-
-	objectID := uuid.New().String()
-
-	// Calculate MD5 for ETag while the store calculates SHA-256
-	md5Hash := md5Pool.Get().(hash.Hash)
-	md5Hash.Reset()
-	defer md5Pool.Put(md5Hash)
-	body := io.TeeReader(r.Body, md5Hash)
-
-	// Write to store (atomic: temp → fsync → rename → fsync dir)
-	checksum, size, locationRef, err := h.store.WriteObject(bucket.ID, objectID, body)
-	if err != nil {
-		h.log.Error("write object", "err", err, "bucket", bucketName, "key", objectKey)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-			"Failed to store object", "/"+bucketName+"/"+objectKey)
-		return
-	}
-
-	etag := hex.EncodeToString(md5Hash.Sum(nil))
-
-	// Determine content type
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-
-	// Collect user metadata (x-amz-meta-*)
+	// Collect user metadata (x-amz-meta-*) from the request headers. Keys are
+	// already lower-cased by the map iteration; we sanitize values to strip
+	// CR/LF so they can't inject further headers on echo-back.
 	userMeta := make(map[string]string)
 	for k, v := range r.Header {
 		lk := strings.ToLower(k)
@@ -76,82 +72,59 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		}
 	}
 
-	obj := &meta.Object{
-		BucketID:        bucket.ID,
-		Key:             objectKey,
-		ObjectID:        objectID,
-		State:           "active",
-		SizeBytes:       size,
-		ContentType:     contentType,
-		ETag:            etag,
-		ChecksumSHA256:  checksum,
-		LocationRef:     locationRef,
-		CreatedAt:       time.Now().UTC(),
-		MetadataHeaders: userMeta,
-	}
+	contentType := r.Header.Get("Content-Type")
 
-	// Commit metadata (returns previous version if overwriting)
-	prev, err := h.db.PutObjectMeta(obj)
+	obj, err := h.objops.PutObject(
+		r.Context(), token,
+		bucketName, objectKey, contentType,
+		r.Body,
+		objops.PutOptions{UserMetadata: userMeta},
+		h.buildIdentity(r, meta.ActionObjectPut),
+	)
 	if err != nil {
-		// Metadata commit failed — clean up the physical file
-		h.store.Cleanup(locationRef)
-		h.log.Error("put object meta", "err", err, "bucket", bucketName, "key", objectKey)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-			"Failed to store metadata", "/"+bucketName+"/"+objectKey)
-		return
-	}
-
-	// GC the previous version's physical file if overwriting
-	if prev != nil && prev.LocationRef != locationRef {
-		if err := h.store.DeleteObject(prev.LocationRef); err != nil {
-			h.log.Warn("gc previous object", "err", err, "location", prev.LocationRef)
+		if h.mapObjopsErr(w, r, err, bucketName, objectKey) {
+			return
 		}
+		h.log.Error("put object", "err", err, "bucket", bucketName, "key", objectKey)
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+			"Failed to store object", "/"+bucketName+"/"+objectKey)
+		return
 	}
 
 	if h.metrics != nil {
 		h.metrics.PutObjectTotal.Add(1)
-		h.metrics.BytesUploaded.Add(size)
+		h.metrics.BytesUploaded.Add(obj.SizeBytes)
 	}
 
-	w.Header().Set("ETag", formatETag(etag))
-	w.Header().Set("x-amz-checksum-sha256", checksum)
+	w.Header().Set("ETag", formatETag(obj.ETag))
+	w.Header().Set("x-amz-checksum-sha256", obj.ChecksumSHA256)
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleGetObject handles GET /<bucket>/<key>
+// handleGetObject handles GET /<bucket>/<key>. Range requests are served by
+// seeking into the physical file; full-object GETs are streamed via io.Copy
+// so the kernel sendfile(2) path is reached (statusWriter implements
+// ReadFrom). No per-read checksum verification — the scrubber owns integrity.
 func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
-	_, ok := h.requireAuth(r, w, meta.ActionObjectGet, bucketName, objectKey)
+	token, ok := h.requireAuth(r, w, meta.ActionObjectGet, bucketName, objectKey)
 	if !ok {
 		return
 	}
 
-	bucket, err := h.db.GetBucket(bucketName)
+	// HEAD-style metadata resolution first — we need Size/ContentType before
+	// we can set the headers and decide if this is a Range request.
+	obj, err := h.objops.HeadObject(r.Context(), token, bucketName, objectKey, h.buildIdentity(r, meta.ActionObjectGet))
 	if err != nil {
-		if errors.Is(err, meta.ErrBucketNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchBucket,
-				"Bucket not found", "/"+bucketName)
+		if h.mapObjopsErr(w, r, err, bucketName, objectKey) {
 			return
 		}
-		h.log.Error("get bucket", "err", err)
+		h.log.Error("get object meta", "err", err, "bucket", bucketName, "key", objectKey)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 			"Internal error", "/"+bucketName+"/"+objectKey)
 		return
 	}
 
-	obj, err := h.db.GetObjectMeta(bucket.ID, objectKey)
-	if err != nil {
-		if errors.Is(err, meta.ErrObjectNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchKey,
-				"Object not found", "/"+bucketName+"/"+objectKey)
-			return
-		}
-		h.log.Error("get object meta", "err", err)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-			"Internal error", "/"+bucketName+"/"+objectKey)
-		return
-	}
-
-	f, err := h.store.ReadObject(obj.LocationRef)
+	f, err := h.objops.OpenObjectFile(obj)
 	if err != nil {
 		h.log.Error("read object", "err", err, "location", obj.LocationRef)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
@@ -166,7 +139,6 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 	w.Header().Set("x-amz-checksum-sha256", obj.ChecksumSHA256)
 	w.Header().Set("Accept-Ranges", "bytes")
 
-	// Set user metadata headers
 	for k, v := range obj.MetadataHeaders {
 		w.Header().Set(k, v)
 	}
@@ -175,16 +147,16 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		h.metrics.GetObjectTotal.Add(1)
 	}
 
-	// Range request support
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
+	// Range support. We still set Content-Range/Content-Length explicitly
+	// because io.CopyN writes exactly the range; sendfile kicks in for those
+	// bytes too (statusWriter.ReadFrom → *net.TCPConn.ReadFrom → *os.File).
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 		start, end, ok := parseRange(rangeHeader, obj.SizeBytes)
 		if !ok {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", obj.SizeBytes))
 			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
-
 		length := end - start + 1
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
@@ -209,70 +181,40 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		h.metrics.BytesDownloaded.Add(obj.SizeBytes)
 	}
 
-	// Probabilistic checksum verification on read (streaming — no buffering)
-	if h.readChecker.ShouldVerify() && obj.SizeBytes <= 64<<20 {
-		verifier := maintenance.NewReadVerifier(f, obj.ChecksumSHA256)
-		w.WriteHeader(http.StatusOK)
-		if _, err := io.Copy(w, verifier); err != nil {
-			h.log.Warn("send verified object", "err", err, "bucket", bucketName, "key", objectKey)
-		}
-		if !verifier.Valid() {
-			h.log.Error("checksum mismatch on read",
-				"bucket", bucketName, "key", objectKey,
-				"expected", obj.ChecksumSHA256,
-				"actual", verifier.ActualChecksum(),
-				"location", obj.LocationRef,
-			)
-			h.readChecker.RecordCheck(false)
-			if h.metrics != nil {
-				h.metrics.ChecksumFailures.Add(1)
-				h.metrics.ObjectsQuarantined.Add(1)
-			}
-			if err := h.db.QuarantineObject(bucket.ID, objectKey); err != nil {
-				h.log.Error("quarantine object meta", "err", err, "bucket", bucketName, "key", objectKey)
-			}
-			if err := h.store.Quarantine(obj.LocationRef); err != nil {
-				h.log.Error("quarantine object file", "err", err, "location", obj.LocationRef)
-			}
-		} else {
-			h.readChecker.RecordCheck(true)
-		}
-		return
-	}
-
 	w.WriteHeader(http.StatusOK)
+	// io.Copy → statusWriter.ReadFrom → TCPConn.ReadFrom → sendfile(2) on Linux.
+	// No re-hashing: read-time integrity is the scrubber's job (maintenance/scrub.go).
 	if _, err := io.Copy(w, f); err != nil {
 		h.log.Warn("send object", "err", err, "bucket", bucketName, "key", objectKey)
 	}
 }
 
-// handleHeadObject handles HEAD /<bucket>/<key>
+// handleHeadObject handles HEAD /<bucket>/<key>. Returns the same headers as
+// GET minus the body. x-amz-checksum-sha256 is exposed so clients can verify
+// post-download without a second round-trip.
 func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	if h.metrics != nil {
 		h.metrics.HeadObjectTotal.Add(1)
 	}
-	_, ok := h.requireAuth(r, w, meta.ActionObjectGet, bucketName, objectKey)
+	token, ok := h.requireAuth(r, w, meta.ActionObjectGet, bucketName, objectKey)
 	if !ok {
 		return
 	}
 
-	bucket, err := h.db.GetBucket(bucketName)
+	obj, err := h.objops.HeadObject(r.Context(), token, bucketName, objectKey, h.buildIdentity(r, meta.ActionObjectGet))
 	if err != nil {
-		if errors.Is(err, meta.ErrBucketNotFound) {
+		switch {
+		case errors.Is(err, objops.ErrBucketNotFound), errors.Is(err, objops.ErrObjectNotFound):
+			// HEAD cannot carry an XML error body — only the status.
 			w.WriteHeader(http.StatusNotFound)
-			return
+		case errors.Is(err, objops.ErrPolicyDenied), errors.Is(err, objops.ErrAccessDenied):
+			if h.metrics != nil {
+				h.metrics.AuthFailures.Add(1)
+			}
+			w.WriteHeader(http.StatusForbidden)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
 		}
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	obj, err := h.db.GetObjectMeta(bucket.ID, objectKey)
-	if err != nil {
-		if errors.Is(err, meta.ErrObjectNotFound) {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -281,69 +223,46 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, bucke
 	w.Header().Set("ETag", formatETag(obj.ETag))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 	w.Header().Set("x-amz-checksum-sha256", obj.ChecksumSHA256)
-
 	for k, v := range obj.MetadataHeaders {
 		w.Header().Set(k, v)
 	}
-
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleDeleteObject handles DELETE /<bucket>/<key>
+// handleDeleteObject handles DELETE /<bucket>/<key>. Returns 204 No Content
+// whether or not the object existed — mirrors S3 semantics (idempotent).
 func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
-	_, ok := h.requireAuth(r, w, meta.ActionObjectDelete, bucketName, objectKey)
+	token, ok := h.requireAuth(r, w, meta.ActionObjectDelete, bucketName, objectKey)
 	if !ok {
 		return
 	}
 
-	bucket, err := h.db.GetBucket(bucketName)
+	err := h.objops.DeleteObject(r.Context(), token, bucketName, objectKey, h.buildIdentity(r, meta.ActionObjectDelete))
 	if err != nil {
-		if errors.Is(err, meta.ErrBucketNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchBucket,
-				"Bucket not found", "/"+bucketName)
+		if h.mapObjopsErr(w, r, err, bucketName, objectKey) {
 			return
 		}
-		h.log.Error("get bucket", "err", err)
+		h.log.Error("delete object", "err", err, "bucket", bucketName, "key", objectKey)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 			"Internal error", fmt.Sprintf("/%s/%s", bucketName, objectKey))
 		return
-	}
-
-	obj, err := h.db.DeleteObjectMeta(bucket.ID, objectKey)
-	if err != nil {
-		if errors.Is(err, meta.ErrObjectNotFound) {
-			// S3 returns 204 even if the object doesn't exist
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		h.log.Error("delete object meta", "err", err)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-			"Internal error", fmt.Sprintf("/%s/%s", bucketName, objectKey))
-		return
-	}
-
-	// Delete physical file
-	if err := h.store.DeleteObject(obj.LocationRef); err != nil {
-		h.log.Warn("gc deleted object", "err", err, "location", obj.LocationRef)
 	}
 
 	if h.metrics != nil {
 		h.metrics.DeleteObjectTotal.Add(1)
 	}
-
 	w.WriteHeader(http.StatusNoContent)
 }
 
-
-// parseRange parses a Range header value like "bytes=0-499" or "bytes=-500" or "bytes=500-".
-// Returns start, end (inclusive), and whether the range is valid.
+// parseRange parses a Range header value like "bytes=0-499" or "bytes=-500" or
+// "bytes=500-". Returns start, end (inclusive), and whether the range is valid.
 func parseRange(rangeHeader string, totalSize int64) (start, end int64, ok bool) {
 	if !strings.HasPrefix(rangeHeader, "bytes=") {
 		return 0, 0, false
 	}
 	spec := strings.TrimPrefix(rangeHeader, "bytes=")
-	// Only support single range
 	if strings.Contains(spec, ",") {
+		// Multi-range is valid per RFC 7233 but we only support single range.
 		return 0, 0, false
 	}
 
@@ -353,7 +272,7 @@ func parseRange(rangeHeader string, totalSize int64) (start, end int64, ok bool)
 	}
 
 	if parts[0] == "" {
-		// Suffix range: bytes=-500 means last 500 bytes
+		// Suffix range: bytes=-500 means last 500 bytes.
 		suffix, err := strconv.ParseInt(parts[1], 10, 64)
 		if err != nil || suffix <= 0 {
 			return 0, 0, false
@@ -379,6 +298,5 @@ func parseRange(rangeHeader string, totalSize int64) (start, end int64, ok bool)
 	if end >= totalSize {
 		end = totalSize - 1
 	}
-
 	return start, end, true
 }
