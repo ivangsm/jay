@@ -7,20 +7,21 @@ import (
 )
 
 type Config struct {
-	DataDir          string
-	ListenAddr       string
-	AdminAddr        string
-	NativeAddr       string
-	AdminToken       string
-	LogLevel         string
-	SigningSecret    string
-	TLSCert          string
-	TLSKey           string
-	RateLimit        float64 // requests per second per token (0 = disabled)
-	RateBurst        int     // burst size
-	SeedTokenAccount string  // JAY_SEED_TOKEN_ACCOUNT
-	SeedTokenID      string  // JAY_SEED_TOKEN_ID
-	SeedTokenSecret  string  // JAY_SEED_TOKEN_SECRET
+	DataDir           string
+	ListenAddr        string
+	AdminAddr         string
+	NativeAddr        string
+	AdminToken        string
+	LogLevel          string
+	SigningSecret     string
+	TLSCert           string
+	TLSKey            string
+	RateLimit         float64 // requests per second per token (0 = disabled)
+	RateBurst         int     // burst size
+	SeedTokenAccount  string  // JAY_SEED_TOKEN_ACCOUNT
+	SeedTokenID       string  // JAY_SEED_TOKEN_ID
+	SeedTokenSecret   string  // JAY_SEED_TOKEN_SECRET
+	TrustProxyHeaders bool    // JAY_TRUST_PROXY_HEADERS — if true, trust X-Forwarded-For / X-Real-IP
 }
 
 func LoadConfig() Config {
@@ -43,6 +44,9 @@ func LoadConfig() Config {
 		}
 	}
 
+	// These are fallback warnings only. The authoritative fail-fast validation
+	// for JAY_ADMIN_TOKEN and JAY_SIGNING_SECRET lives in main.go and runs
+	// before any listener binds or the DB opens.
 	if adminToken := os.Getenv("JAY_ADMIN_TOKEN"); adminToken != "" && len(adminToken) < 16 {
 		slog.Warn("JAY_ADMIN_TOKEN is too short, minimum 16 characters recommended")
 	}
@@ -51,20 +55,21 @@ func LoadConfig() Config {
 	}
 
 	cfg := Config{
-		DataDir:          envOr("JAY_DATA_DIR", "./data"),
-		ListenAddr:       envOr("JAY_LISTEN_ADDR", ":9000"),
-		AdminAddr:        envOr("JAY_ADMIN_ADDR", ":9001"),
-		NativeAddr:       envOr("JAY_NATIVE_ADDR", ":4444"),
-		AdminToken:       os.Getenv("JAY_ADMIN_TOKEN"),
-		LogLevel:         envOr("JAY_LOG_LEVEL", "info"),
-		SigningSecret:    os.Getenv("JAY_SIGNING_SECRET"),
-		TLSCert:          os.Getenv("JAY_TLS_CERT"),
-		TLSKey:           os.Getenv("JAY_TLS_KEY"),
-		RateLimit:        rateLimit,
-		RateBurst:        rateBurst,
-		SeedTokenAccount: os.Getenv("JAY_SEED_TOKEN_ACCOUNT"),
-		SeedTokenID:      os.Getenv("JAY_SEED_TOKEN_ID"),
-		SeedTokenSecret:  os.Getenv("JAY_SEED_TOKEN_SECRET"),
+		DataDir:           envOr("JAY_DATA_DIR", "./data"),
+		ListenAddr:        envOr("JAY_LISTEN_ADDR", ":9000"),
+		AdminAddr:         envOr("JAY_ADMIN_ADDR", ":9001"),
+		NativeAddr:        envOr("JAY_NATIVE_ADDR", ":4444"),
+		AdminToken:        os.Getenv("JAY_ADMIN_TOKEN"),
+		LogLevel:          envOr("JAY_LOG_LEVEL", "info"),
+		SigningSecret:     os.Getenv("JAY_SIGNING_SECRET"),
+		TLSCert:           os.Getenv("JAY_TLS_CERT"),
+		TLSKey:            os.Getenv("JAY_TLS_KEY"),
+		RateLimit:         rateLimit,
+		RateBurst:         rateBurst,
+		SeedTokenAccount:  os.Getenv("JAY_SEED_TOKEN_ACCOUNT"),
+		SeedTokenID:       os.Getenv("JAY_SEED_TOKEN_ID"),
+		SeedTokenSecret:   os.Getenv("JAY_SEED_TOKEN_SECRET"),
+		TrustProxyHeaders: parseBoolEnv("JAY_TRUST_PROXY_HEADERS"),
 	}
 	return cfg
 }
@@ -74,4 +79,18 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseBoolEnv returns true only for "1" or "true" (case-insensitive). Anything
+// else — including empty — is false. Defaults to false for safety.
+func parseBoolEnv(key string) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return false
+	}
+	switch v {
+	case "1", "true", "TRUE", "True":
+		return true
+	}
+	return false
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,7 +22,25 @@ import (
 	"github.com/ivangsm/jay/store"
 )
 
+// minSecretLen is the minimum acceptable length (in bytes) for sensitive env
+// secrets. 32 chars of high-entropy input (e.g. `openssl rand -base64 32`)
+// leaves comfortable margin against online brute force even if the hash ever
+// leaks. The monorepo policy forbids defaults for secrets, so anything shorter
+// than this is treated as operator error and the process refuses to boot.
+const minSecretLen = 32
+
 func main() {
+	// Fail-fast on missing or weak secrets BEFORE touching disk, opening the
+	// metadata DB, or binding any listener. Monorepo rule: "Ninguna variable de
+	// entorno sensible tiene valor por defecto. Si falta, el servicio debe
+	// fallar al arrancar."
+	if v := os.Getenv("JAY_ADMIN_TOKEN"); len(v) < minSecretLen {
+		log.Fatalf("JAY_ADMIN_TOKEN must be set and at least %d chars", minSecretLen)
+	}
+	if v := os.Getenv("JAY_SIGNING_SECRET"); len(v) < minSecretLen {
+		log.Fatalf("JAY_SIGNING_SECRET must be set and at least %d chars", minSecretLen)
+	}
+
 	cfg := LoadConfig()
 
 	// Setup structured logging
@@ -52,18 +71,16 @@ func main() {
 	}
 	defer func() { _ = db.Close() }()
 
-	if cfg.SigningSecret != "" {
-		db.SetSigningSecret(cfg.SigningSecret)
-		migrated, err := db.MigrateTokenSecrets()
-		if err != nil {
-			log.Error("failed to migrate token secrets", "err", err)
-			os.Exit(1)
-		}
-		if migrated > 0 {
-			log.Info("migrated token secrets to encrypted format", "count", migrated)
-		}
-	} else {
-		log.Warn("JAY_SIGNING_SECRET not set — token SecretKey will not be encrypted at rest")
+	// JAY_SIGNING_SECRET is guaranteed non-empty and >= minSecretLen by the
+	// fail-fast at the top of main().
+	db.SetSigningSecret(cfg.SigningSecret)
+	migrated, err := db.MigrateTokenSecrets()
+	if err != nil {
+		log.Error("failed to migrate token secrets", "err", err)
+		os.Exit(1)
+	}
+	if migrated > 0 {
+		log.Info("migrated token secrets to encrypted format", "count", migrated)
 	}
 
 	// Initialize object store
@@ -92,13 +109,24 @@ func main() {
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
 
-	// Start background scrubber (10% sample every 6 hours)
-	scrubber := maintenance.NewScrubber(db, st, log, 6*time.Hour, 0.1)
+	// Invalidate auth cache whenever a token is revoked/updated at the meta
+	// layer so the 5-minute cache TTL can't keep a killed token alive.
+	db.SetTokenInvalidateHook(au.InvalidateToken)
+
+	// Surface fsync failures to the metrics counter so operators can alert on
+	// durability loss without grepping logs.
+	st.SetFsyncErrorHook(func(err error) { metrics.RecordFsyncFailure() })
+
+	// Start background scrubber (10% sample every 6 hours, capped at 50 MiB/s
+	// so integrity work can't starve production reads).
+	scrubber := maintenance.NewScrubber(db, st, log, 6*time.Hour, 0.1, 50<<20)
 	scrubber.Start()
 	defer scrubber.Stop()
 
-	// Start background GC (every 15 minutes)
+	// Start background GC (every 15 minutes). Wire deletion notifications so
+	// GC wakes immediately on delete instead of waiting for the next tick.
 	gc := maintenance.NewGC(cfg.DataDir, log, 15*time.Minute)
+	db.SetDeletionHook(gc.NotifyDeletion)
 	gc.Start()
 	defer gc.Stop()
 
@@ -123,6 +151,7 @@ func main() {
 		rlCfg = &api.RateLimiterConfig{Rate: cfg.RateLimit, Burst: cfg.RateBurst}
 	}
 	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret, rlCfg)
+	s3Handler.SetTrustProxyHeaders(cfg.TrustProxyHeaders)
 
 	// Admin API handler (on separate port)
 	adminMux := http.NewServeMux()
@@ -138,6 +167,7 @@ func main() {
 		ListenAddr:    cfg.ListenAddr,
 		TLSEnabled:    tlsEnabled,
 	})
+	defer func() { _ = adminHandler.Close() }()
 	adminMux.Handle("/_jay/", adminHandler)
 
 	// Health checks
