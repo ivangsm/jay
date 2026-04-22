@@ -71,7 +71,7 @@ func (h *Handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Req
 
 // handleUploadPart handles PUT /<bucket>/<key>?uploadId=X&partNumber=N
 func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucketName, objectKey, uploadID string) {
-	_, ok := h.requireAuth(r, w, meta.ActionMultipartUpload, bucketName, objectKey)
+	token, ok := h.requireAuth(r, w, meta.ActionMultipartUpload, bucketName, objectKey)
 	if !ok {
 		return
 	}
@@ -90,6 +90,11 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 			return
 		}
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+		return
+	}
+
+	if token == nil || upload.InitiatedBy != token.AccountID {
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", "/"+bucketName+"/"+objectKey)
 		return
 	}
 
@@ -133,7 +138,7 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 
 // handleCompleteMultipartUpload handles POST /<bucket>/<key>?uploadId=X
 func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucketName, objectKey, uploadID string) {
-	_, ok := h.requireAuth(r, w, meta.ActionMultipartComplete, bucketName, objectKey)
+	token, ok := h.requireAuth(r, w, meta.ActionMultipartComplete, bucketName, objectKey)
 	if !ok {
 		return
 	}
@@ -145,6 +150,20 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 			return
 		}
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName)
+		return
+	}
+
+	existing, err := h.db.GetMultipartUpload(uploadID)
+	if err != nil {
+		if errors.Is(err, meta.ErrUploadNotFound) {
+			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
+			return
+		}
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+		return
+	}
+	if token == nil || existing.InitiatedBy != token.AccountID {
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", "/"+bucketName+"/"+objectKey)
 		return
 	}
 
@@ -234,8 +253,22 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 // handleAbortMultipartUpload handles DELETE /<bucket>/<key>?uploadId=X
 func (h *Handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, bucketName, objectKey, uploadID string) {
-	_, ok := h.requireAuth(r, w, meta.ActionMultipartAbort, bucketName, objectKey)
+	token, ok := h.requireAuth(r, w, meta.ActionMultipartAbort, bucketName, objectKey)
 	if !ok {
+		return
+	}
+
+	existing, err := h.db.GetMultipartUpload(uploadID)
+	if err != nil {
+		if errors.Is(err, meta.ErrUploadNotFound) {
+			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
+			return
+		}
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+		return
+	}
+	if token == nil || existing.InitiatedBy != token.AccountID {
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", "/"+bucketName+"/"+objectKey)
 		return
 	}
 
@@ -262,7 +295,7 @@ func (h *Handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Requ
 
 // handleListParts handles GET /<bucket>/<key>?uploadId=X
 func (h *Handler) handleListParts(w http.ResponseWriter, r *http.Request, bucketName, objectKey, uploadID string) {
-	_, ok := h.requireAuth(r, w, meta.ActionMultipartUpload, bucketName, objectKey)
+	token, ok := h.requireAuth(r, w, meta.ActionMultipartUpload, bucketName, objectKey)
 	if !ok {
 		return
 	}
@@ -274,6 +307,10 @@ func (h *Handler) handleListParts(w http.ResponseWriter, r *http.Request, bucket
 			return
 		}
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+		return
+	}
+	if token == nil || upload.InitiatedBy != token.AccountID {
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", "/"+bucketName+"/"+objectKey)
 		return
 	}
 

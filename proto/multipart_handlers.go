@@ -80,6 +80,13 @@ func (h *connHandler) handleUploadPart(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
+	if upload.InitiatedBy != h.token.AccountID {
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
+	}
+
 	if upload.State != "initiated" {
 		if derr := drainData(req); derr != nil {
 			return derr
@@ -144,6 +151,17 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+
+	existing, err := h.db.GetMultipartUpload(uploadID)
+	if err != nil {
+		if errors.Is(err, meta.ErrUploadNotFound) {
+			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
+		}
+		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+	if existing.InitiatedBy != h.token.AccountID {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	upload, err := h.db.CompleteMultipartUpload(uploadID, partNumbers)
@@ -214,6 +232,17 @@ func (h *connHandler) handleAbortMultipart(req *request) error {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
+	existing, err := h.db.GetMultipartUpload(uploadID)
+	if err != nil {
+		if errors.Is(err, meta.ErrUploadNotFound) {
+			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
+		}
+		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+	if existing.InitiatedBy != h.token.AccountID {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
+	}
+
 	upload, err := h.db.AbortMultipartUpload(uploadID)
 	if err != nil {
 		if errors.Is(err, meta.ErrUploadNotFound) {
@@ -248,6 +277,9 @@ func (h *connHandler) handleListParts(req *request) error {
 			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+	if upload.InitiatedBy != h.token.AccountID {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	entries := make([]PartInfoEntry, len(upload.Parts))
