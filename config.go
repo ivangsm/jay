@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -22,6 +23,10 @@ type Config struct {
 	SeedTokenID       string  // JAY_SEED_TOKEN_ID
 	SeedTokenSecret   string  // JAY_SEED_TOKEN_SECRET
 	TrustProxyHeaders bool    // JAY_TRUST_PROXY_HEADERS — if true, trust X-Forwarded-For / X-Real-IP
+	ScrubInterval     time.Duration
+	ScrubSampleRate   float64
+	ScrubBytesPerSec  int64
+	ScrubMaxPerRun    int
 }
 
 func LoadConfig() Config {
@@ -44,14 +49,41 @@ func LoadConfig() Config {
 		}
 	}
 
-	// These are fallback warnings only. The authoritative fail-fast validation
-	// for JAY_ADMIN_TOKEN and JAY_SIGNING_SECRET lives in main.go and runs
-	// before any listener binds or the DB opens.
-	if adminToken := os.Getenv("JAY_ADMIN_TOKEN"); adminToken != "" && len(adminToken) < 16 {
-		slog.Warn("JAY_ADMIN_TOKEN is too short, minimum 16 characters recommended")
+	scrubInterval := 6 * time.Hour
+	if v := os.Getenv("JAY_SCRUB_INTERVAL_HOURS"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed <= 0 {
+			slog.Error("invalid JAY_SCRUB_INTERVAL_HOURS, using default", "value", v, "err", err)
+		} else {
+			scrubInterval = time.Duration(parsed) * time.Hour
+		}
 	}
-	if signingSecret := os.Getenv("JAY_SIGNING_SECRET"); signingSecret != "" && len(signingSecret) < 32 {
-		slog.Warn("JAY_SIGNING_SECRET is too short, minimum 32 characters recommended")
+	scrubSampleRate := 0.1
+	if v := os.Getenv("JAY_SCRUB_SAMPLE_RATE"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil || parsed <= 0 || parsed > 1.0 {
+			slog.Error("invalid JAY_SCRUB_SAMPLE_RATE (must be in (0.0, 1.0]), using default 0.1", "value", v, "err", err)
+		} else {
+			scrubSampleRate = parsed
+		}
+	}
+	scrubBytesPerSec := int64(50 << 20)
+	if v := os.Getenv("JAY_SCRUB_BYTES_PER_SEC"); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			slog.Error("invalid JAY_SCRUB_BYTES_PER_SEC, using default", "value", v, "err", err)
+		} else {
+			scrubBytesPerSec = parsed
+		}
+	}
+	scrubMaxPerRun := 100
+	if v := os.Getenv("JAY_SCRUB_MAX_PER_RUN"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed <= 0 {
+			slog.Error("invalid JAY_SCRUB_MAX_PER_RUN, using default", "value", v, "err", err)
+		} else {
+			scrubMaxPerRun = parsed
+		}
 	}
 
 	cfg := Config{
@@ -70,6 +102,10 @@ func LoadConfig() Config {
 		SeedTokenID:       os.Getenv("JAY_SEED_TOKEN_ID"),
 		SeedTokenSecret:   os.Getenv("JAY_SEED_TOKEN_SECRET"),
 		TrustProxyHeaders: parseBoolEnv("JAY_TRUST_PROXY_HEADERS"),
+		ScrubInterval:     scrubInterval,
+		ScrubSampleRate:   scrubSampleRate,
+		ScrubBytesPerSec:  scrubBytesPerSec,
+		ScrubMaxPerRun:    scrubMaxPerRun,
 	}
 	return cfg
 }
