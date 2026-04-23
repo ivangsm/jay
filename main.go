@@ -29,6 +29,10 @@ import (
 // than this is treated as operator error and the process refuses to boot.
 const minSecretLen = 32
 
+// Backup retention policy: keep 24 backups, prune those older than 7 days.
+const backupRetentionDays = 7
+const backupPruneMinCount = 3
+
 func main() {
 	// Fail-fast on missing or weak secrets BEFORE touching disk, opening the
 	// metadata DB, or binding any listener. Monorepo rule: "Ninguna variable de
@@ -93,65 +97,8 @@ func main() {
 	// Health checker (not ready until recovery completes)
 	hc := NewHealthChecker(db)
 
-	// Run startup recovery
-	if err := recovery.Run(db, st, log); err != nil {
-		log.Error("recovery failed", "err", err)
-		os.Exit(1)
-	}
-
-	// Seed token from env vars (idempotent)
-	if err := runSeed(cfg, db, log); err != nil {
-		log.Error("seed failed", "err", err)
-		os.Exit(1)
-	}
-
-	// Build shared components
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
-
-	// Invalidate auth cache whenever a token is revoked/updated at the meta
-	// layer so the 5-minute cache TTL can't keep a killed token alive.
-	db.SetTokenInvalidateHook(au.InvalidateToken)
-
-	// Surface fsync failures to the metrics counter so operators can alert on
-	// durability loss without grepping logs.
-	st.SetFsyncErrorHook(func(err error) { metrics.RecordFsyncFailure() })
-
-	// Start background scrubber (10% sample every 6 hours, capped at 50 MiB/s
-	// so integrity work can't starve production reads).
-	scrubber := maintenance.NewScrubber(db, st, log, 6*time.Hour, 0.1, 50<<20)
-	scrubber.Start()
-	defer scrubber.Stop()
-
-	// Start background GC (every 15 minutes). Wire deletion notifications so
-	// GC wakes immediately on delete instead of waiting for the next tick.
-	gc := maintenance.NewGC(cfg.DataDir, log, 15*time.Minute)
-	db.SetDeletionHook(gc.NotifyDeletion)
-	gc.Start()
-	defer gc.Stop()
-
-	// Start background backup (every 1 hour, keep 24, prune after 7 days)
-	backupMgr := maintenance.NewBackupManager(db, filepath.Join(cfg.DataDir, "backups"), log)
-	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			if _, err := backupMgr.Run(); err != nil {
-				log.Error("backup failed", "err", err)
-			}
-			if _, err := backupMgr.Prune(7*24*time.Hour, 3); err != nil {
-				log.Error("backup prune failed", "err", err)
-			}
-		}
-	}()
-
-	// S3 API handler
-	var rlCfg *api.RateLimiterConfig
-	if cfg.RateLimit > 0 {
-		rlCfg = &api.RateLimiterConfig{Rate: cfg.RateLimit, Burst: cfg.RateBurst}
-	}
-	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret, rlCfg)
-	s3Handler.SetTrustProxyHeaders(cfg.TrustProxyHeaders)
 
 	// Admin API handler (on separate port)
 	adminMux := http.NewServeMux()
@@ -170,19 +117,80 @@ func main() {
 	defer func() { _ = adminHandler.Close() }()
 	adminMux.Handle("/_jay/", adminHandler)
 
-	// Health checks
 	adminMux.HandleFunc("/health", hc.ReadinessHandler)
 	adminMux.HandleFunc("/health/live", hc.LivenessHandler)
 	adminMux.HandleFunc("/health/ready", hc.ReadinessHandler)
 
-	// Start servers
-	shutdownS3 := startServer(cfg.ListenAddr, s3Handler, log, "s3", cfg.TLSCert, cfg.TLSKey)
+	// Bind admin listener BEFORE recovery so probes get 503 (not
+	// ECONNREFUSED) while recovery is in flight on a large store.
 	shutdownAdmin := startServer(cfg.AdminAddr, adminMux, log, "admin", cfg.TLSCert, cfg.TLSKey)
+
+	// Run startup recovery
+	if err := recovery.Run(db, st, log); err != nil {
+		log.Error("recovery failed", "err", err)
+		os.Exit(1)
+	}
+
+	// Seed token from env vars (idempotent)
+	if err := runSeed(cfg, db, log); err != nil {
+		log.Error("seed failed", "err", err)
+		os.Exit(1)
+	}
+
+	// Invalidate auth cache whenever a token is revoked/updated at the meta
+	// layer so the 5-minute cache TTL can't keep a killed token alive.
+	db.SetTokenInvalidateHook(au.InvalidateToken)
+
+	// Surface fsync failures to the metrics counter so operators can alert on
+	// durability loss without grepping logs.
+	st.SetFsyncErrorHook(func(err error) { metrics.RecordFsyncFailure() })
+
+	scrubber := maintenance.NewScrubber(db, st, log, cfg.ScrubInterval, cfg.ScrubSampleRate, cfg.ScrubBytesPerSec, cfg.ScrubMaxPerRun)
+	scrubber.Start()
+	defer scrubber.Stop()
+
+	// Start background GC (every 15 minutes). Wire deletion notifications so
+	// GC wakes immediately on delete instead of waiting for the next tick.
+	gc := maintenance.NewGC(cfg.DataDir, log, 15*time.Minute)
+	db.SetDeletionHook(gc.NotifyDeletion)
+	gc.Start()
+	defer gc.Stop()
+
+	// Start background backup (every 1 hour, keep 24, prune after 7 days)
+	backupMgr := maintenance.NewBackupManager(db, filepath.Join(cfg.DataDir, "backups"), log)
+	backupDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-backupDone:
+				return
+			case <-ticker.C:
+				if _, err := backupMgr.Run(); err != nil {
+					log.Error("backup failed", "err", err)
+				}
+				if _, err := backupMgr.Prune(backupRetentionDays*24*time.Hour, backupPruneMinCount); err != nil {
+					log.Error("backup prune failed", "err", err)
+				}
+			}
+		}
+	}()
+
+	// S3 API handler
+	var rlCfg *api.RateLimiterConfig
+	if cfg.RateLimit > 0 {
+		rlCfg = &api.RateLimiterConfig{Rate: cfg.RateLimit, Burst: cfg.RateBurst}
+	}
+	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret, rlCfg)
+	s3Handler.SetTrustProxyHeaders(cfg.TrustProxyHeaders)
+
+	shutdownS3 := startServer(cfg.ListenAddr, s3Handler, log, "s3", cfg.TLSCert, cfg.TLSKey)
 
 	// Start native TCP server
 	var shutdownNative func() error
 	if cfg.NativeAddr != "" {
-		nativeServer := jayproto.NewServer(db, st, au, log, int(cfg.RateLimit), cfg.RateBurst)
+		nativeServer := jayproto.NewServer(db, st, au, log, metrics, int(cfg.RateLimit), cfg.RateBurst)
 		var err error
 		shutdownNative, err = nativeServer.ListenAndServe(cfg.NativeAddr)
 		if err != nil {
@@ -200,6 +208,10 @@ func main() {
 	<-sig
 
 	log.Info("jay: shutting down")
+
+	// Stop backup loop before the deferred db.Close so no Run() is in
+	// flight when bbolt.Close fires.
+	close(backupDone)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

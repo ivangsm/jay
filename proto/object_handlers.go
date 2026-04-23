@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/ivangsm/jay/internal/objops"
@@ -68,15 +69,19 @@ func (h *connHandler) handlePutObject(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "failed to store object", "InternalError")
 	}
 
+	if h.metrics != nil {
+		h.metrics.PutObjectTotal.Add(1)
+		h.metrics.BytesUploaded.Add(obj.SizeBytes)
+	}
+
 	return h.writeResponseCombined(StatusOK, req.streamID, EncodePutResponse(obj.ETag, obj.ChecksumSHA256))
 }
 
-// handleGetObject streams the object body to the connection via WriteFrame,
-// which uses io.CopyN on a *bufio.Writer. The buffer is small (64KB) and is
-// backed by the net.Conn; we do NOT wrap or re-hash — sendfile only fires on
-// raw *net.TCPConn writes, not through a bufio.Writer, but the streaming is
-// still zero-allocation per chunk once the data_len is known. The scrubber
-// owns read-time integrity verification.
+// handleGetObject streams the object body directly from the underlying
+// *os.File to the raw net.Conn so (*net.TCPConn).ReadFrom → sendfile(2) can
+// fire on Linux. The framing prelude (header + meta) is written through the
+// bufio writer and flushed before the body copy so the body path stays in
+// kernel space.
 func (h *connHandler) handleGetObject(req *request) error {
 	bucket, key, err := DecodeBucketKey(req.meta)
 	if err != nil {
@@ -104,12 +109,37 @@ func (h *connHandler) handleGetObject(req *request) error {
 		obj.UpdatedAt.Format(time.RFC3339),
 		obj.MetadataHeaders,
 	)
-	// WriteFrame copies exactly SizeBytes from f into the bufio writer; the
-	// subsequent Flush in handleOneRequest drains to the TCP conn. An io.Copy
-	// directly to the net.Conn would be marginally better for sendfile, but
-	// changing the framing contract here is out of scope — frames are the
-	// protocol.
-	return h.writeResponse(StatusOK, req.streamID, resp, f, obj.SizeBytes)
+
+	if h.metrics != nil {
+		h.metrics.GetObjectTotal.Add(1)
+		h.metrics.BytesDownloaded.Add(obj.SizeBytes)
+	}
+
+	return h.writeResponseStreaming(StatusOK, req.streamID, resp, f, obj.SizeBytes)
+}
+
+// writeResponseStreaming writes the frame header + meta through the buffered
+// writer, flushes, then copies the file body straight to the raw net.Conn so
+// (*net.TCPConn).ReadFrom can delegate to sendfile(2).
+func (h *connHandler) writeResponseStreaming(status byte, streamID uint32, meta []byte, file *os.File, dataLen int64) error {
+	if err := WriteHeader(h.bw, status, streamID, uint32(len(meta)), dataLen); err != nil {
+		return err
+	}
+	if len(meta) > 0 {
+		if _, err := h.bw.Write(meta); err != nil {
+			return err
+		}
+	}
+	if err := h.bw.Flush(); err != nil {
+		return err
+	}
+	if dataLen <= 0 || file == nil {
+		return nil
+	}
+	if _, err := io.Copy(h.conn, file); err != nil {
+		return err
+	}
+	return nil
 }
 
 // handleHeadObject returns object metadata only. No body frame.
@@ -133,6 +163,11 @@ func (h *connHandler) handleHeadObject(req *request) error {
 		obj.UpdatedAt.Format(time.RFC3339),
 		obj.MetadataHeaders,
 	)
+
+	if h.metrics != nil {
+		h.metrics.HeadObjectTotal.Add(1)
+	}
+
 	return h.writeResponseCombined(StatusOK, req.streamID, resp)
 }
 
@@ -153,6 +188,11 @@ func (h *connHandler) handleDeleteObject(req *request) error {
 		h.log.Error("delete object", "err", err, "bucket", bucket, "key", key)
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
+
+	if h.metrics != nil {
+		h.metrics.DeleteObjectTotal.Add(1)
+	}
+
 	return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 }
 

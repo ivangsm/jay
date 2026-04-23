@@ -16,6 +16,7 @@ import (
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/internal/objops"
 	"github.com/ivangsm/jay/internal/ratelimit"
+	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
 )
@@ -30,16 +31,16 @@ const (
 
 // Server is the native TCP protocol server.
 //
-// Rate limiting uses the same token-bucket implementation as the HTTP API
-// (see internal/ratelimit). The previous implementation was a sliding window
-// that stored rateBurst but never consulted it — burst is now actually
-// enforced and both transports share one limiter type.
+// Rate limiting uses a token-bucket algorithm with per-token buckets.
+// rateLimit is requests per second; rateBurst is the bucket capacity.
+// rateLimit <= 0 disables the limiter entirely.
 type Server struct {
 	db       *meta.DB
 	store    *store.Store
 	auth     *auth.Auth
 	objops   *objops.Service
 	log      *slog.Logger
+	metrics  *maintenance.Metrics
 	listener net.Listener
 	wg       sync.WaitGroup
 	quit     chan struct{}
@@ -55,13 +56,14 @@ type Server struct {
 // token-bucket capacity. rateLimit <= 0 disables the limiter entirely.
 // Pre-existing callers pass (100, 200) from config; those defaults are
 // preserved by internal/ratelimit.New when Burst <= 0.
-func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, rateLimit, rateBurst int) *Server {
+func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, rateLimit, rateBurst int) *Server {
 	return &Server{
 		db:       db,
 		store:    st,
 		auth:     au,
 		objops:   objops.New(db, st, log),
 		log:      log,
+		metrics:  metrics,
 		quit:     make(chan struct{}),
 		maxConns: defaultMaxConns,
 		limiter: ratelimit.New(ratelimit.Config{
@@ -178,10 +180,7 @@ func (s *Server) handleConn(nc net.Conn) {
 		sourceIP = host
 	}
 
-	// Limiter key mixes token ID + remote addr so two concurrent connections
-	// from the same token share the same bucket only when they come from the
-	// same peer. This is the intended behaviour: one caller, one bucket.
-	limitKey := token.TokenID + "@" + nc.RemoteAddr().String()
+	limitKey := token.TokenID
 
 	h := &connHandler{
 		db:       s.db,
@@ -189,6 +188,7 @@ func (s *Server) handleConn(nc net.Conn) {
 		auth:     s.auth,
 		objops:   s.objops,
 		log:      s.log,
+		metrics:  s.metrics,
 		token:    token,
 		conn:     nc,
 		br:       br,
@@ -229,6 +229,7 @@ type connHandler struct {
 	auth     *auth.Auth
 	objops   *objops.Service
 	log      *slog.Logger
+	metrics  *maintenance.Metrics
 	token    *meta.Token
 	conn     net.Conn
 	br       *bufio.Reader

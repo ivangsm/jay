@@ -20,7 +20,6 @@ type Handler struct {
 	store             *store.Store
 	auth              *auth.Auth
 	log               *slog.Logger
-	readChecker       *maintenance.ReadChecker
 	metrics           *maintenance.Metrics
 	signingSecret     string
 	rateLimiter       *ratelimit.Limiter
@@ -45,7 +44,6 @@ func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, m
 		store:         st,
 		auth:          au,
 		log:           log,
-		readChecker:   maintenance.NewReadChecker(0.05),
 		metrics:       metrics,
 		signingSecret: signingSecret,
 		rateLimiter:   rl,

@@ -72,7 +72,7 @@ func setup(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 
-	srv := proto.NewServer(db, st, au, log, 0, 0)
+	srv := proto.NewServer(db, st, au, log, nil, 0, 0)
 
 	// Use random port
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
