@@ -55,7 +55,7 @@ func (db *DB) PutObjectMeta(obj *Object) (*Object, error) {
 		obj.State = "active"
 	}
 
-	data, err := json.Marshal(obj)
+	data, err := encodeObject(obj)
 	if err != nil {
 		return nil, fmt.Errorf("meta: marshal object: %w", err)
 	}
@@ -70,7 +70,7 @@ func (db *DB) PutObjectMeta(obj *Object) (*Object, error) {
 		var dCount, dSize int64
 		if existing := bk.Get([]byte(obj.Key)); existing != nil {
 			var old Object
-			if err := json.Unmarshal(existing, &old); err == nil {
+			if err := decodeObject(existing, &old); err == nil {
 				if old.State == "active" {
 					prev = &old
 					if obj.State == "active" {
@@ -108,6 +108,49 @@ func (db *DB) PutObjectMeta(obj *Object) (*Object, error) {
 	return prev, err
 }
 
+// GetBucketAndObject resolves a bucket by name and fetches an active object by
+// key in a single bbolt View transaction. Returns ErrBucketNotFound if the
+// bucket is missing and ErrObjectNotFound if the object is missing or not in
+// the "active" state. When the bucket exists but the object does not, the
+// bucket pointer is still returned alongside ErrObjectNotFound so callers can
+// authorize without issuing a second view transaction.
+func (db *DB) GetBucketAndObject(bucketName, key string) (*Bucket, *Object, error) {
+	var (
+		bucket   Bucket
+		obj      Object
+		foundObj bool
+	)
+	err := db.bolt.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket(bucketBuckets).Get([]byte(bucketName))
+		if data == nil {
+			return ErrBucketNotFound
+		}
+		if err := json.Unmarshal(data, &bucket); err != nil {
+			return err
+		}
+		bk := tx.Bucket(objectsBucketName(bucket.ID))
+		if bk == nil {
+			return nil
+		}
+		raw := bk.Get([]byte(key))
+		if raw == nil {
+			return nil
+		}
+		if err := decodeObject(raw, &obj); err != nil {
+			return err
+		}
+		foundObj = true
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if !foundObj || obj.State != "active" {
+		return &bucket, nil, ErrObjectNotFound
+	}
+	return &bucket, &obj, nil
+}
+
 // GetObjectMeta retrieves object metadata by bucket ID and key.
 func (db *DB) GetObjectMeta(bucketID, key string) (*Object, error) {
 	var obj Object
@@ -120,7 +163,7 @@ func (db *DB) GetObjectMeta(bucketID, key string) (*Object, error) {
 		if data == nil {
 			return ErrObjectNotFound
 		}
-		return json.Unmarshal(data, &obj)
+		return decodeObject(data, &obj)
 	})
 	if err != nil {
 		return nil, err
@@ -143,7 +186,7 @@ func (db *DB) DeleteObjectMeta(bucketID, key string) (*Object, error) {
 		if data == nil {
 			return ErrObjectNotFound
 		}
-		if err := json.Unmarshal(data, &obj); err != nil {
+		if err := decodeObject(data, &obj); err != nil {
 			return err
 		}
 		if obj.State != "active" {
@@ -173,45 +216,111 @@ type ListObjectsResult struct {
 }
 
 // ListObjects lists objects in a bucket with prefix, delimiter, pagination support.
-// Pagination is applied inside the cursor loop: iteration stops as soon as
-// maxKeys is reached, so cost is bounded by maxKeys rather than by the bucket
-// size. Preserves IsTruncated and NextStartAfter semantics expected by callers.
+//
+// Iteration is split into short read transactions (batchSize keys each) so that
+// long listings do not starve bbolt writers (bbolt allows a single writer and
+// blocks it for the entire lifetime of any overlapping read tx). Between
+// batches the read tx is released, giving writers a chance to commit; the next
+// batch resumes from the last key seen.
+//
+// Externally observable semantics (returned object set, CommonPrefixes,
+// IsTruncated, NextStartAfter, delimiter handling, prefix matching, maxKeys
+// cap) are preserved bit-identical to the previous single-tx implementation.
 func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKeys int) (*ListObjectsResult, error) {
 	if maxKeys <= 0 {
 		maxKeys = 1000
 	}
+	const batchSize = 100
 
 	result := &ListObjectsResult{}
 	prefixSet := make(map[string]bool)
 	count := 0
 
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(objectsBucketName(bucketID))
-		if bk == nil {
-			return ErrBucketNotFound
+	// kvPair holds copies of key/value bytes from a bbolt tx so we can safely
+	// process them after the tx has been released.
+	type kvPair struct {
+		key []byte
+		val []byte
+	}
+
+	// cursorKey is the last key we advanced past (inclusive-skip). On the first
+	// iteration it is empty and we derive the seek position from startAfter /
+	// prefix, matching the original implementation.
+	cursorKey := ""
+	firstBatch := true
+	// prefixExhausted is true once we have observed a key that no longer
+	// matches prefix (or ran past the end of the bucket) — at that point no
+	// further batches can possibly yield matches.
+	prefixExhausted := false
+
+	for !prefixExhausted {
+		batch := make([]kvPair, 0, batchSize)
+
+		err := db.bolt.View(func(tx *bolt.Tx) error {
+			bk := tx.Bucket(objectsBucketName(bucketID))
+			if bk == nil {
+				return ErrBucketNotFound
+			}
+
+			c := bk.Cursor()
+			var k, v []byte
+			if firstBatch {
+				seekKey := max(startAfter, prefix)
+				if seekKey == "" {
+					k, v = c.First()
+				} else {
+					k, v = c.Seek([]byte(seekKey))
+					if startAfter != "" && k != nil && string(k) == startAfter {
+						k, v = c.Next()
+					}
+				}
+			} else {
+				// Resume strictly after the last key we processed in the prior
+				// batch. Seek lands on >= cursorKey; if equal, advance.
+				k, v = c.Seek([]byte(cursorKey))
+				if k != nil && string(k) == cursorKey {
+					k, v = c.Next()
+				}
+			}
+
+			for ; k != nil && len(batch) < batchSize; k, v = c.Next() {
+				if prefix != "" && !bytes.HasPrefix(k, []byte(prefix)) {
+					prefixExhausted = true
+					return nil
+				}
+				batch = append(batch, kvPair{
+					key: append([]byte(nil), k...),
+					val: append([]byte(nil), v...),
+				})
+			}
+			if k == nil {
+				// Walked off the end of the bucket — no more keys exist.
+				prefixExhausted = true
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		firstBatch = false
+
+		if len(batch) == 0 {
+			break
 		}
 
-		c := bk.Cursor()
-		var k, v []byte
-		seekKey := max(startAfter, prefix)
-		if seekKey == "" {
-			k, v = c.First()
-		} else {
-			k, v = c.Seek([]byte(seekKey))
-			if startAfter != "" && string(k) == startAfter {
-				k, v = c.Next()
-			}
-		}
-
-		for ; k != nil; k, v = c.Next() {
-			if prefix != "" && !bytes.HasPrefix(k, []byte(prefix)) {
-				break
-			}
-
-			key := string(k)
+		// Process the batch OUTSIDE the tx so write transactions can interleave.
+		done := false
+		for _, p := range batch {
+			key := string(p.key)
+			// Advance the resume cursor for the next batch even for records we
+			// skip (corrupt, non-active, duplicate common-prefix). This ensures
+			// forward progress and matches the original cursor semantics, where
+			// the cursor always advances regardless of whether a record
+			// contributes to the output.
+			cursorKey = key
 
 			var obj Object
-			if err := json.Unmarshal(v, &obj); err != nil {
+			if err := decodeObject(p.val, &obj); err != nil {
 				slog.Warn("meta: corrupt object record", "key", key, "err", err)
 				continue
 			}
@@ -229,7 +338,8 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 					}
 					if count >= maxKeys {
 						result.IsTruncated = true
-						return nil
+						done = true
+						break
 					}
 					prefixSet[cp] = true
 					result.CommonPrefixes = append(result.CommonPrefixes, cp)
@@ -240,19 +350,22 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 
 			if count >= maxKeys {
 				result.IsTruncated = true
-				return nil
+				done = true
+				break
 			}
 
-			// Copy fields we expose; Object itself is value-type and safe to
-			// retain after the tx closes (no unsafe references into bbolt pages).
+			// Object is a value type; safe to retain after the tx closes.
 			result.Objects = append(result.Objects, obj)
 			result.NextStartAfter = key
 			count++
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+
+		if done {
+			break
+		}
+		// If the batch was short, either because we hit the end of the bucket
+		// or ran past the prefix, prefixExhausted is already set and the loop
+		// will terminate.
 	}
 
 	return result, nil
@@ -270,14 +383,14 @@ func (db *DB) QuarantineObject(bucketID, key string) error {
 			return ErrObjectNotFound
 		}
 		var obj Object
-		if err := json.Unmarshal(data, &obj); err != nil {
+		if err := decodeObject(data, &obj); err != nil {
 			return err
 		}
 		wasActive := obj.State == "active"
 		prevSize := obj.SizeBytes
 		obj.State = "quarantined"
 		obj.UpdatedAt = time.Now().UTC()
-		updated, err := json.Marshal(&obj)
+		updated, err := encodeObject(&obj)
 		if err != nil {
 			return err
 		}
@@ -302,7 +415,7 @@ func (db *DB) ForEachObject(bucketID string, fn func(Object) error) error {
 		}
 		return bk.ForEach(func(k, v []byte) error {
 			var obj Object
-			if err := json.Unmarshal(v, &obj); err != nil {
+			if err := decodeObject(v, &obj); err != nil {
 				slog.Warn("meta: corrupt object record", "key", string(k), "err", err)
 				return nil
 			}
@@ -323,7 +436,7 @@ func (db *DB) GetObjectMetaAny(bucketID, key string) (*Object, error) {
 		if data == nil {
 			return ErrObjectNotFound
 		}
-		return json.Unmarshal(data, &obj)
+		return decodeObject(data, &obj)
 	})
 	if err != nil {
 		return nil, err
@@ -343,13 +456,13 @@ func (db *DB) RestoreObject(bucketID, key string) error {
 			return ErrObjectNotFound
 		}
 		var obj Object
-		if err := json.Unmarshal(data, &obj); err != nil {
+		if err := decodeObject(data, &obj); err != nil {
 			return err
 		}
 		wasActive := obj.State == "active"
 		obj.State = "active"
 		obj.UpdatedAt = time.Now().UTC()
-		updated, err := json.Marshal(&obj)
+		updated, err := encodeObject(&obj)
 		if err != nil {
 			return err
 		}
@@ -404,7 +517,7 @@ func (db *DB) ForEachObjectFrom(bucketID, startKey string, limit int, fn func(Ob
 		count := 0
 		for ; k != nil && count < limit; k, v = c.Next() {
 			var obj Object
-			if err := json.Unmarshal(v, &obj); err != nil {
+			if err := decodeObject(v, &obj); err != nil {
 				slog.Warn("meta: corrupt object record", "key", string(k), "err", err)
 				continue
 			}
