@@ -181,7 +181,7 @@ func TestReadObject_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadObject: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	got, err := io.ReadAll(f)
 	if err != nil {
@@ -440,7 +440,7 @@ func TestCleanTmp_RemovesFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateTemp %d: %v", i, err)
 		}
-		f.Close()
+		_ = f.Close()
 	}
 
 	count, err := s.CleanTmp()

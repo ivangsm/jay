@@ -389,7 +389,7 @@ func TestGetObject_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 
 	got, err := io.ReadAll(result.Body)
 	if err != nil {
@@ -527,7 +527,7 @@ func TestPutGet_LargeObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetObject large: %v", err)
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 
 	got, err := io.ReadAll(result.Body)
 	if err != nil {
@@ -587,7 +587,7 @@ func TestPutObject_Overwrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 
 	got, _ := io.ReadAll(result.Body)
 	if string(got) != v2 {
@@ -1022,7 +1022,7 @@ func TestMultipleClients_SameBucket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c2.Close()
+	defer func() { _ = c2.Close() }()
 
 	if _, err := env.client.CreateBucket("shared-bucket"); err != nil {
 		t.Fatal(err)
@@ -1039,7 +1039,7 @@ func TestMultipleClients_SameBucket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetObject via c2: %v", err)
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 
 	got, _ := io.ReadAll(result.Body)
 	if string(got) != content {
