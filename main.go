@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"log/slog"
 	"net/http"
@@ -34,20 +35,56 @@ const backupRetentionDays = 7
 const backupPruneMinCount = 3
 
 func main() {
-	// Fail-fast on missing or weak secrets BEFORE touching disk, opening the
-	// metadata DB, or binding any listener. Monorepo rule: "Ninguna variable de
-	// entorno sensible tiene valor por defecto. Si falta, el servicio debe
-	// fallar al arrancar."
-	if v := os.Getenv("JAY_ADMIN_TOKEN"); len(v) < minSecretLen {
-		log.Fatalf("JAY_ADMIN_TOKEN must be set and at least %d chars", minSecretLen)
-	}
-	if v := os.Getenv("JAY_SIGNING_SECRET"); len(v) < minSecretLen {
-		log.Fatalf("JAY_SIGNING_SECRET must be set and at least %d chars", minSecretLen)
+	// Parse --config-file flag. An empty value preserves the legacy env-only
+	// path. The JAY_CONFIG_FILE env var is honored as a fallback so
+	// container runtimes that only inject env vars can still point jay at a
+	// mounted YAML file.
+	var configFile string
+	flag.StringVar(&configFile, "config-file", "", "Path to YAML config file (optional)")
+	flag.Parse()
+	if configFile == "" {
+		configFile = os.Getenv("JAY_CONFIG_FILE")
 	}
 
-	cfg := LoadConfig()
+	// Bootstrap logger: info-level JSON to stdout. Needed because
+	// LoadConfigFromSources emits slog.Warn on YAML/env conflicts, so we
+	// have to hand it a real logger before we know cfg.LogLevel.
+	bootstrapLog := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	// Setup structured logging
+	cfg, err := LoadConfigFromSources(configFile, bootstrapLog)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+
+	// Fail-fast on missing or weak secrets AFTER config load so YAML-provided
+	// secrets are honored. Monorepo rule: "Ninguna variable de entorno
+	// sensible tiene valor por defecto. Si falta, el servicio debe fallar al
+	// arrancar."
+	if len(cfg.AdminToken) < minSecretLen {
+		log.Fatalf("JAY_ADMIN_TOKEN (or admin_token in YAML) must be set and at least %d chars", minSecretLen)
+	}
+	if len(cfg.SigningSecret) < minSecretLen {
+		log.Fatalf("JAY_SIGNING_SECRET (or signing_secret in YAML) must be set and at least %d chars", minSecretLen)
+	}
+
+	// Validate seed token config: all three fields or none. Partial
+	// configuration is operator error and must not boot.
+	seedSet := 0
+	if cfg.SeedTokenAccount != "" {
+		seedSet++
+	}
+	if cfg.SeedTokenID != "" {
+		seedSet++
+	}
+	if cfg.SeedTokenSecret != "" {
+		seedSet++
+	}
+	if seedSet != 0 && seedSet != 3 {
+		log.Fatalf("seed token config must have all three fields (account, id, secret) or none")
+	}
+
+	// Setup structured logging at the configured level. Replaces the
+	// bootstrap logger for the rest of the process lifetime.
 	level := slog.LevelInfo
 	switch strings.ToLower(cfg.LogLevel) {
 	case "debug":

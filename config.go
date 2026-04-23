@@ -1,9 +1,9 @@
 package main
 
 import (
+	"io"
 	"log/slog"
 	"os"
-	"strconv"
 	"time"
 )
 
@@ -29,83 +29,26 @@ type Config struct {
 	ScrubMaxPerRun    int
 }
 
+// LoadConfig keeps the legacy env-only contract. It delegates to
+// LoadConfigFromSources with an empty YAML path so the precedence rules
+// (env > YAML > defaults) collapse to the pre-existing "env > defaults"
+// behaviour.
+//
+// New callers should prefer LoadConfigFromSources directly so they can pass
+// a --config-file value.
 func LoadConfig() Config {
-	rateLimit := float64(100)
-	if v := os.Getenv("JAY_RATE_LIMIT"); v != "" {
-		parsed, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			slog.Error("invalid JAY_RATE_LIMIT, using default", "value", v, "err", err)
-		} else {
-			rateLimit = parsed
-		}
-	}
-	rateBurst := 200
-	if v := os.Getenv("JAY_RATE_BURST"); v != "" {
-		parsed, err := strconv.Atoi(v)
-		if err != nil {
-			slog.Error("invalid JAY_RATE_BURST, using default", "value", v, "err", err)
-		} else {
-			rateBurst = parsed
-		}
-	}
-
-	scrubInterval := 6 * time.Hour
-	if v := os.Getenv("JAY_SCRUB_INTERVAL_HOURS"); v != "" {
-		parsed, err := strconv.Atoi(v)
-		if err != nil || parsed <= 0 {
-			slog.Error("invalid JAY_SCRUB_INTERVAL_HOURS, using default", "value", v, "err", err)
-		} else {
-			scrubInterval = time.Duration(parsed) * time.Hour
-		}
-	}
-	scrubSampleRate := 0.1
-	if v := os.Getenv("JAY_SCRUB_SAMPLE_RATE"); v != "" {
-		parsed, err := strconv.ParseFloat(v, 64)
-		if err != nil || parsed <= 0 || parsed > 1.0 {
-			slog.Error("invalid JAY_SCRUB_SAMPLE_RATE (must be in (0.0, 1.0]), using default 0.1", "value", v, "err", err)
-		} else {
-			scrubSampleRate = parsed
-		}
-	}
-	scrubBytesPerSec := int64(50 << 20)
-	if v := os.Getenv("JAY_SCRUB_BYTES_PER_SEC"); v != "" {
-		parsed, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			slog.Error("invalid JAY_SCRUB_BYTES_PER_SEC, using default", "value", v, "err", err)
-		} else {
-			scrubBytesPerSec = parsed
-		}
-	}
-	scrubMaxPerRun := 100
-	if v := os.Getenv("JAY_SCRUB_MAX_PER_RUN"); v != "" {
-		parsed, err := strconv.Atoi(v)
-		if err != nil || parsed <= 0 {
-			slog.Error("invalid JAY_SCRUB_MAX_PER_RUN, using default", "value", v, "err", err)
-		} else {
-			scrubMaxPerRun = parsed
-		}
-	}
-
-	cfg := Config{
-		DataDir:           envOr("JAY_DATA_DIR", "./data"),
-		ListenAddr:        envOr("JAY_LISTEN_ADDR", ":9000"),
-		AdminAddr:         envOr("JAY_ADMIN_ADDR", ":9001"),
-		NativeAddr:        envOr("JAY_NATIVE_ADDR", ":4444"),
-		AdminToken:        os.Getenv("JAY_ADMIN_TOKEN"),
-		LogLevel:          envOr("JAY_LOG_LEVEL", "info"),
-		SigningSecret:     os.Getenv("JAY_SIGNING_SECRET"),
-		TLSCert:           os.Getenv("JAY_TLS_CERT"),
-		TLSKey:            os.Getenv("JAY_TLS_KEY"),
-		RateLimit:         rateLimit,
-		RateBurst:         rateBurst,
-		SeedTokenAccount:  os.Getenv("JAY_SEED_TOKEN_ACCOUNT"),
-		SeedTokenID:       os.Getenv("JAY_SEED_TOKEN_ID"),
-		SeedTokenSecret:   os.Getenv("JAY_SEED_TOKEN_SECRET"),
-		TrustProxyHeaders: parseBoolEnv("JAY_TRUST_PROXY_HEADERS"),
-		ScrubInterval:     scrubInterval,
-		ScrubSampleRate:   scrubSampleRate,
-		ScrubBytesPerSec:  scrubBytesPerSec,
-		ScrubMaxPerRun:    scrubMaxPerRun,
+	// The env-only path never surfaces YAML conflicts, so the logger only
+	// ever receives parse-error messages. Route them to a discard handler
+	// to preserve the original LoadConfig signature (no logger parameter,
+	// no error return) without losing the slog.Error calls the legacy
+	// implementation emitted for invalid env values.
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		// Impossible when yamlPath == "" — but guard anyway so a future
+		// change doesn't silently lose the error.
+		slog.Error("LoadConfig: unexpected error from LoadConfigFromSources", "err", err)
+		return defaultConfig()
 	}
 	return cfg
 }

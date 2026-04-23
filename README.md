@@ -1,5 +1,13 @@
 # Jay
 
+[![CI](https://github.com/ivangsm/jay/actions/workflows/ci.yml/badge.svg)](https://github.com/ivangsm/jay/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/ivangsm/jay/graph/badge.svg)](https://codecov.io/gh/ivangsm/jay)
+[![Go Reference](https://pkg.go.dev/badge/github.com/ivangsm/jay.svg)](https://pkg.go.dev/github.com/ivangsm/jay)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ivangsm/jay)](https://goreportcard.com/report/github.com/ivangsm/jay)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/ivangsm/jay)](https://github.com/ivangsm/jay/blob/main/go.mod)
+[![Release](https://img.shields.io/github/v/release/ivangsm/jay?sort=semver)](https://github.com/ivangsm/jay/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ivangsm/jay/blob/main/LICENSE)
+
 S3-compatible object storage server with a native binary protocol, written in Go.
 
 Jay provides dual API access: a fully S3-compatible HTTP API and a high-performance native binary protocol for Go clients. It uses bbolt for metadata, atomic file writes with SHA-256 checksums, and includes background integrity scrubbing, garbage collection, and automated backups.
@@ -47,19 +55,89 @@ Jay listens on three ports:
 
 ## Configuration
 
+Jay accepts configuration from environment variables, a YAML config file, or both. When both are provided, **env vars win** and every conflict is logged at `WARN` level.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `JAY_CONFIG_FILE` | *(optional)* | Path to a YAML config file. Can also be set via `--config-file` flag (flag takes precedence) |
 | `JAY_DATA_DIR` | `./data` | Data directory for objects and metadata |
 | `JAY_LISTEN_ADDR` | `:9000` | S3 API listen address |
 | `JAY_ADMIN_ADDR` | `:9001` | Admin API listen address |
 | `JAY_NATIVE_ADDR` | `:4444` | Native protocol listen address |
-| `JAY_ADMIN_TOKEN` | *(required)* | Bearer token for admin API |
-| `JAY_SIGNING_SECRET` | *(optional)* | Secret for presigned URL generation |
+| `JAY_ADMIN_TOKEN` | *(required)* | Bearer token for admin API (≥ 32 chars) |
+| `JAY_SIGNING_SECRET` | *(required)* | AES-GCM key for presigned URLs and token secrets (≥ 32 chars) |
 | `JAY_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
 | `JAY_TLS_CERT` | *(optional)* | Path to TLS certificate file |
 | `JAY_TLS_KEY` | *(optional)* | Path to TLS private key file |
-| `JAY_RATE_LIMIT` | `0` (disabled) | Requests/sec per token |
+| `JAY_RATE_LIMIT` | `100` | Requests/sec per token (0 = disabled) |
 | `JAY_RATE_BURST` | `200` | Rate limit burst size |
+| `JAY_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` headers |
+| `JAY_SCRUB_INTERVAL_HOURS` | `6` | Scrubber interval |
+| `JAY_SCRUB_SAMPLE_RATE` | `0.1` | Fraction of objects verified per pass, in `(0, 1]` |
+| `JAY_SCRUB_BYTES_PER_SEC` | `52428800` | Scrubber read throttle (0 = unlimited) |
+| `JAY_SCRUB_MAX_PER_RUN` | `100` | Max objects visited per bucket per pass |
+
+### YAML Configuration File
+
+Point jay at a YAML file via `--config-file path/to/config.yml` or `JAY_CONFIG_FILE=path/to/config.yml`:
+
+```yaml
+# config.yml
+data_dir: ./data
+listen_addr: ":9000"
+admin_addr: ":9001"
+native_addr: ":4444"
+
+# Secrets can reference env vars via ${VAR} interpolation.
+# This lets you commit config.yml to git while keeping secrets in .env.
+admin_token: ${JAY_ADMIN_TOKEN}
+signing_secret: ${JAY_SIGNING_SECRET}
+
+log_level: info
+rate_limit: 100
+rate_burst: 200
+trust_proxy_headers: false
+
+# Optional ${VAR:-default} syntax provides a fallback.
+tls_cert: ${JAY_TLS_CERT:-}
+tls_key: ${JAY_TLS_KEY:-}
+
+scrub:
+  interval_hours: 6
+  sample_rate: 0.1
+  bytes_per_sec: 52428800
+  max_per_run: 100
+
+seed_token:
+  account: ${JAY_SEED_TOKEN_ACCOUNT:-}
+  id: ${JAY_SEED_TOKEN_ID:-}
+  secret: ${JAY_SEED_TOKEN_SECRET:-}
+```
+
+Rules:
+
+- **Precedence:** env var > YAML > hardcoded default. A conflict (both set to different values) logs `WARN` at startup but doesn't fail.
+- **Interpolation:** `${VAR}` and `${VAR:-default}` are resolved against `os.Getenv` on string values only. If neither is set, the value ends up empty (which then triggers the normal secret-length fail-fast if it's `admin_token` or `signing_secret`).
+- **Mixing sources:** perfectly fine to put non-sensitive config in YAML and keep secrets in env vars — interpolation is the bridge.
+
+### `jay-config` CLI
+
+Convert between YAML and `.env` or validate a YAML config:
+
+```bash
+go build -o jay-config ./cmd/jay-config
+
+# YAML → .env (writes to stdout if --output omitted)
+jay-config yaml-to-env --input config.yml --output .env
+
+# .env → YAML
+jay-config env-to-yaml --input .env --output config.yml
+
+# Validate YAML config (checks required secrets, seed-token atomicity, value ranges)
+jay-config validate --input config.yml
+```
+
+`${VAR}` interpolation is preserved literally during conversion — the tool never resolves env vars, only moves keys between formats.
 
 ## Seed Token
 
