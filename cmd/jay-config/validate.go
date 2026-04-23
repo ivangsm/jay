@@ -354,10 +354,11 @@ func parseInt(s string) (int64, bool) {
 	var n int64
 	sign := int64(1)
 	i := 0
-	if s[0] == '-' {
+	switch s[0] {
+	case '-':
 		sign = -1
 		i = 1
-	} else if s[0] == '+' {
+	case '+':
 		i = 1
 	}
 	for ; i < len(s); i++ {
@@ -375,10 +376,11 @@ func parseFloat(s string) (float64, bool) {
 	sign := 1.0
 	seenDot := false
 	i := 0
-	if s[0] == '-' {
+	switch s[0] {
+	case '-':
 		sign = -1
 		i = 1
-	} else if s[0] == '+' {
+	case '+':
 		i = 1
 	}
 	for ; i < len(s); i++ {

@@ -3,7 +3,6 @@ package main
 import (
 	"io"
 	"log/slog"
-	"os"
 	"time"
 )
 
@@ -51,25 +50,4 @@ func LoadConfig() Config {
 		return defaultConfig()
 	}
 	return cfg
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// parseBoolEnv returns true only for "1" or "true" (case-insensitive). Anything
-// else — including empty — is false. Defaults to false for safety.
-func parseBoolEnv(key string) bool {
-	v := os.Getenv(key)
-	if v == "" {
-		return false
-	}
-	switch v {
-	case "1", "true", "TRUE", "True":
-		return true
-	}
-	return false
 }
