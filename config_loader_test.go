@@ -38,7 +38,7 @@ func TestInterpolateEnvVars_SetVar(t *testing.T) {
 
 func TestInterpolateEnvVars_UnsetVarNoDefault(t *testing.T) {
 	// Explicitly unset to avoid leakage from the host env.
-	os.Unsetenv("JAY_TEST_UNSET")
+	_ = os.Unsetenv("JAY_TEST_UNSET")
 	got := InterpolateEnvVars("x=${JAY_TEST_UNSET}")
 	if got != "x=" {
 		t.Fatalf("want x=, got %q", got)
@@ -46,7 +46,7 @@ func TestInterpolateEnvVars_UnsetVarNoDefault(t *testing.T) {
 }
 
 func TestInterpolateEnvVars_UnsetVarWithDefault(t *testing.T) {
-	os.Unsetenv("JAY_TEST_UNSET")
+	_ = os.Unsetenv("JAY_TEST_UNSET")
 	got := InterpolateEnvVars("x=${JAY_TEST_UNSET:-fallback}")
 	if got != "x=fallback" {
 		t.Fatalf("want x=fallback, got %q", got)
@@ -64,7 +64,7 @@ func TestInterpolateEnvVars_SetVarWithDefaultIgnored(t *testing.T) {
 func TestInterpolateEnvVars_MultipleAndNested(t *testing.T) {
 	t.Setenv("JAY_TEST_A", "alpha")
 	t.Setenv("JAY_TEST_B", "beta")
-	os.Unsetenv("JAY_TEST_C")
+	_ = os.Unsetenv("JAY_TEST_C")
 	got := InterpolateEnvVars("${JAY_TEST_A}-${JAY_TEST_B}-${JAY_TEST_C:-gamma}")
 	if got != "alpha-beta-gamma" {
 		t.Fatalf("want alpha-beta-gamma, got %q", got)
@@ -358,7 +358,7 @@ func clearJAYEnv(t *testing.T) {
 	}
 	for _, v := range vars {
 		t.Setenv(v, "")
-		os.Unsetenv(v)
+		_ = os.Unsetenv(v)
 	}
 }
 

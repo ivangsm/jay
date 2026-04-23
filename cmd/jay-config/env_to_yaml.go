@@ -62,7 +62,7 @@ func runEnvToYAML(args []string, stdout, stderr io.Writer) error {
 	}
 
 	for _, w := range warnings {
-		fmt.Fprintf(stderr, "jay-config: warning: %s\n", w)
+		_, _ = fmt.Fprintf(stderr, "jay-config: warning: %s\n", w)
 	}
 
 	out, closer, err := openOutput(output, stdout)

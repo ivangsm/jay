@@ -12,36 +12,36 @@ import (
 func runValidate(args []string, stdout, stderr io.Writer) int {
 	input, _, err := parseIOValidate(args)
 	if err != nil {
-		fmt.Fprintf(stderr, "jay-config: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "jay-config: %v\n", err)
 		return 1
 	}
 
 	raw, err := os.ReadFile(input)
 	if err != nil {
-		fmt.Fprintf(stderr, "jay-config: read %s: %v\n", input, err)
+		_, _ = fmt.Fprintf(stderr, "jay-config: read %s: %v\n", input, err)
 		return 1
 	}
 
 	var root yaml.Node
 	if err := yaml.Unmarshal(raw, &root); err != nil {
-		fmt.Fprintf(stderr, "jay-config: parse YAML %s: %v\n", input, err)
+		_, _ = fmt.Fprintf(stderr, "jay-config: parse YAML %s: %v\n", input, err)
 		return 1
 	}
 
 	errs, warns := validateDocument(&root, input)
 
 	for _, w := range warns {
-		fmt.Fprintf(stderr, "warning: %s\n", w)
+		_, _ = fmt.Fprintf(stderr, "warning: %s\n", w)
 	}
 
 	if len(errs) > 0 {
 		for _, e := range errs {
-			fmt.Fprintf(stderr, "error: %s\n", e)
+			_, _ = fmt.Fprintf(stderr, "error: %s\n", e)
 		}
 		return 1
 	}
 
-	fmt.Fprintf(stdout, "OK: %s is valid\n", input)
+	_, _ = fmt.Fprintf(stdout, "OK: %s is valid\n", input)
 	return 0
 }
 

@@ -32,13 +32,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch cmd {
 	case "yaml-to-env":
 		if err := runYAMLToEnv(rest, stdout, stderr); err != nil {
-			fmt.Fprintf(stderr, "jay-config: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "jay-config: %v\n", err)
 			return 1
 		}
 		return 0
 	case "env-to-yaml":
 		if err := runEnvToYAML(rest, stdout, stderr); err != nil {
-			fmt.Fprintf(stderr, "jay-config: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "jay-config: %v\n", err)
 			return 1
 		}
 		return 0
@@ -48,14 +48,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		usage(stdout)
 		return 0
 	default:
-		fmt.Fprintf(stderr, "jay-config: unknown subcommand: %s\n\n", cmd)
+		_, _ = fmt.Fprintf(stderr, "jay-config: unknown subcommand: %s\n\n", cmd)
 		usage(stderr)
 		return 1
 	}
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, `jay-config — convert between YAML and .env and validate jay configs
+	_, _ = fmt.Fprintln(w, `jay-config — convert between YAML and .env and validate jay configs
 
 Usage:
   jay-config yaml-to-env --input config.yml [--output .env]
