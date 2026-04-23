@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/ivangsm/jay/actions/workflows/ci.yml/badge.svg)](https://github.com/ivangsm/jay/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/ivangsm/jay/graph/badge.svg)](https://codecov.io/gh/ivangsm/jay)
-[![Go Reference](https://pkg.go.dev/badge/github.com/ivangsm/jay.svg)](https://pkg.go.dev/github.com/ivangsm/jay)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ivangsm/jay)](https://goreportcard.com/report/github.com/ivangsm/jay)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/ivangsm/jay)](https://github.com/ivangsm/jay/blob/main/go.mod)
 [![Release](https://img.shields.io/github/v/release/ivangsm/jay?sort=semver)](https://github.com/ivangsm/jay/releases)
