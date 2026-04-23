@@ -15,11 +15,16 @@ import (
 
 // ScrubResult contains the results of a scrub run.
 type ScrubResult struct {
-	Checked      int
-	Healthy      int
-	Quarantined  int
-	Missing      int
-	Errors       int
+	Checked     int
+	Healthy     int
+	Quarantined int
+	Missing     int
+	Errors      int
+	// Migrated counts healthy records whose on-disk envelope was rewritten
+	// from the legacy JSON format to the current binary codec during this
+	// pass. Non-fatal: migration errors are logged and counted as Errors
+	// rather than failing the scrub.
+	Migrated int
 }
 
 // ScrubCoverage reports incremental scrub progress.
@@ -53,9 +58,14 @@ type Scrubber struct {
 // NewScrubber creates a new scrubber.
 // sampleRate controls what fraction of objects are checked per run (1.0 = full scan).
 // scrubBytesPerSec bounds checksum-read bandwidth; <=0 disables the limiter.
-func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.Duration, sampleRate float64, scrubBytesPerSec int64) *Scrubber {
+// maxPerRun bounds how many objects per bucket are inspected on each tick;
+// <=0 falls back to 100.
+func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.Duration, sampleRate float64, scrubBytesPerSec int64, maxPerRun int) *Scrubber {
 	if sampleRate <= 0 || sampleRate > 1.0 {
 		sampleRate = 0.1 // default 10% per run
+	}
+	if maxPerRun <= 0 {
+		maxPerRun = 100
 	}
 	var limiter *rate.Limiter
 	if scrubBytesPerSec > 0 {
@@ -75,7 +85,7 @@ func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.D
 		bytesLimiter: limiter,
 		quit:         make(chan struct{}),
 		lastKey:      make(map[string]string),
-		maxPerRun:    100,
+		maxPerRun:    maxPerRun,
 	}
 }
 
@@ -111,6 +121,7 @@ func (s *Scrubber) loop() {
 				"quarantined", result.Quarantined,
 				"missing", result.Missing,
 				"errors", result.Errors,
+				"migrated", result.Migrated,
 			)
 			timer.Reset(s.interval)
 		}
@@ -277,6 +288,10 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 				isMismatch  bool
 			}
 			var toQuarantine []quarantineAction
+			// toMigrateKeys collects keys of healthy records that may still be
+			// on the legacy JSON envelope. MigrateLegacyObject is a no-op for
+			// records already binary-encoded, so we can be generous here.
+			var toMigrateKeys []string
 
 			lastVisited, iterErr := s.db.ForEachObjectFrom(b.ID, start, maxPerRun, func(obj meta.Object) error {
 				if obj.State != "active" {
@@ -321,6 +336,12 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 				}
 
 				br.partial.Healthy++
+				// Record is healthy — piggyback the JSON→binary meta-envelope
+				// rewrite so legacy records migrate in-place without a
+				// dedicated batch job. No-op for records already in binary
+				// format; collected outside the View tx to avoid a read/write
+				// tx overlap on the same bucket.
+				toMigrateKeys = append(toMigrateKeys, obj.Key)
 				return nil
 			})
 
@@ -333,6 +354,21 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 					if qerr := s.store.Quarantine(qa.locationRef); qerr != nil {
 						s.log.Error("incremental scrub: quarantine file", "err", qerr, "location", qa.locationRef)
 					}
+				}
+			}
+
+			// Migrate legacy-JSON records to the binary envelope, one write
+			// tx per record. Healthy-only so we never persist re-encoded
+			// bytes for an object we just quarantined.
+			for _, k := range toMigrateKeys {
+				migrated, merr := s.db.MigrateLegacyObject(b.ID, k)
+				if merr != nil {
+					s.log.Error("incremental scrub: migrate legacy", "err", merr, "bucket", b.Name, "key", k)
+					br.partial.Errors++
+					continue
+				}
+				if migrated {
+					br.partial.Migrated++
 				}
 			}
 
@@ -365,6 +401,7 @@ wait:
 		result.Quarantined += br.partial.Quarantined
 		result.Missing += br.partial.Missing
 		result.Errors += br.partial.Errors
+		result.Migrated += br.partial.Migrated
 		s.totalChecked += int64(br.partial.Checked)
 
 		if br.iterErr {
