@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -49,7 +50,7 @@ func (h *connHandler) handlePutObject(req *request) error {
 	// that here. We call HeadObject-style auth first? No — simpler: let
 	// PutObject run; if it returns an auth error before reading, we drain.
 	obj, err := h.objops.PutObject(
-		nil, h.token,
+		context.TODO(), h.token,
 		bucket, key, contentType,
 		req.data,
 		objops.PutOptions{UserMetadata: metadata},
@@ -88,7 +89,7 @@ func (h *connHandler) handleGetObject(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	obj, err := h.objops.HeadObject(nil, h.token, bucket, key, h.identity(meta.ActionObjectGet))
+	obj, err := h.objops.HeadObject(context.TODO(), h.token, bucket, key, h.identity(meta.ActionObjectGet))
 	if err != nil {
 		if status, m, code, ok := mapObjopsStatus(err); ok {
 			return h.writeError(status, req.streamID, m, code)
@@ -149,7 +150,7 @@ func (h *connHandler) handleHeadObject(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	obj, err := h.objops.HeadObject(nil, h.token, bucket, key, h.identity(meta.ActionObjectGet))
+	obj, err := h.objops.HeadObject(context.TODO(), h.token, bucket, key, h.identity(meta.ActionObjectGet))
 	if err != nil {
 		if status, m, code, ok := mapObjopsStatus(err); ok {
 			return h.writeError(status, req.streamID, m, code)
@@ -181,7 +182,7 @@ func (h *connHandler) handleDeleteObject(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.objops.DeleteObject(nil, h.token, bucket, key, h.identity(meta.ActionObjectDelete)); err != nil {
+	if err := h.objops.DeleteObject(context.TODO(), h.token, bucket, key, h.identity(meta.ActionObjectDelete)); err != nil {
 		if status, m, code, ok := mapObjopsStatus(err); ok {
 			return h.writeError(status, req.streamID, m, code)
 		}

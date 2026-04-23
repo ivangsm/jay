@@ -227,7 +227,7 @@ func (s *Service) PutObject(
 	md5Hash.Reset()
 	defer md5Pool.Put(md5Hash)
 
-	var teeBody io.Reader = body
+	var teeBody io.Reader
 	if body != nil {
 		teeBody = io.TeeReader(body, md5Hash)
 	} else {
