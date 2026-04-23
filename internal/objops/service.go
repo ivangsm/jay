@@ -166,6 +166,26 @@ func (s *Service) resolveBucket(name string) (*meta.Bucket, error) {
 	return bucket, nil
 }
 
+// lookupBucketAndObject loads the bucket and an active object in a single
+// bbolt view transaction, mapping meta errors to the objops-level sentinels.
+// On ErrObjectNotFound the returned bucket is non-nil when the bucket itself
+// does exist; this lets callers authorize an idempotent delete without a
+// second view transaction.
+func (s *Service) lookupBucketAndObject(bucketName, key string) (*meta.Bucket, *meta.Object, error) {
+	bucket, obj, err := s.db.GetBucketAndObject(bucketName, key)
+	if err != nil {
+		switch {
+		case errors.Is(err, meta.ErrBucketNotFound):
+			return nil, nil, ErrBucketNotFound
+		case errors.Is(err, meta.ErrObjectNotFound):
+			return bucket, nil, ErrObjectNotFound
+		default:
+			return nil, nil, err
+		}
+	}
+	return bucket, obj, nil
+}
+
 // PutOptions carry per-request metadata that doesn't fit in the required args.
 type PutOptions struct {
 	// UserMetadata holds x-amz-meta-* headers (HTTP) or a decoded metadata map
@@ -275,19 +295,11 @@ func (s *Service) GetObject(
 	w io.Writer,
 	identity Identity,
 ) (*meta.Object, error) {
-	bucket, err := s.resolveBucket(bucketName)
+	bucket, obj, err := s.lookupBucketAndObject(bucketName, key)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.authorize(bucket, identity, token, key); err != nil {
-		return nil, err
-	}
-
-	obj, err := s.db.GetObjectMeta(bucket.ID, key)
-	if err != nil {
-		if errors.Is(err, meta.ErrObjectNotFound) {
-			return nil, ErrObjectNotFound
-		}
 		return nil, err
 	}
 
@@ -332,18 +344,11 @@ func (s *Service) HeadObject(
 	bucketName, key string,
 	identity Identity,
 ) (*meta.Object, error) {
-	bucket, err := s.resolveBucket(bucketName)
+	bucket, obj, err := s.lookupBucketAndObject(bucketName, key)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.authorize(bucket, identity, token, key); err != nil {
-		return nil, err
-	}
-	obj, err := s.db.GetObjectMeta(bucket.ID, key)
-	if err != nil {
-		if errors.Is(err, meta.ErrObjectNotFound) {
-			return nil, ErrObjectNotFound
-		}
 		return nil, err
 	}
 	return obj, nil
@@ -357,18 +362,21 @@ func (s *Service) DeleteObject(
 	bucketName, key string,
 	identity Identity,
 ) error {
-	bucket, err := s.resolveBucket(bucketName)
-	if err != nil {
+	bucket, _, err := s.lookupBucketAndObject(bucketName, key)
+	if err != nil && !errors.Is(err, ErrObjectNotFound) {
 		return err
 	}
 	if err := s.authorize(bucket, identity, token, key); err != nil {
 		return err
 	}
+	if errors.Is(err, ErrObjectNotFound) {
+		// S3 semantics: deleting a non-existent object is not an error.
+		return nil
+	}
 
 	obj, err := s.db.DeleteObjectMeta(bucket.ID, key)
 	if err != nil {
 		if errors.Is(err, meta.ErrObjectNotFound) {
-			// S3 semantics: deleting a non-existent object is not an error.
 			return nil
 		}
 		return err
