@@ -12,14 +12,32 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
+func (h *connHandler) multipartUploadForRequest(bucket, key, uploadID string) (*meta.Bucket, *meta.MultipartUpload, error) {
+	upload, err := h.db.GetMultipartUpload(uploadID)
+	if err != nil {
+		return nil, nil, err
+	}
+	bkt, err := h.db.GetBucketByID(upload.BucketID)
+	if err != nil {
+		if errors.Is(err, meta.ErrBucketNotFound) {
+			return nil, nil, meta.ErrUploadNotFound
+		}
+		return nil, nil, err
+	}
+	if bkt.Name != bucket || upload.ObjectKey != key {
+		return nil, nil, meta.ErrUploadNotFound
+	}
+	return bkt, upload, nil
+}
+
+func (h *connHandler) authorizeMultipart(tokenBucket *meta.Bucket, action, key string) error {
+	return h.auth.AuthorizeWithPolicy(h.token, action, tokenBucket.Name, key, h.sourceIP, tokenBucket.PolicyJSON)
+}
+
 func (h *connHandler) handleCreateMultipartUpload(req *request) error {
 	bucket, key, contentType, err := DecodeCreateMultipartRequest(req.meta)
 	if err != nil {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
-	}
-
-	if err := h.auth.Authorize(h.token, meta.ActionMultipartCreate, bucket, key); err != nil {
-		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	bkt, err := h.db.GetBucket(bucket)
@@ -28,6 +46,9 @@ func (h *connHandler) handleCreateMultipartUpload(req *request) error {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+	if err := h.authorizeMultipart(bkt, meta.ActionMultipartCreate, key); err != nil {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	if contentType == "" {
@@ -62,14 +83,7 @@ func (h *connHandler) handleUploadPart(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionMultipartUpload, bucket, key); err != nil {
-		if derr := drainData(req); derr != nil {
-			return derr
-		}
-		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
-	}
-
-	upload, err := h.db.GetMultipartUpload(uploadID)
+	bkt, upload, err := h.multipartUploadForRequest(bucket, key, uploadID)
 	if err != nil {
 		if derr := drainData(req); derr != nil {
 			return derr
@@ -78,6 +92,12 @@ func (h *connHandler) handleUploadPart(req *request) error {
 			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+	if err := h.authorizeMultipart(bkt, meta.ActionMultipartUpload, key); err != nil {
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	if upload.InitiatedBy != h.token.AccountID {
@@ -141,16 +161,15 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionMultipartComplete, bucket, key); err != nil {
-		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
-	}
-
-	bkt, err := h.db.GetBucket(bucket)
+	bkt, _, err := h.multipartUploadForRequest(bucket, key, uploadID)
 	if err != nil {
-		if errors.Is(err, meta.ErrBucketNotFound) {
-			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
+		if errors.Is(err, meta.ErrUploadNotFound) {
+			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+	if err := h.authorizeMultipart(bkt, meta.ActionMultipartComplete, key); err != nil {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	existing, err := h.db.GetMultipartUpload(uploadID)
@@ -212,6 +231,11 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 		}
 	}
 
+	if err := h.db.MarkMultipartUploadCompleted(uploadID); err != nil {
+		h.log.Error("mark multipart completed", "err", err, "upload_id", uploadID)
+		return h.writeError(StatusInternal, req.streamID, "failed to finalize upload", "InternalError")
+	}
+
 	if err := h.store.CleanupUploadParts(uploadID); err != nil {
 		h.log.Warn("cleanup upload parts", "err", err, "upload_id", uploadID)
 	}
@@ -228,7 +252,14 @@ func (h *connHandler) handleAbortMultipart(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionMultipartAbort, bucket, key); err != nil {
+	bkt, _, err := h.multipartUploadForRequest(bucket, key, uploadID)
+	if err != nil {
+		if errors.Is(err, meta.ErrUploadNotFound) {
+			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
+		}
+		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+	if err := h.authorizeMultipart(bkt, meta.ActionMultipartAbort, key); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
@@ -267,16 +298,15 @@ func (h *connHandler) handleListParts(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	if err := h.auth.Authorize(h.token, meta.ActionMultipartUpload, bucket, key); err != nil {
-		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
-	}
-
-	upload, err := h.db.GetMultipartUpload(uploadID)
+	bkt, upload, err := h.multipartUploadForRequest(bucket, key, uploadID)
 	if err != nil {
 		if errors.Is(err, meta.ErrUploadNotFound) {
 			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+	if err := h.authorizeMultipart(bkt, meta.ActionMultipartUpload, key); err != nil {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 	if upload.InitiatedBy != h.token.AccountID {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")

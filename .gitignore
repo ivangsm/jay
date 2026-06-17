@@ -17,6 +17,9 @@ coverage.html
 *.swo
 *~
 
+# Local tool caches
+.reflex/
+
 # OS
 .DS_Store
 Thumbs.db

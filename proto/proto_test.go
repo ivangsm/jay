@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -414,6 +415,145 @@ func TestConnectionReuse(t *testing.T) {
 	}
 	if len(result.Objects) != 10 {
 		t.Fatalf("expected 10 objects, got %d", len(result.Objects))
+	}
+}
+
+func requireClientErrorCode(t *testing.T, err error, code string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected client error %s", code)
+	}
+	jayErr, ok := err.(*client.Error)
+	if !ok {
+		t.Fatalf("expected *client.Error, got %T: %v", err, err)
+	}
+	if jayErr.Code != code {
+		t.Fatalf("expected code %s, got %s", code, jayErr.Code)
+	}
+}
+
+func TestMultipartRejectsWrongBucketOrKeyAndKeepsConnection(t *testing.T) {
+	env := setup(t)
+	c := dial(t, env)
+
+	if _, err := c.CreateBucket("owner"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateBucket("other"); err != nil {
+		t.Fatal(err)
+	}
+
+	uploadID, err := c.CreateMultipartUpload("owner", "image.bin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.UploadPart("other", "image.bin", uploadID, 1, strings.NewReader("data"), 4)
+	requireClientErrorCode(t, err, "NoSuchUpload")
+	if err := c.Ping(); err != nil {
+		t.Fatalf("connection should remain reusable after rejected upload part: %v", err)
+	}
+
+	_, err = c.UploadPart("owner", "other.bin", uploadID, 1, strings.NewReader("data"), 4)
+	requireClientErrorCode(t, err, "NoSuchUpload")
+	if err := c.Ping(); err != nil {
+		t.Fatalf("connection should remain reusable after rejected upload part: %v", err)
+	}
+
+	if _, err := c.ListParts("other", "image.bin", uploadID); err != nil {
+		requireClientErrorCode(t, err, "NoSuchUpload")
+	} else {
+		t.Fatal("expected wrong-bucket list parts to fail")
+	}
+
+	parts, err := c.ListParts("owner", "image.bin", uploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 0 {
+		t.Fatalf("wrong bucket/key must not register parts, got %d", len(parts))
+	}
+}
+
+func TestMultipartHonorsBucketPolicyDeny(t *testing.T) {
+	env := setup(t)
+	c := dial(t, env)
+
+	if _, err := c.CreateBucket("owner"); err != nil {
+		t.Fatal(err)
+	}
+	policy := auth.BucketPolicy{
+		Version: "1",
+		Statements: []auth.PolicyStatement{{
+			Effect:   "deny",
+			Actions:  []string{meta.ActionMultipartUpload},
+			Prefixes: []string{"private/"},
+			Subjects: []string{env.tokenID},
+		}},
+	}
+	raw, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.UpdateBucketPolicy("owner", raw); err != nil {
+		t.Fatal(err)
+	}
+
+	uploadID, err := c.CreateMultipartUpload("owner", "private/image.bin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.UploadPart("owner", "private/image.bin", uploadID, 1, strings.NewReader("data"), 4)
+	requireClientErrorCode(t, err, "AccessDenied")
+	if err := c.Ping(); err != nil {
+		t.Fatalf("connection should remain reusable after policy-denied upload part: %v", err)
+	}
+
+	parts, err := c.ListParts("owner", "private/image.bin", uploadID)
+	requireClientErrorCode(t, err, "AccessDenied")
+	if parts != nil {
+		t.Fatalf("policy-denied list should not return parts: %v", parts)
+	}
+}
+
+func TestMultipartCompleteFailureLeavesUploadRetryable(t *testing.T) {
+	env := setup(t)
+	c := dial(t, env)
+
+	if _, err := c.CreateBucket("owner"); err != nil {
+		t.Fatal(err)
+	}
+	bucket, err := env.db.GetBucket("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadID, err := c.CreateMultipartUpload("owner", "image.bin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.AddMultipartPart(uploadID, meta.MultipartPart{
+		PartNumber:     1,
+		Size:           4,
+		ETag:           "8d777f385d3dfec8815d20f7496026dc",
+		ChecksumSHA256: "missing",
+		LocationRef:    "multipart/" + uploadID + "/part-00001",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.CompleteMultipartUpload("owner", "image.bin", uploadID, []client.CompletePart{{PartNumber: 1}})
+	requireClientErrorCode(t, err, "InternalError")
+
+	upload, err := env.db.GetMultipartUpload(uploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.State != "initiated" {
+		t.Fatalf("failed complete should remain retryable, got state %s", upload.State)
+	}
+	if _, err := env.db.GetObjectMeta(bucket.ID, "image.bin"); !errors.Is(err, meta.ErrObjectNotFound) {
+		t.Fatalf("object should not be committed, got %v", err)
 	}
 }
 

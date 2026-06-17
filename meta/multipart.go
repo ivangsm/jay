@@ -14,11 +14,11 @@ import (
 const MaxMultipartParts = 10000
 
 var (
-	bucketMultipart    = []byte("multipart")
-	ErrUploadNotFound  = errors.New("upload not found")
-	ErrUploadNotActive = errors.New("upload is not active")
+	bucketMultipart      = []byte("multipart")
+	ErrUploadNotFound    = errors.New("upload not found")
+	ErrUploadNotActive   = errors.New("upload is not active")
 	ErrInvalidPartNumber = errors.New("part number must be between 1 and 10000")
-	ErrTooManyParts    = errors.New("upload exceeds maximum number of parts (10000)")
+	ErrTooManyParts      = errors.New("upload exceeds maximum number of parts (10000)")
 )
 
 // ensureMultipartBucket creates the multipart bbolt bucket if needed.
@@ -124,10 +124,13 @@ func (db *DB) AddMultipartPart(uploadID string, part MultipartPart) error {
 	})
 }
 
-// CompleteMultipartUpload marks the upload as completed and returns the sorted parts.
+// CompleteMultipartUpload validates the requested parts and returns the sorted
+// part set without mutating upload state. Callers must assemble and commit the
+// final object before marking/deleting the upload, so failed assembly remains
+// retryable.
 func (db *DB) CompleteMultipartUpload(uploadID string, partNumbers []int) (*MultipartUpload, error) {
 	var upload MultipartUpload
-	err := db.bolt.Update(func(tx *bolt.Tx) error {
+	err := db.bolt.View(func(tx *bolt.Tx) error {
 		bk := tx.Bucket(bucketMultipart)
 		if bk == nil {
 			return ErrUploadNotFound
@@ -177,18 +180,40 @@ func (db *DB) CompleteMultipartUpload(uploadID string, partNumbers []int) (*Mult
 		})
 
 		upload.Parts = finalParts
-		upload.State = "completed"
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &upload, nil
+}
 
+// MarkMultipartUploadCompleted marks a still-active multipart upload as
+// completed after the final object has been durably committed.
+func (db *DB) MarkMultipartUploadCompleted(uploadID string) error {
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(bucketMultipart)
+		if bk == nil {
+			return ErrUploadNotFound
+		}
+		data := bk.Get([]byte(uploadID))
+		if data == nil {
+			return ErrUploadNotFound
+		}
+		var upload MultipartUpload
+		if err := json.Unmarshal(data, &upload); err != nil {
+			return err
+		}
+		if upload.State != "initiated" {
+			return ErrUploadNotActive
+		}
+		upload.State = "completed"
 		updated, err := json.Marshal(&upload)
 		if err != nil {
 			return err
 		}
 		return bk.Put([]byte(uploadID), updated)
 	})
-	if err != nil {
-		return nil, err
-	}
-	return &upload, nil
 }
 
 // AbortMultipartUpload marks the upload as aborted.

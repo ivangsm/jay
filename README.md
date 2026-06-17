@@ -21,7 +21,7 @@ Jay provides dual API access: a fully S3-compatible HTTP API and a high-performa
 - **CopyObject** -- server-side copy between buckets
 - **Bucket policies** -- prefix-based allow/deny rules with IP conditions
 - **Token authentication** -- scoped by actions, buckets, and key prefixes
-- **AWS SigV4** -- simplified mode for AWS CLI compatibility
+- **AWS SigV4** -- HMAC-validated mode for AWS CLI compatibility
 - **Integrity scrubbing** -- periodic SHA-256 verification (10% sample/6h)
 - **Quarantine** -- automatic isolation of corrupted objects
 - **Rate limiting** -- per-token token bucket with configurable rate/burst
@@ -35,8 +35,8 @@ Jay provides dual API access: a fully S3-compatible HTTP API and a high-performa
 ### Docker Compose
 
 ```bash
-export JAY_ADMIN_TOKEN=my-secret-admin-token
-export JAY_SIGNING_SECRET=my-signing-secret
+export JAY_ADMIN_TOKEN=$(openssl rand -base64 32)
+export JAY_SIGNING_SECRET=$(openssl rand -base64 32)
 docker compose up -d
 ```
 
@@ -44,7 +44,9 @@ docker compose up -d
 
 ```bash
 go build -o jay .
-JAY_ADMIN_TOKEN=my-secret-admin-token ./jay
+JAY_ADMIN_TOKEN=$(openssl rand -base64 32) \
+JAY_SIGNING_SECRET=$(openssl rand -base64 32) \
+./jay
 ```
 
 Jay listens on three ports:
@@ -63,12 +65,12 @@ Jay accepts configuration from environment variables, a YAML config file, or bot
 | `JAY_LISTEN_ADDR` | `:9000` | S3 API listen address |
 | `JAY_ADMIN_ADDR` | `:9001` | Admin API listen address |
 | `JAY_NATIVE_ADDR` | `:4444` | Native protocol listen address |
-| `JAY_ADMIN_TOKEN` | *(required)* | Bearer token for admin API (≥ 32 chars) |
-| `JAY_SIGNING_SECRET` | *(required)* | AES-GCM key for presigned URLs and token secrets (≥ 32 chars) |
+| `JAY_ADMIN_TOKEN` | *(required)* | Bearer token for admin API; must be at least 32 characters |
+| `JAY_SIGNING_SECRET` | *(required)* | AES-GCM key for presigned URLs and token secrets; must be at least 32 characters |
 | `JAY_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
 | `JAY_TLS_CERT` | *(optional)* | Path to TLS certificate file |
 | `JAY_TLS_KEY` | *(optional)* | Path to TLS private key file |
-| `JAY_RATE_LIMIT` | `100` | Requests/sec per token (0 = disabled) |
+| `JAY_RATE_LIMIT` | `100` | Requests/sec per token (`0` disables rate limiting) |
 | `JAY_RATE_BURST` | `200` | Rate limit burst size |
 | `JAY_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` headers |
 | `JAY_SCRUB_INTERVAL_HOURS` | `6` | Scrubber interval |
@@ -215,7 +217,7 @@ curl -X POST http://localhost:9001/_jay/tokens \
 Authorization: Bearer <token_id>:<secret>
 ```
 
-**AWS SigV4 (simplified):** Use `token_id` as the access key and any value as the secret key. Jay validates the token exists but does not verify the HMAC signature.
+**AWS SigV4:** Use `token_id` as the access key and the token secret as the secret key. Jay validates the request timestamp and verifies the SigV4 HMAC signature.
 
 ### Token Scoping
 
@@ -260,7 +262,7 @@ Available actions: `bucket:list`, `bucket:read-meta`, `bucket:write-meta`, `obje
 ```bash
 # Configure AWS CLI
 aws configure set aws_access_key_id <token_id>
-aws configure set aws_secret_access_key <any-value>
+aws configure set aws_secret_access_key <token-secret>
 aws configure set default.region us-east-1
 
 # Basic operations

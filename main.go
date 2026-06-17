@@ -160,7 +160,11 @@ func main() {
 
 	// Bind admin listener BEFORE recovery so probes get 503 (not
 	// ECONNREFUSED) while recovery is in flight on a large store.
-	shutdownAdmin := startServer(cfg.AdminAddr, adminMux, log, "admin", cfg.TLSCert, cfg.TLSKey)
+	shutdownAdmin, err := startServer(cfg.AdminAddr, adminMux, log, "admin", cfg.TLSCert, cfg.TLSKey)
+	if err != nil {
+		log.Error("failed to start admin server", "err", err)
+		os.Exit(1)
+	}
 
 	// Run startup recovery
 	if err := recovery.Run(db, st, log); err != nil {
@@ -222,7 +226,14 @@ func main() {
 	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret, rlCfg)
 	s3Handler.SetTrustProxyHeaders(cfg.TrustProxyHeaders)
 
-	shutdownS3 := startServer(cfg.ListenAddr, s3Handler, log, "s3", cfg.TLSCert, cfg.TLSKey)
+	shutdownS3, err := startServer(cfg.ListenAddr, s3Handler, log, "s3", cfg.TLSCert, cfg.TLSKey)
+	if err != nil {
+		log.Error("failed to start s3 server", "err", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = shutdownAdmin(ctx)
+		cancel()
+		os.Exit(1)
+	}
 
 	// Start native TCP server
 	var shutdownNative func() error
@@ -232,6 +243,10 @@ func main() {
 		shutdownNative, err = nativeServer.ListenAndServe(cfg.NativeAddr)
 		if err != nil {
 			log.Error("failed to start native server", "err", err)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = shutdownS3(ctx)
+			_ = shutdownAdmin(ctx)
+			cancel()
 			os.Exit(1)
 		}
 	}

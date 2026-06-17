@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,8 +13,67 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 )
+
+func (h *Handler) denyMultipartPolicy(w http.ResponseWriter, r *http.Request, bucket *meta.Bucket, action, objectKey string) bool {
+	if len(bucket.PolicyJSON) == 0 {
+		return false
+	}
+
+	var policy auth.BucketPolicy
+	if err := json.Unmarshal(bucket.PolicyJSON, &policy); err != nil {
+		h.log.Warn("multipart: malformed bucket policy, failing closed", "bucket", bucket.Name, "err", err)
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", r.URL.Path)
+		return true
+	}
+	policy.Compile()
+
+	tokenID := ""
+	if tok := tokenFromContext(r.Context()); tok != nil {
+		tokenID = tok.TokenID
+	}
+	if auth.EvaluatePolicyDeny(&policy, tokenID, action, objectKey, clientIP(r, h.trustProxyHeaders)) {
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", r.URL.Path)
+		return true
+	}
+	return false
+}
+
+func (h *Handler) multipartUploadForRequest(w http.ResponseWriter, r *http.Request, bucketName, objectKey, uploadID string) (*meta.Bucket, *meta.MultipartUpload, bool) {
+	upload, err := h.db.GetMultipartUpload(uploadID)
+	if err != nil {
+		if errors.Is(err, meta.ErrUploadNotFound) {
+			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
+			return nil, nil, false
+		}
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+		return nil, nil, false
+	}
+
+	bucket, err := h.db.GetBucketByID(upload.BucketID)
+	if err != nil {
+		if errors.Is(err, meta.ErrBucketNotFound) {
+			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
+			return nil, nil, false
+		}
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+		return nil, nil, false
+	}
+
+	if bucket.Name != bucketName || upload.ObjectKey != objectKey {
+		writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
+		return nil, nil, false
+	}
+	return bucket, upload, true
+}
 
 // handleCreateMultipartUpload handles POST /<bucket>/<key>?uploads
 func (h *Handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
@@ -29,6 +89,9 @@ func (h *Handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Req
 			return
 		}
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName)
+		return
+	}
+	if h.denyMultipartPolicy(w, r, bucket, meta.ActionMultipartCreate, objectKey) {
 		return
 	}
 
@@ -83,13 +146,11 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	upload, err := h.db.GetMultipartUpload(uploadID)
-	if err != nil {
-		if errors.Is(err, meta.ErrUploadNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
-			return
-		}
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+	bucket, upload, ok := h.multipartUploadForRequest(w, r, bucketName, objectKey, uploadID)
+	if !ok {
+		return
+	}
+	if h.denyMultipartPolicy(w, r, bucket, meta.ActionMultipartUpload, objectKey) {
 		return
 	}
 
@@ -143,13 +204,11 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	bucket, err := h.db.GetBucket(bucketName)
-	if err != nil {
-		if errors.Is(err, meta.ErrBucketNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchBucket, "Bucket not found", "/"+bucketName)
-			return
-		}
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName)
+	bucket, _, ok := h.multipartUploadForRequest(w, r, bucketName, objectKey, uploadID)
+	if !ok {
+		return
+	}
+	if h.denyMultipartPolicy(w, r, bucket, meta.ActionMultipartComplete, objectKey) {
 		return
 	}
 
@@ -234,6 +293,12 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		}
 	}
 
+	if err := h.db.MarkMultipartUploadCompleted(uploadID); err != nil {
+		h.log.Error("mark multipart completed", "err", err, "upload_id", uploadID)
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to finalize upload", "/"+bucketName+"/"+objectKey)
+		return
+	}
+
 	// Cleanup parts (best-effort)
 	if err := h.store.CleanupUploadParts(uploadID); err != nil {
 		h.log.Warn("cleanup upload parts", "err", err, "upload_id", uploadID)
@@ -258,13 +323,11 @@ func (h *Handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	existing, err := h.db.GetMultipartUpload(uploadID)
-	if err != nil {
-		if errors.Is(err, meta.ErrUploadNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
-			return
-		}
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+	bucket, existing, ok := h.multipartUploadForRequest(w, r, bucketName, objectKey, uploadID)
+	if !ok {
+		return
+	}
+	if h.denyMultipartPolicy(w, r, bucket, meta.ActionMultipartAbort, objectKey) {
 		return
 	}
 	if token == nil || existing.InitiatedBy != token.AccountID {
@@ -300,13 +363,11 @@ func (h *Handler) handleListParts(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	upload, err := h.db.GetMultipartUpload(uploadID)
-	if err != nil {
-		if errors.Is(err, meta.ErrUploadNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
-			return
-		}
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
+	bucket, upload, ok := h.multipartUploadForRequest(w, r, bucketName, objectKey, uploadID)
+	if !ok {
+		return
+	}
+	if h.denyMultipartPolicy(w, r, bucket, meta.ActionMultipartUpload, objectKey) {
 		return
 	}
 	if token == nil || upload.InitiatedBy != token.AccountID {

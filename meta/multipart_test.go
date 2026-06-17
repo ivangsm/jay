@@ -239,7 +239,7 @@ func TestAddMultipartPart_UploadNotActive(t *testing.T) {
 	}
 }
 
-func TestCompleteMultipartUpload_TransitionToCompleted(t *testing.T) {
+func TestCompleteMultipartUpload_ReturnsPartsWithoutChangingState(t *testing.T) {
 	db := openMultipartTestDB(t)
 	upload := &MultipartUpload{
 		UploadID:  uuid.New().String(),
@@ -258,8 +258,8 @@ func TestCompleteMultipartUpload_TransitionToCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompleteMultipartUpload: %v", err)
 	}
-	if completed.State != "completed" {
-		t.Fatalf("want state=completed, got %s", completed.State)
+	if completed.State != "initiated" {
+		t.Fatalf("want returned state=initiated, got %s", completed.State)
 	}
 	if len(completed.Parts) != 3 {
 		t.Fatalf("want 3 parts, got %d", len(completed.Parts))
@@ -269,8 +269,19 @@ func TestCompleteMultipartUpload_TransitionToCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after complete: %v", err)
 	}
+	if got.State != "initiated" {
+		t.Fatalf("persisted state: want initiated, got %s", got.State)
+	}
+
+	if err := db.MarkMultipartUploadCompleted(upload.UploadID); err != nil {
+		t.Fatalf("MarkMultipartUploadCompleted: %v", err)
+	}
+	got, err = db.GetMultipartUpload(upload.UploadID)
+	if err != nil {
+		t.Fatalf("get after mark completed: %v", err)
+	}
 	if got.State != "completed" {
-		t.Fatalf("persisted state: want completed, got %s", got.State)
+		t.Fatalf("persisted state after mark: want completed, got %s", got.State)
 	}
 }
 
@@ -406,6 +417,9 @@ func TestListMultipartUploads_ReturnsInitiatedForBucket(t *testing.T) {
 	_ = db.AddMultipartPart(ids[0], MultipartPart{PartNumber: 1, Size: 1, ETag: "e"})
 	if _, err := db.CompleteMultipartUpload(ids[0], []int{1}); err != nil {
 		t.Fatalf("complete: %v", err)
+	}
+	if err := db.MarkMultipartUploadCompleted(ids[0]); err != nil {
+		t.Fatalf("mark completed: %v", err)
 	}
 
 	uploads, err := db.ListMultipartUploads(bucketID)
