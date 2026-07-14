@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -267,5 +268,117 @@ func TestMultipartCompleteSuccessDeletesUploadRecord(t *testing.T) {
 	}
 	if _, err := env.db.GetObjectMeta(bucket.ID, "image.bin"); err != nil {
 		t.Fatalf("object should be committed: %v", err)
+	}
+}
+
+func TestMultipartCompleteRejectsMismatchedPartETag(t *testing.T) {
+	env := setupMultipartHTTPEnv(t)
+	bucket := env.createBucket(t, "owner")
+	upload := env.createUpload(t, bucket, "image.bin")
+
+	w := env.serve(http.MethodPut, "/owner/image.bin?uploadId="+upload.UploadID+"&partNumber=1", []byte("data"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("upload part: got %d: %s", w.Code, w.Body.String())
+	}
+
+	body := []byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"deadbeef"</ETag></Part></CompleteMultipartUpload>`)
+	w = env.serve(http.MethodPost, "/owner/image.bin?uploadId="+upload.UploadID, body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "InvalidPart") {
+		t.Fatalf("want InvalidPart error code, got %s", w.Body.String())
+	}
+
+	got, err := env.db.GetMultipartUpload(upload.UploadID)
+	if err != nil {
+		t.Fatalf("get upload: %v", err)
+	}
+	if got.State != "initiated" {
+		t.Fatalf("rejected complete must stay retryable, got %s", got.State)
+	}
+	if _, err := env.db.GetObjectMeta(bucket.ID, "image.bin"); !errors.Is(err, meta.ErrObjectNotFound) {
+		t.Fatalf("object must not be committed, got %v", err)
+	}
+}
+
+func TestMultipartCompleteAcceptsQuotedAndEmptyPartETag(t *testing.T) {
+	env := setupMultipartHTTPEnv(t)
+	bucket := env.createBucket(t, "owner")
+
+	// Matching (quoted) ETag → accepted.
+	upload := env.createUpload(t, bucket, "quoted.bin")
+	w := env.serve(http.MethodPut, "/owner/quoted.bin?uploadId="+upload.UploadID+"&partNumber=1", []byte("data"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("upload part: got %d: %s", w.Code, w.Body.String())
+	}
+	etag := w.Header().Get("ETag") // already quoted, as S3 clients echo it back
+	body := []byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>` + etag + `</ETag></Part></CompleteMultipartUpload>`)
+	w = env.serve(http.MethodPost, "/owner/quoted.bin?uploadId="+upload.UploadID, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("complete with matching etag: got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Empty ETag → tolerated.
+	upload = env.createUpload(t, bucket, "empty.bin")
+	w = env.serve(http.MethodPut, "/owner/empty.bin?uploadId="+upload.UploadID+"&partNumber=1", []byte("data"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("upload part: got %d: %s", w.Code, w.Body.String())
+	}
+	body = []byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag></ETag></Part></CompleteMultipartUpload>`)
+	w = env.serve(http.MethodPost, "/owner/empty.bin?uploadId="+upload.UploadID, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("complete with empty etag: got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMultipartAbortRejectsCompletedUpload(t *testing.T) {
+	env := setupMultipartHTTPEnv(t)
+	bucket := env.createBucket(t, "owner")
+	upload := env.createUpload(t, bucket, "image.bin")
+	if err := env.db.MarkMultipartUploadCompleted(upload.UploadID); err != nil {
+		t.Fatalf("mark completed: %v", err)
+	}
+
+	w := env.serve(http.MethodDelete, "/owner/image.bin?uploadId="+upload.UploadID, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("want 404 NoSuchUpload, got %d: %s", w.Code, w.Body.String())
+	}
+
+	got, err := env.db.GetMultipartUpload(upload.UploadID)
+	if err != nil {
+		t.Fatalf("get upload: %v", err)
+	}
+	if got.State != "completed" {
+		t.Fatalf("abort must not overwrite a completed upload, got %s", got.State)
+	}
+}
+
+func TestMultipartUploadPartRejectsOversizedPart(t *testing.T) {
+	env := setupMultipartHTTPEnv(t)
+	env.handler.objops.SetMaxObjectSize(4)
+	bucket := env.createBucket(t, "owner")
+	upload := env.createUpload(t, bucket, "image.bin")
+
+	w := env.serve(http.MethodPut, "/owner/image.bin?uploadId="+upload.UploadID+"&partNumber=1", []byte("12345"))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "EntityTooLarge") {
+		t.Fatalf("want EntityTooLarge error code, got %s", w.Body.String())
+	}
+
+	got, err := env.db.GetMultipartUpload(upload.UploadID)
+	if err != nil {
+		t.Fatalf("get upload: %v", err)
+	}
+	if len(got.Parts) != 0 {
+		t.Fatalf("oversized part must not be registered, got %d", len(got.Parts))
+	}
+
+	// A part at the limit still succeeds.
+	w = env.serve(http.MethodPut, "/owner/image.bin?uploadId="+upload.UploadID+"&partNumber=1", []byte("1234"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("part at limit: want 200, got %d: %s", w.Code, w.Body.String())
 	}
 }

@@ -12,6 +12,11 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
+// s3ErrEntityTooLarge is the S3 error code returned when an upload exceeds the
+// configured maximum object size. Declared here (not in xml.go) to keep the
+// S3ErrXxx exported set stable.
+const s3ErrEntityTooLarge = "EntityTooLarge"
+
 // buildIdentity snapshots the request-bound context needed by objops for
 // bucket-policy evaluation. It is called by every object handler after
 // requireAuth has populated the token (or confirmed public-read fallback).
@@ -46,6 +51,9 @@ func (h *Handler) mapObjopsErr(w http.ResponseWriter, r *http.Request, err error
 			h.metrics.AuthFailures.Add(1)
 		}
 		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", "/"+bucketName+"/"+objectKey)
+	case errors.Is(err, objops.ErrObjectTooLarge):
+		writeS3Error(w, r, http.StatusBadRequest, s3ErrEntityTooLarge,
+			"Your proposed upload exceeds the maximum allowed object size", "/"+bucketName+"/"+objectKey)
 	default:
 		return false
 	}
@@ -258,6 +266,12 @@ func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 // "bytes=500-". Returns start, end (inclusive), and whether the range is valid.
 func parseRange(rangeHeader string, totalSize int64) (start, end int64, ok bool) {
 	if !strings.HasPrefix(rangeHeader, "bytes=") {
+		return 0, 0, false
+	}
+	// A zero-length object has no satisfiable range: every first-byte-pos is
+	// >= totalSize, and a suffix range would otherwise yield end = -1 (an
+	// invalid Content-Range and a bogus length). RFC 7233 §4.4 → 416.
+	if totalSize == 0 {
 		return 0, 0, false
 	}
 	spec := strings.TrimPrefix(rangeHeader, "bytes=")

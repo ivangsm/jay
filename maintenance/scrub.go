@@ -2,7 +2,6 @@ package maintenance
 
 import (
 	"log/slog"
-	"math/rand"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -40,13 +39,16 @@ type Scrubber struct {
 	store    *store.Store
 	log      *slog.Logger
 	interval time.Duration
-	sampleRate float64 // 0.0-1.0, fraction of objects to check per run
 	quit     chan struct{}
 	running  atomic.Bool
 
 	// bytesLimiter throttles scrub read bandwidth to avoid starving
 	// production reads. nil = unlimited.
 	bytesLimiter *rate.Limiter
+
+	// metrics is an optional sink for ChecksumFailures / ObjectsQuarantined.
+	// Set via SetMetrics before Start; nil = no metrics recorded.
+	metrics *Metrics
 
 	mu           sync.Mutex
 	lastKey      map[string]string // bucketID -> last checked key
@@ -56,14 +58,10 @@ type Scrubber struct {
 }
 
 // NewScrubber creates a new scrubber.
-// sampleRate controls what fraction of objects are checked per run (1.0 = full scan).
 // scrubBytesPerSec bounds checksum-read bandwidth; <=0 disables the limiter.
 // maxPerRun bounds how many objects per bucket are inspected on each tick;
 // <=0 falls back to 100.
-func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.Duration, sampleRate float64, scrubBytesPerSec int64, maxPerRun int) *Scrubber {
-	if sampleRate <= 0 || sampleRate > 1.0 {
-		sampleRate = 0.1 // default 10% per run
-	}
+func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.Duration, scrubBytesPerSec int64, maxPerRun int) *Scrubber {
 	if maxPerRun <= 0 {
 		maxPerRun = 100
 	}
@@ -81,11 +79,34 @@ func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.D
 		store:        st,
 		log:          log,
 		interval:     interval,
-		sampleRate:   sampleRate,
 		bytesLimiter: limiter,
 		quit:         make(chan struct{}),
 		lastKey:      make(map[string]string),
 		maxPerRun:    maxPerRun,
+	}
+}
+
+// SetMetrics attaches a metrics sink to the scrubber. Nil-safe (nil simply
+// disables metric recording). Call before Start; the field is read from
+// scrub goroutines without synchronization, so it must not be swapped while
+// the scrubber is running.
+func (s *Scrubber) SetMetrics(m *Metrics) {
+	s.metrics = m
+}
+
+// recordChecksumFailure increments the checksum-failure counter if a metrics
+// sink is attached.
+func (s *Scrubber) recordChecksumFailure() {
+	if s.metrics != nil {
+		s.metrics.ChecksumFailures.Add(1)
+	}
+}
+
+// recordQuarantine increments the quarantine counter if a metrics sink is
+// attached.
+func (s *Scrubber) recordQuarantine() {
+	if s.metrics != nil {
+		s.metrics.ObjectsQuarantined.Add(1)
 	}
 }
 
@@ -126,106 +147,6 @@ func (s *Scrubber) loop() {
 			timer.Reset(s.interval)
 		}
 	}
-}
-
-// RunOnce performs a single scrub pass.
-func (s *Scrubber) RunOnce() ScrubResult {
-	var result ScrubResult
-
-	buckets, err := s.db.ListBuckets("")
-	if err != nil {
-		s.log.Error("scrub: list buckets", "err", err)
-		result.Errors++
-		return result
-	}
-
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	for _, bucket := range buckets {
-		type quarantineAction struct {
-			key         string
-			locationRef string
-			isMismatch  bool // true = checksum mismatch, false = missing file
-		}
-		var toQuarantine []quarantineAction
-
-		if err := s.db.ForEachObject(bucket.ID, func(obj meta.Object) error {
-			if obj.State != "active" {
-				return nil
-			}
-
-			// Sample based on rate
-			if rng.Float64() > s.sampleRate {
-				return nil
-			}
-
-			result.Checked++
-
-			// Check physical file exists
-			if !s.store.ObjectExists(&obj) {
-				s.log.Warn("scrub: missing file",
-					"bucket", bucket.Name,
-					"key", obj.Key,
-					"location", obj.LocationRef,
-				)
-				toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: false})
-				result.Missing++
-				return nil
-			}
-
-			// Verify checksum
-			match, actual, err := s.store.VerifyChecksum(obj.LocationRef, obj.ChecksumSHA256)
-			if err != nil {
-				s.log.Error("scrub: verify checksum",
-					"err", err,
-					"bucket", bucket.Name,
-					"key", obj.Key,
-				)
-				result.Errors++
-				return nil
-			}
-
-			if !match {
-				s.log.Error("scrub: checksum mismatch",
-					"bucket", bucket.Name,
-					"key", obj.Key,
-					"expected", obj.ChecksumSHA256,
-					"actual", actual,
-					"location", obj.LocationRef,
-				)
-				toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: true})
-				result.Quarantined++
-				return nil
-			}
-
-			result.Healthy++
-			return nil
-		}); err != nil {
-			s.log.Error("scrub: iterate objects", "err", err, "bucket", bucket.Name)
-			result.Errors++
-		}
-
-		// Quarantine outside the View transaction to avoid deadlock.
-		for _, qa := range toQuarantine {
-			if err := s.db.QuarantineObject(bucket.ID, qa.key); err != nil {
-				s.log.Error("scrub: quarantine meta", "err", err, "bucket", bucket.Name, "key", qa.key)
-			}
-			if qa.isMismatch {
-				if err := s.store.Quarantine(qa.locationRef); err != nil {
-					s.log.Error("scrub: quarantine file", "err", err, "location", qa.locationRef)
-				}
-			}
-		}
-
-		// Check for shutdown between buckets
-		select {
-		case <-s.quit:
-			return result
-		default:
-		}
-	}
-
-	return result
 }
 
 // RunIncremental checks up to maxPerRun objects per bucket, starting from
@@ -293,14 +214,47 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 			// records already binary-encoded, so we can be generous here.
 			var toMigrateKeys []string
 
+			// Inside the View transaction we ONLY collect candidate objects.
+			// ObjectExists / VerifyChecksumRateLimited hit the disk (and the
+			// latter is deliberately rate-limited), and a long-lived bbolt
+			// read tx blocks the writer's mmap remap and pins freelist pages,
+			// stalling writes and growing the DB file for the whole scrub.
+			// The Object values passed to the callback are decoded copies, so
+			// they are safe to retain after the tx closes.
+			var candidates []meta.Object
 			lastVisited, iterErr := s.db.ForEachObjectFrom(b.ID, start, maxPerRun, func(obj meta.Object) error {
 				if obj.State != "active" {
 					return nil
 				}
+				candidates = append(candidates, obj)
+				return nil
+			})
 
+			// Disk verification happens outside the tx. Because the metadata
+			// may change while we verify (object overwritten or deleted), each
+			// mismatch/missing finding is re-checked against the current
+			// record before quarantining: only quarantine if the object is
+			// still active AND still points at the same LocationRef we
+			// verified. Otherwise we would quarantine a freshly replaced
+			// object based on stale evidence.
+			stillCurrent := func(obj *meta.Object) bool {
+				cur, err := s.db.GetObjectMetaAny(b.ID, obj.Key)
+				if err != nil {
+					return false
+				}
+				return cur.State == "active" && cur.LocationRef == obj.LocationRef
+			}
+
+			for i := range candidates {
+				obj := &candidates[i]
 				br.partial.Checked++
 
-				if !s.store.ObjectExists(&obj) {
+				if !s.store.ObjectExists(obj) {
+					if !stillCurrent(obj) {
+						s.log.Info("scrub: object changed during verification, skipping",
+							"bucket", b.Name, "key", obj.Key, "location", obj.LocationRef)
+						continue
+					}
 					s.log.Warn("scrub: missing file",
 						"bucket", b.Name,
 						"key", obj.Key,
@@ -308,7 +262,7 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 					)
 					toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: false})
 					br.partial.Missing++
-					return nil
+					continue
 				}
 
 				match, actual, verifyErr := s.store.VerifyChecksumRateLimited(obj.LocationRef, obj.ChecksumSHA256, s.bytesLimiter)
@@ -319,10 +273,15 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 						"key", obj.Key,
 					)
 					br.partial.Errors++
-					return nil
+					continue
 				}
 
 				if !match {
+					if !stillCurrent(obj) {
+						s.log.Info("scrub: object changed during verification, skipping",
+							"bucket", b.Name, "key", obj.Key, "location", obj.LocationRef)
+						continue
+					}
 					s.log.Error("scrub: checksum mismatch",
 						"bucket", b.Name,
 						"key", obj.Key,
@@ -330,25 +289,27 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 						"actual", actual,
 						"location", obj.LocationRef,
 					)
+					s.recordChecksumFailure()
 					toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: true})
 					br.partial.Quarantined++
-					return nil
+					continue
 				}
 
 				br.partial.Healthy++
 				// Record is healthy — piggyback the JSON→binary meta-envelope
 				// rewrite so legacy records migrate in-place without a
 				// dedicated batch job. No-op for records already in binary
-				// format; collected outside the View tx to avoid a read/write
+				// format; runs outside the View tx to avoid a read/write
 				// tx overlap on the same bucket.
 				toMigrateKeys = append(toMigrateKeys, obj.Key)
-				return nil
-			})
+			}
 
 			// Quarantine outside the View transaction to avoid deadlock.
 			for _, qa := range toQuarantine {
 				if qerr := s.db.QuarantineObject(b.ID, qa.key); qerr != nil {
 					s.log.Error("incremental scrub: quarantine meta", "err", qerr, "bucket", b.Name, "key", qa.key)
+				} else {
+					s.recordQuarantine()
 				}
 				if qa.isMismatch {
 					if qerr := s.store.Quarantine(qa.locationRef); qerr != nil {

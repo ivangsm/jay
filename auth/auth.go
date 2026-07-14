@@ -24,10 +24,30 @@ var (
 
 const authCacheTTL = 5 * time.Minute
 
+// authFailCacheTTL is how long a failed bcrypt comparison is remembered.
+//
+// bcrypt costs ~60-100ms of CPU per attempt, so replaying the same bad
+// credentials is a cheap way to burn the whole CPU budget. Caching the
+// *failure* for a few seconds makes identical retries free. The TTL is kept
+// deliberately short so a secret rotation (or a token being re-created with a
+// new secret) is never blocked for more than a few seconds.
+const authFailCacheTTL = 5 * time.Second
+
+// authFailCacheMax caps the negative cache so an attacker cycling through
+// random secrets cannot grow it without bound. When exceeded, expired entries
+// are swept and — if that is not enough — the map is dropped entirely.
+const authFailCacheMax = 4096
+
 // authCacheEntry stores a validated token with an expiry time.
 type authCacheEntry struct {
 	token     *meta.Token
 	expiresAt time.Time
+}
+
+// authFailEntry remembers a rejected credential pair until deadline.
+type authFailEntry struct {
+	err      error
+	deadline time.Time
 }
 
 // Auth handles authentication and authorization.
@@ -35,7 +55,8 @@ type Auth struct {
 	db        *meta.DB
 	mu        sync.RWMutex
 	cache     map[[32]byte]authCacheEntry
-	tokenKeys map[string]map[[32]byte]struct{} // tokenID → set of cache keys
+	failCache map[[32]byte]authFailEntry
+	tokenKeys map[string]map[[32]byte]struct{} // tokenID → set of cache keys (positive + negative)
 }
 
 // New creates an Auth instance.
@@ -43,6 +64,7 @@ func New(db *meta.DB) *Auth {
 	return &Auth{
 		db:        db,
 		cache:     make(map[[32]byte]authCacheEntry),
+		failCache: make(map[[32]byte]authFailEntry),
 		tokenKeys: make(map[string]map[[32]byte]struct{}),
 	}
 }
@@ -52,17 +74,50 @@ func cacheKey(tokenID, secret string) [32]byte {
 	return sha256.Sum256([]byte(tokenID + ":" + secret))
 }
 
-// InvalidateToken removes all cache entries for a given token ID.
-// Call this when a token is revoked or modified.
+// InvalidateToken removes all cache entries (positive and negative) for a
+// given token ID. Call this when a token is revoked or modified.
 func (a *Auth) InvalidateToken(tokenID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if keys, ok := a.tokenKeys[tokenID]; ok {
 		for k := range keys {
 			delete(a.cache, k)
+			delete(a.failCache, k)
 		}
 		delete(a.tokenKeys, tokenID)
 	}
+}
+
+// rememberKey associates a cache key with its token ID so InvalidateToken can
+// evict it later. Caller must hold a.mu.
+func (a *Auth) rememberKey(tokenID string, key [32]byte) {
+	if a.tokenKeys[tokenID] == nil {
+		a.tokenKeys[tokenID] = make(map[[32]byte]struct{})
+	}
+	a.tokenKeys[tokenID][key] = struct{}{}
+}
+
+// cacheAuthFailure records a rejected credential pair so identical retries do
+// not pay for bcrypt again within authFailCacheTTL.
+func (a *Auth) cacheAuthFailure(tokenID string, key [32]byte, failErr error, now time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if len(a.failCache) >= authFailCacheMax {
+		for k, e := range a.failCache {
+			if now.After(e.deadline) {
+				delete(a.failCache, k)
+			}
+		}
+		// Still full of live entries: drop everything rather than grow without
+		// bound. Worst case a handful of attackers pay for bcrypt again.
+		if len(a.failCache) >= authFailCacheMax {
+			a.failCache = make(map[[32]byte]authFailEntry)
+		}
+	}
+
+	a.failCache[key] = authFailEntry{err: failErr, deadline: now.Add(authFailCacheTTL)}
+	a.rememberKey(tokenID, key)
 }
 
 // Authenticate extracts and validates credentials from the request.
@@ -103,8 +158,18 @@ func (a *Auth) validateToken(tokenID, secret string) (*meta.Token, error) {
 	now := time.Now()
 
 	a.mu.RLock()
-	if entry, ok := a.cache[key]; ok && now.Before(entry.expiresAt) {
-		a.mu.RUnlock()
+	entry, hit := a.cache[key]
+	hit = hit && now.Before(entry.expiresAt)
+	failEntry, failHit := a.failCache[key]
+	failHit = failHit && now.Before(failEntry.deadline)
+	a.mu.RUnlock()
+
+	// Negative cache: identical bad credentials are rejected without bcrypt.
+	if failHit {
+		return nil, failEntry.err
+	}
+
+	if hit {
 		// Re-check revocation/expiry on the cached token without bcrypt.
 		if entry.token.Status == "revoked" {
 			return nil, ErrTokenRevoked
@@ -112,9 +177,14 @@ func (a *Auth) validateToken(tokenID, secret string) (*meta.Token, error) {
 		if entry.token.ExpiresAt != nil && now.After(*entry.token.ExpiresAt) {
 			return nil, ErrTokenExpired
 		}
+		// Account status must be re-checked on every request: suspending an
+		// account has to take effect immediately, not after authCacheTTL. This
+		// is an O(1) bbolt View, orders of magnitude cheaper than bcrypt.
+		if err := a.checkAccountActive(entry.token.AccountID); err != nil {
+			return nil, err
+		}
 		return entry.token, nil
 	}
-	a.mu.RUnlock()
 
 	// Slow path: full validation with bcrypt.
 	token, err := a.db.GetToken(tokenID)
@@ -134,16 +204,15 @@ func (a *Auth) validateToken(tokenID, secret string) (*meta.Token, error) {
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(token.SecretHash), []byte(secret)); err != nil {
+		// Remember the failure briefly so a replay of the same wrong secret
+		// does not cost another bcrypt round.
+		a.cacheAuthFailure(tokenID, key, ErrInvalidCredentials, now)
 		return nil, ErrInvalidCredentials
 	}
 
 	// Verify account exists and is active
-	account, err := a.db.GetAccount(token.AccountID)
-	if err != nil {
-		return nil, ErrInvalidCredentials
-	}
-	if account.Status != "active" {
-		return nil, ErrAccessDenied
+	if err := a.checkAccountActive(token.AccountID); err != nil {
+		return nil, err
 	}
 
 	// Store in cache — clone the token and strip SecretKey so the cache
@@ -152,13 +221,24 @@ func (a *Auth) validateToken(tokenID, secret string) (*meta.Token, error) {
 	cached.SecretKey = ""
 	a.mu.Lock()
 	a.cache[key] = authCacheEntry{token: &cached, expiresAt: now.Add(authCacheTTL)}
-	if a.tokenKeys[token.TokenID] == nil {
-		a.tokenKeys[token.TokenID] = make(map[[32]byte]struct{})
-	}
-	a.tokenKeys[token.TokenID][key] = struct{}{}
+	a.rememberKey(token.TokenID, key)
 	a.mu.Unlock()
 
 	return token, nil
+}
+
+// checkAccountActive verifies the owning account still exists and is active.
+// Returns ErrInvalidCredentials when the account is gone and ErrAccessDenied
+// when it is suspended.
+func (a *Auth) checkAccountActive(accountID string) error {
+	account, err := a.db.GetAccount(accountID)
+	if err != nil {
+		return ErrInvalidCredentials
+	}
+	if account.Status != "active" {
+		return ErrAccessDenied
+	}
+	return nil
 }
 
 // Authorize checks if the token has permission for the given action on the bucket/key.
@@ -181,6 +261,38 @@ func (a *Auth) Authorize(token *meta.Token, action, bucketName, objectKey string
 	}
 
 	return nil
+}
+
+// AuthorizeBucketOwnership checks that the token is entitled to operate on an
+// EXISTING bucket's metadata (delete, head, and any other cross-account
+// sensitive bucket operation).
+//
+// Authorize alone is not enough: a token with "bucket:write-meta" and no
+// BucketScope is allowed to act on *every* bucket name, including buckets
+// owned by a different account. This is the tenant-isolation check that must
+// run in addition to Authorize, after the bucket has been loaded from meta.
+//
+// Access is granted when any of the following holds:
+//   - the token's account owns the bucket;
+//   - the bucket has no owner (legacy buckets created before ownership was
+//     recorded — refusing these would break existing deployments);
+//   - the token's BucketScope explicitly names the bucket, which is how an
+//     operator delegates cross-account access via the admin API.
+func (a *Auth) AuthorizeBucketOwnership(token *meta.Token, bucket *meta.Bucket) error {
+	if token == nil || bucket == nil {
+		return ErrAccessDenied
+	}
+	if bucket.OwnerAccountID == "" {
+		return nil
+	}
+	if token.AccountID == bucket.OwnerAccountID {
+		return nil
+	}
+	// Explicit delegation: the operator scoped this token to this bucket.
+	if contains(token.BucketScope, bucket.Name) {
+		return nil
+	}
+	return ErrAccessDenied
 }
 
 // IsPublicRead checks if a bucket is publicly readable.

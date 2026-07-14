@@ -1,17 +1,27 @@
 package maintenance
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/ivangsm/jay/meta"
+	"github.com/ivangsm/jay/store"
 )
+
+// multipartMaxAge is how long a multipart upload may stay inactive before its
+// bbolt record and on-disk parts are reclaimed by the GC.
+const multipartMaxAge = 24 * time.Hour
 
 // GC performs garbage collection of orphaned files.
 type GC struct {
 	dataDir  string
+	db       *meta.DB
+	st       *store.Store
 	log      *slog.Logger
 	interval time.Duration
 	quit     chan struct{}
@@ -26,9 +36,11 @@ type GC struct {
 }
 
 // NewGC creates a garbage collector.
-func NewGC(dataDir string, log *slog.Logger, interval time.Duration) *GC {
+func NewGC(dataDir string, db *meta.DB, st *store.Store, log *slog.Logger, interval time.Duration) *GC {
 	return &GC{
 		dataDir:  dataDir,
+		db:       db,
+		st:       st,
 		log:      log,
 		interval: interval,
 		quit:     make(chan struct{}),
@@ -90,10 +102,77 @@ func (gc *GC) loop() {
 // RunOnce performs a single GC pass.
 // It cleans up:
 // 1. Old temp files (older than 1 hour)
-// 2. Empty bucket object directories
+// 2. Expired multipart uploads (bbolt record + on-disk parts)
+// 3. Orphaned multipart part directories with no bbolt record
+// 4. Empty bucket object directories
 func (gc *GC) RunOnce() {
 	gc.cleanOldTempFiles()
+	gc.cleanupExpiredUploads()
+	gc.sweepOrphanMultipartDirs()
 	gc.cleanEmptyDirs()
+}
+
+// cleanupExpiredUploads reclaims multipart uploads abandoned for longer than
+// multipartMaxAge: the bbolt record is deleted and the on-disk parts under
+// <dataDir>/multipart/<uploadID>/ are removed. Without this, an initiated
+// upload that never completes leaks its parts and its record forever.
+func (gc *GC) cleanupExpiredUploads() {
+	expired, err := gc.db.CleanupExpiredUploads(multipartMaxAge)
+	if err != nil {
+		gc.log.Error("gc: cleanup expired multipart uploads", "err", err)
+		return
+	}
+	if len(expired) == 0 {
+		return
+	}
+	for _, u := range expired {
+		if err := gc.st.CleanupUploadParts(u.UploadID); err != nil {
+			// Best-effort: a leftover dir is picked up by
+			// sweepOrphanMultipartDirs on a later pass.
+			gc.log.Error("gc: remove multipart parts", "upload_id", u.UploadID, "err", err)
+		}
+	}
+	gc.log.Info("gc: reclaimed expired multipart uploads", "count", len(expired))
+}
+
+// sweepOrphanMultipartDirs removes part directories under
+// <dataDir>/multipart/ whose upload has no bbolt record and whose mtime is
+// older than multipartMaxAge. This covers records deleted while the
+// best-effort part cleanup failed (completed/aborted uploads pruned by
+// CleanupExpiredUploads included). The age guard avoids racing an upload
+// whose record is being created concurrently.
+func (gc *GC) sweepOrphanMultipartDirs() {
+	mpDir := filepath.Join(gc.dataDir, "multipart")
+	entries, err := os.ReadDir(mpDir)
+	if err != nil {
+		// Directory may simply not exist yet (no multipart upload ever ran).
+		return
+	}
+
+	cutoff := time.Now().Add(-multipartMaxAge)
+	removed := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if _, err := gc.db.GetMultipartUpload(e.Name()); !errors.Is(err, meta.ErrUploadNotFound) {
+			// Record still exists (or a transient read error) — leave the
+			// parts alone; cleanupExpiredUploads owns registered uploads.
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(mpDir, e.Name())); err != nil {
+			gc.log.Error("gc: remove orphan multipart dir", "upload_id", e.Name(), "err", err)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		gc.log.Info("gc: removed orphan multipart part dirs", "count", removed)
+	}
 }
 
 func (gc *GC) cleanOldTempFiles() {

@@ -213,3 +213,38 @@ func TestTokenMissingAction_Denied(t *testing.T) {
 		t.Fatalf("want ErrAccessDenied, got %v", err)
 	}
 }
+
+func TestPutObject_MaxObjectSize(t *testing.T) {
+	svc, db, tok, bkt := setupTestService(t)
+	ctx := context.Background()
+	svc.SetMaxObjectSize(8)
+
+	if got := svc.MaxObjectSize(); got != 8 {
+		t.Fatalf("MaxObjectSize: want 8, got %d", got)
+	}
+
+	putID := objops.Identity{TokenID: tok.TokenID, AccountID: tok.AccountID, Action: meta.ActionObjectPut}
+
+	// Exactly at the limit is accepted.
+	if _, err := svc.PutObject(ctx, tok, "bkt", "ok.bin", "application/octet-stream",
+		bytes.NewReader([]byte("12345678")), objops.PutOptions{}, putID); err != nil {
+		t.Fatalf("put at limit: %v", err)
+	}
+
+	// One byte over the limit is rejected and leaves no metadata behind.
+	_, err := svc.PutObject(ctx, tok, "bkt", "too-big.bin", "application/octet-stream",
+		bytes.NewReader([]byte("123456789")), objops.PutOptions{}, putID)
+	if !errors.Is(err, objops.ErrObjectTooLarge) {
+		t.Fatalf("want ErrObjectTooLarge, got %v", err)
+	}
+	if _, err := db.GetObjectMeta(bkt.ID, "too-big.bin"); !errors.Is(err, meta.ErrObjectNotFound) {
+		t.Fatalf("oversized object must not be committed, got %v", err)
+	}
+
+	// 0 disables the limit.
+	svc.SetMaxObjectSize(0)
+	if _, err := svc.PutObject(ctx, tok, "bkt", "unlimited.bin", "application/octet-stream",
+		bytes.NewReader(bytes.Repeat([]byte("a"), 1024)), objops.PutOptions{}, putID); err != nil {
+		t.Fatalf("put with limit disabled: %v", err)
+	}
+}

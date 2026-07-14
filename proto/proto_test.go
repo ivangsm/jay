@@ -8,11 +8,14 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
@@ -25,6 +28,7 @@ type testEnv struct {
 	db       *meta.DB
 	store    *store.Store
 	server   *proto.Server
+	dir      string
 	addr     string
 	tokenID  string
 	secret   string
@@ -93,6 +97,7 @@ func setup(t *testing.T) *testEnv {
 		db:       db,
 		store:    st,
 		server:   srv,
+		dir:      dir,
 		addr:     addr,
 		tokenID:  "test-token",
 		secret:   secret,
@@ -557,5 +562,217 @@ func TestMultipartCompleteFailureLeavesUploadRetryable(t *testing.T) {
 	}
 }
 
+// TestUploadPartStoreFailureKeepsConnection forces store.WritePart to fail
+// before it consumes any body byte (parts are staged via os.CreateTemp in
+// <dataDir>/tmp, so a read-only tmp dir fails the create). The handler must
+// drain the unread body before responding, otherwise the next request on the
+// same connection reads body bytes as a frame header and the connection is
+// poisoned.
+func TestUploadPartStoreFailureKeepsConnection(t *testing.T) {
+	env := setup(t)
+	c := dial(t, env)
+
+	if _, err := c.CreateBucket("mpbucket"); err != nil {
+		t.Fatal(err)
+	}
+	uploadID, err := c.CreateMultipartUpload("mpbucket", "image.bin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmpDir := filepath.Join(env.dir, "tmp")
+	if err := os.Chmod(tmpDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(tmpDir, 0o755) })
+
+	body := "payload that must be drained"
+	_, err = c.UploadPart("mpbucket", "image.bin", uploadID, 1, strings.NewReader(body), int64(len(body)))
+	requireClientErrorCode(t, err, "InternalError")
+
+	// Same connection must still be correctly framed.
+	if err := c.Ping(); err != nil {
+		t.Fatalf("connection desynced after store failure: %v", err)
+	}
+
+	// And after the store recovers, the same upload is still usable.
+	if err := os.Chmod(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.UploadPart("mpbucket", "image.bin", uploadID, 1, strings.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("upload after store recovery: %v", err)
+	}
+}
+
+// gatedReader yields first, then runs hook once, then yields rest. It lets a
+// test mutate server state while the server is mid-body inside
+// store.WritePart (blocked waiting for the remaining bytes). first must be
+// larger than the client's 64KB write buffer so the frame header and the
+// leading body bytes actually reach the server before hook runs.
+type gatedReader struct {
+	first    []byte
+	rest     []byte
+	hook     func()
+	hookDone bool
+}
+
+func (g *gatedReader) Read(p []byte) (int, error) {
+	if len(g.first) > 0 {
+		n := copy(p, g.first)
+		g.first = g.first[n:]
+		return n, nil
+	}
+	if !g.hookDone {
+		g.hookDone = true
+		if g.hook != nil {
+			g.hook()
+		}
+	}
+	if len(g.rest) > 0 {
+		n := copy(p, g.rest)
+		g.rest = g.rest[n:]
+		return n, nil
+	}
+	return 0, io.EOF
+}
+
+// TestUploadPartMetaFailureAfterBodyConsumedKeepsConnection exercises
+// drainData against an already-consumed body: the upload record is deleted
+// while the server is mid-way through store.WritePart, so WritePart succeeds
+// (consuming the whole body) and AddMultipartPart fails afterwards. The
+// error path drains a fully-exhausted LimitReader — which must be treated as
+// benign (frame fully consumed), delivering the error response instead of
+// killing the connection.
+func TestUploadPartMetaFailureAfterBodyConsumedKeepsConnection(t *testing.T) {
+	env := setup(t)
+	c := dial(t, env)
+
+	if _, err := c.CreateBucket("mpbucket"); err != nil {
+		t.Fatal(err)
+	}
+	uploadID, err := c.CreateMultipartUpload("mpbucket", "image.bin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 128KB first chunk: overflows the client's 64KB write buffer so the
+	// server is guaranteed to be inside WritePart by the time hook runs.
+	body := &gatedReader{
+		first: bytes.Repeat([]byte("a"), 128*1024),
+		rest:  []byte("second-half"),
+		hook: func() {
+			// Wait until the server is inside WritePart (it stages the part
+			// via a jay-part-*.writing temp file) — that guarantees it
+			// already passed the GetMultipartUpload lookup.
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				matches, _ := filepath.Glob(filepath.Join(env.dir, "tmp", "jay-part-*.writing"))
+				if len(matches) > 0 {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if err := env.db.DeleteMultipartUpload(uploadID); err != nil {
+				t.Errorf("delete upload mid-body: %v", err)
+			}
+		},
+	}
+
+	size := int64(len(body.first) + len(body.rest))
+	_, err = c.UploadPart("mpbucket", "image.bin", uploadID, 1, body, size)
+	requireClientErrorCode(t, err, "InternalError")
+
+	// The error response was delivered and the connection stays usable.
+	if err := c.Ping(); err != nil {
+		t.Fatalf("connection desynced after meta failure: %v", err)
+	}
+}
+
+// TestShutdownWithHungConnection verifies Shutdown force-closes connections
+// that don't drain on their own. The idle client connection sits blocked in
+// ReadHeader under the 60s idle deadline; Shutdown must not wait for it.
+func TestShutdownWithHungConnection(t *testing.T) {
+	env := setup(t)
+	c := dial(t, env)
+
+	if err := c.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := env.shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("shutdown took %v, want <10s", elapsed)
+	}
+}
+
 // Ensure json package is used (for test compilation)
 var _ = json.Marshal
+
+// --- wire limits ------------------------------------------------------------
+
+// Strings are length-prefixed with a uint16. Anything longer than 64 KiB used
+// to wrap silently and corrupt the frame; it must now surface an error.
+func TestEncoder_StringTooLarge(t *testing.T) {
+	huge := strings.Repeat("k", math.MaxUint16+1)
+
+	if _, err := proto.EncodeBucketKey("bucket", huge); !errors.Is(err, proto.ErrFieldTooLarge) {
+		t.Errorf("proto.EncodeBucketKey with oversized key: got %v, want proto.ErrFieldTooLarge", err)
+	}
+	if _, err := proto.EncodePutObjectRequest("bucket", "key", "text/plain", map[string]string{"x": huge}); !errors.Is(err, proto.ErrFieldTooLarge) {
+		t.Errorf("proto.EncodePutObjectRequest with oversized metadata value: got %v, want proto.ErrFieldTooLarge", err)
+	}
+	if _, err := proto.EncodeObjectInfo("text/plain", 1, "etag", "sum", "now", map[string]string{"x": huge}); !errors.Is(err, proto.ErrFieldTooLarge) {
+		t.Errorf("proto.EncodeObjectInfo with oversized metadata value: got %v, want proto.ErrFieldTooLarge", err)
+	}
+}
+
+// Collections are count-prefixed with a uint16.
+func TestEncoder_CollectionTooLarge(t *testing.T) {
+	parts := make([]int, math.MaxUint16+1)
+	if _, err := proto.EncodeCompleteMultipartRequest("bucket", "key", "upload", parts); !errors.Is(err, proto.ErrFieldTooLarge) {
+		t.Errorf("proto.EncodeCompleteMultipartRequest with %d parts: got %v, want proto.ErrFieldTooLarge", len(parts), err)
+	}
+
+	md := make(map[string]string, math.MaxUint16+1)
+	for i := range math.MaxUint16 + 1 {
+		md[strconv.Itoa(i)] = "v"
+	}
+	if _, err := proto.EncodePutObjectRequest("bucket", "key", "", md); !errors.Is(err, proto.ErrFieldTooLarge) {
+		t.Errorf("proto.EncodePutObjectRequest with %d metadata entries: got %v, want proto.ErrFieldTooLarge", len(md), err)
+	}
+}
+
+// A value exactly at the limit must still encode and round-trip.
+func TestEncoder_StringAtLimit(t *testing.T) {
+	atLimit := strings.Repeat("k", math.MaxUint16)
+	buf, err := proto.EncodeBucketKey("bucket", atLimit)
+	if err != nil {
+		t.Fatalf("proto.EncodeBucketKey at limit: %v", err)
+	}
+	bucket, key, err := proto.DecodeBucketKey(buf)
+	if err != nil {
+		t.Fatalf("proto.DecodeBucketKey: %v", err)
+	}
+	if bucket != "bucket" || key != atLimit {
+		t.Errorf("round-trip mismatch: bucket=%q len(key)=%d", bucket, len(key))
+	}
+}
+
+// EncodeError never fails — it clamps instead, so the server can always report
+// an error (including one caused by an oversized field).
+func TestEncodeError_TruncatesInsteadOfCorrupting(t *testing.T) {
+	huge := strings.Repeat("m", math.MaxUint16+10)
+	msg, code, err := proto.DecodeError(proto.EncodeError(huge, "InternalError"))
+	if err != nil {
+		t.Fatalf("proto.DecodeError: %v", err)
+	}
+	if len(msg) != math.MaxUint16 {
+		t.Errorf("message len: got %d, want %d", len(msg), math.MaxUint16)
+	}
+	if code != "InternalError" {
+		t.Errorf("code: got %q, want InternalError", code)
+	}
+}

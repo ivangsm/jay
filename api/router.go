@@ -22,7 +22,8 @@ type Handler struct {
 	log               *slog.Logger
 	metrics           *maintenance.Metrics
 	signingSecret     string
-	rateLimiter       *ratelimit.Limiter
+	rateLimiter       *ratelimit.Limiter // per-token, post-auth
+	ipRateLimiter     *ratelimit.Limiter // per-source-IP, pre-auth (see withIPRateLimit)
 	objops            *objops.Service
 	trustProxyHeaders bool
 }
@@ -35,9 +36,13 @@ type Handler struct {
 // is kept as a setter (not an extra NewHandler arg) so main.go's existing
 // NewHandler call site does not need to be modified by this refactor agent.
 func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, signingSecret string, rlCfg *RateLimiterConfig) *Handler {
-	var rl *ratelimit.Limiter
+	var rl, ipRL *ratelimit.Limiter
 	if rlCfg != nil && rlCfg.Rate > 0 {
 		rl = newRateLimiter(*rlCfg)
+		// Separate bucket set, same configured rate/burst. Keeping them
+		// separate is what lets the IP limiter run before authentication
+		// without stealing tokens from the per-token quota.
+		ipRL = newRateLimiter(*rlCfg)
 	}
 	return &Handler{
 		db:            db,
@@ -47,6 +52,7 @@ func NewHandler(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, m
 		metrics:       metrics,
 		signingSecret: signingSecret,
 		rateLimiter:   rl,
+		ipRateLimiter: ipRL,
 		objops:        objops.New(db, st, log),
 	}
 }
@@ -60,9 +66,22 @@ func (h *Handler) SetTrustProxyHeaders(v bool) {
 	h.trustProxyHeaders = v
 }
 
+// SetMaxObjectSize caps the size of a single PUT body (and of each multipart
+// part). 0 means unlimited. Wired from cfg.MaxObjectSize in main.go; the
+// native proto server owns a separate objops.Service and must be configured
+// through its own setter.
+func (h *Handler) SetMaxObjectSize(n int64) {
+	h.objops.SetMaxObjectSize(n)
+}
+
 // ServeHTTP dispatches S3 requests based on path and method.
+//
+// Middleware order matters: withIPRateLimit runs BEFORE any authentication so
+// that bcrypt/SigV4 verification is never reached by a source that is already
+// over its budget (see withIPRateLimit). withRateLimit then applies the
+// per-token quota once the caller is known.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	handler := h.withLogging(h.withPresigned(h.withRequestIDAndAuth(h.withRateLimit(h.dispatch))))
+	handler := h.withLogging(h.withIPRateLimit(h.withPresigned(h.withRequestIDAndAuth(h.withRateLimit(h.dispatch)))))
 	handler(w, r)
 }
 

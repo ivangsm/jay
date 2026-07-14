@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"time"
@@ -67,6 +68,13 @@ func LoadConfigFromSources(yamlPath string, log *slog.Logger) (Config, error) {
 	//    value.
 	applyEnvOverlay(&cfg, yamlMap, log)
 
+	// 4. Resolve derived defaults. BackupDir defaults to <DataDir>/backups,
+	//    which must be computed AFTER overlays so an overridden DataDir moves
+	//    the default backup location with it.
+	if cfg.BackupDir == "" {
+		cfg.BackupDir = filepath.Join(cfg.DataDir, "backups")
+	}
+
 	return cfg, nil
 }
 
@@ -83,9 +91,12 @@ func defaultConfig() Config {
 		RateLimit:        100,
 		RateBurst:        200,
 		ScrubInterval:    6 * time.Hour,
-		ScrubSampleRate:  0.1,
 		ScrubBytesPerSec: int64(50 << 20),
 		ScrubMaxPerRun:   100,
+		// BackupDir is left empty here; LoadConfigFromSources resolves it to
+		// <DataDir>/backups after all overlays are applied.
+		MinFreeBytes:  int64(500 << 20), // 500 MiB
+		MaxObjectSize: int64(5 << 30),   // 5 GiB
 	}
 }
 
@@ -108,9 +119,12 @@ func bindings() []yamlKeyBinding {
 		bindBool("trust_proxy_headers", "JAY_TRUST_PROXY_HEADERS", func(c *Config) *bool { return &c.TrustProxyHeaders }),
 
 		bindScrubIntervalHours(),
-		bindScrubSampleRate(),
 		bindScrubBytesPerSec(),
 		bindScrubMaxPerRun(),
+
+		bindString("backup.dir", "JAY_BACKUP_DIR", func(c *Config) *string { return &c.BackupDir }),
+		bindMinFreeBytes(),
+		bindMaxObjectSize(),
 
 		bindString("seed_token.account", "JAY_SEED_TOKEN_ACCOUNT", func(c *Config) *string { return &c.SeedTokenAccount }),
 		bindString("seed_token.id", "JAY_SEED_TOKEN_ID", func(c *Config) *string { return &c.SeedTokenID }),
@@ -281,35 +295,6 @@ func bindScrubIntervalHours() yamlKeyBinding {
 	}
 }
 
-func bindScrubSampleRate() yamlKeyBinding {
-	const env = "JAY_SCRUB_SAMPLE_RATE"
-	return yamlKeyBinding{
-		path:   "scrub.sample_rate",
-		envVar: env,
-		applyYAML: func(cfg *Config, raw any, log *slog.Logger) (string, bool, error) {
-			f, err := toFloat64(raw)
-			if err != nil {
-				return "", false, err
-			}
-			if f <= 0 || f > 1.0 {
-				log.Error("invalid scrub.sample_rate in YAML (must be in (0.0, 1.0]), ignoring", "value", f)
-				return "", false, nil
-			}
-			cfg.ScrubSampleRate = f
-			return strconv.FormatFloat(f, 'f', -1, 64), true, nil
-		},
-		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
-			parsed, err := strconv.ParseFloat(value, 64)
-			if err != nil || parsed <= 0 || parsed > 1.0 {
-				log.Error("invalid "+env+" (must be in (0.0, 1.0]), keeping previous value", "value", value, "err", err)
-				return true
-			}
-			cfg.ScrubSampleRate = parsed
-			return true
-		},
-	}
-}
-
 func bindScrubBytesPerSec() yamlKeyBinding {
 	const env = "JAY_SCRUB_BYTES_PER_SEC"
 	return yamlKeyBinding{
@@ -359,6 +344,66 @@ func bindScrubMaxPerRun() yamlKeyBinding {
 				return true
 			}
 			cfg.ScrubMaxPerRun = parsed
+			return true
+		},
+	}
+}
+
+func bindMinFreeBytes() yamlKeyBinding {
+	const env = "JAY_MIN_FREE_BYTES"
+	return yamlKeyBinding{
+		path:   "min_free_bytes",
+		envVar: env,
+		applyYAML: func(cfg *Config, raw any, log *slog.Logger) (string, bool, error) {
+			n, err := toInt64(raw)
+			if err != nil {
+				return "", false, err
+			}
+			if n < 0 {
+				log.Error("invalid min_free_bytes in YAML (must be >= 0), ignoring", "value", n)
+				return "", false, nil
+			}
+			cfg.MinFreeBytes = n
+			return strconv.FormatInt(n, 10), true, nil
+		},
+		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || parsed < 0 {
+				log.Error("invalid "+env+" (must be >= 0), keeping previous value", "value", value, "err", err)
+				return true
+			}
+			cfg.MinFreeBytes = parsed
+			return true
+		},
+	}
+}
+
+// bindMaxObjectSize binds the maximum accepted object size (in bytes). 0 means
+// unlimited; negative values are invalid and are ignored (previous value kept).
+func bindMaxObjectSize() yamlKeyBinding {
+	const env = "JAY_MAX_OBJECT_SIZE"
+	return yamlKeyBinding{
+		path:   "max_object_size",
+		envVar: env,
+		applyYAML: func(cfg *Config, raw any, log *slog.Logger) (string, bool, error) {
+			n, err := toInt64(raw)
+			if err != nil {
+				return "", false, err
+			}
+			if n < 0 {
+				log.Error("invalid max_object_size in YAML (must be >= 0), ignoring", "value", n)
+				return "", false, nil
+			}
+			cfg.MaxObjectSize = n
+			return strconv.FormatInt(n, 10), true, nil
+		},
+		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || parsed < 0 {
+				log.Error("invalid "+env+" (must be >= 0), keeping previous value", "value", value, "err", err)
+				return true
+			}
+			cfg.MaxObjectSize = parsed
 			return true
 		},
 	}
@@ -523,4 +568,3 @@ func stringify(raw any) string {
 		return fmt.Sprintf("%v", v)
 	}
 }
-

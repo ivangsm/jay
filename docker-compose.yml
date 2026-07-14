@@ -18,7 +18,7 @@ services:
       JAY_SEED_TOKEN_ID: ${JAY_SEED_TOKEN_ID}
       JAY_SEED_TOKEN_SECRET: ${JAY_SEED_TOKEN_SECRET}
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4011/health/ready"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9001/health/ready"]
       interval: 10s
       timeout: 5s
       retries: 3

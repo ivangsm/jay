@@ -2,7 +2,6 @@ package maintenance
 
 import (
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -28,9 +27,11 @@ func NewBackupManager(db *meta.DB, backupDir string, log *slog.Logger) *BackupMa
 	return &BackupManager{db: db, backupDir: backupDir, log: log}
 }
 
-// Run creates a consistent snapshot of the bbolt database.
+// Run creates a consistent snapshot of the bbolt database and verifies it.
 // It uses the shared meta.DB handle's Backup method which runs inside a
-// read transaction — no second bolt handle is opened.
+// read transaction — no second bolt handle is opened. A snapshot that fails
+// verification is deleted and reported as an error: a backup that cannot be
+// restored is worse than no backup, because it silently satisfies retention.
 func (bm *BackupManager) Run() (string, error) {
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	backupPath := filepath.Join(bm.backupDir, fmt.Sprintf("jay-%s.db", ts))
@@ -54,8 +55,27 @@ func (bm *BackupManager) Run() (string, error) {
 		return "", fmt.Errorf("backup: close: %w", err)
 	}
 
-	bm.log.Info("backup completed", "path", backupPath)
+	if err := bm.verifyAndCleanup(backupPath); err != nil {
+		return "", err
+	}
+
+	bm.log.Info("backup completed and verified", "path", backupPath)
 	return backupPath, nil
+}
+
+// verifyAndCleanup runs Verify on a freshly written backup. On failure the
+// corrupt file is removed so it can never be mistaken for a restorable
+// snapshot, and the error is both logged and returned.
+func (bm *BackupManager) verifyAndCleanup(backupPath string) error {
+	if _, err := bm.Verify(backupPath); err != nil {
+		bm.log.Error("backup verification failed, removing corrupt backup",
+			"path", backupPath, "err", err)
+		if rmErr := os.Remove(backupPath); rmErr != nil {
+			bm.log.Error("failed to remove corrupt backup", "path", backupPath, "err", rmErr)
+		}
+		return fmt.Errorf("backup: verify: %w", err)
+	}
+	return nil
 }
 
 // Verify opens a backup file and checks that the required bbolt buckets exist
@@ -182,10 +202,4 @@ func (bm *BackupManager) Prune(retention time.Duration, minKeep int) (int, error
 	}
 
 	return removed, nil
-}
-
-// BackupToWriter writes a consistent bbolt snapshot to the given writer.
-// Useful for streaming backups over HTTP.
-func (bm *BackupManager) BackupToWriter(w io.Writer) error {
-	return bm.db.Backup(w)
 }

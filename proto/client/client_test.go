@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
@@ -10,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/maintenance"
@@ -1010,6 +1013,256 @@ func TestGetObject_CloseIdempotent(t *testing.T) {
 	}
 	// Second close should be safe (closed=true guard)
 	if err := result.Body.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// --- Pool timeouts, idle discard and retry ---
+
+// fakeServer speaks only the handshake portion of the protocol so tests can
+// control connection lifecycle (close, hang, serve) per accepted connection.
+type fakeServer struct {
+	ln      net.Listener
+	accepts atomic.Int32
+}
+
+func (f *fakeServer) addr() string { return f.ln.Addr().String() }
+
+// startFakeServer accepts connections, performs the handshake (any
+// credentials succeed), then hands the connection to handler. The handler
+// receives the zero-based index of the connection.
+func startFakeServer(t *testing.T, handler func(i int32, nc net.Conn, br *bufio.Reader, bw *bufio.Writer)) *fakeServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := &fakeServer{ln: ln}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			nc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			i := fs.accepts.Add(1) - 1
+			go func() {
+				br := bufio.NewReader(nc)
+				bw := bufio.NewWriter(nc)
+				if _, err := proto.ReadHandshake(br); err != nil {
+					_ = nc.Close()
+					return
+				}
+				if err := proto.WriteHandshakeResponse(bw, proto.HandshakeOK); err != nil {
+					_ = nc.Close()
+					return
+				}
+				if err := bw.Flush(); err != nil {
+					_ = nc.Close()
+					return
+				}
+				handler(i, nc, br, bw)
+			}()
+		}
+	}()
+	return fs
+}
+
+// serveRequests answers every incoming frame with StatusOK and no metadata.
+func serveRequests(nc net.Conn, br *bufio.Reader, bw *bufio.Writer) {
+	defer func() { _ = nc.Close() }()
+	for {
+		_, streamID, metaLen, dataLen, err := proto.ReadHeader(br)
+		if err != nil {
+			return
+		}
+		if metaLen > 0 {
+			if _, err := io.CopyN(io.Discard, br, int64(metaLen)); err != nil {
+				return
+			}
+		}
+		if dataLen > 0 {
+			if _, err := io.CopyN(io.Discard, br, dataLen); err != nil {
+				return
+			}
+		}
+		if err := proto.WriteFrameCombined(bw, proto.StatusOK, streamID, nil); err != nil {
+			return
+		}
+		if err := bw.Flush(); err != nil {
+			return
+		}
+	}
+}
+
+func TestDoRequest_RetriesOnDeadPooledConn(t *testing.T) {
+	firstClosed := make(chan struct{})
+	fs := startFakeServer(t, func(i int32, nc net.Conn, br *bufio.Reader, bw *bufio.Writer) {
+		if i == 0 {
+			// First connection: handshake, then die. Simulates the server's
+			// idle timeout closing a connection while it sits in the pool.
+			_ = nc.Close()
+			close(firstClosed)
+			return
+		}
+		serveRequests(nc, br, bw)
+	})
+
+	c, err := Dial(fs.addr(), "tok", "sec", 2)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	<-firstClosed
+
+	// The pooled connection is dead; Ping must succeed via a transparent
+	// single retry on a fresh connection.
+	if err := c.Ping(); err != nil {
+		t.Fatalf("expected transparent retry, got: %v", err)
+	}
+	if got := fs.accepts.Load(); got != 2 {
+		t.Fatalf("expected 2 connections (initial + retry), got %d", got)
+	}
+}
+
+func TestDoRequestWithData_NoRetryOnDeadPooledConn(t *testing.T) {
+	firstClosed := make(chan struct{})
+	fs := startFakeServer(t, func(i int32, nc net.Conn, br *bufio.Reader, bw *bufio.Writer) {
+		_ = nc.Close()
+		if i == 0 {
+			close(firstClosed)
+		}
+	})
+
+	c, err := Dial(fs.addr(), "tok", "sec", 1)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	<-firstClosed
+
+	// Upload paths must NOT retry: the body reader may be partially consumed.
+	data := "payload"
+	_, err = c.PutObject("bucket", "key", strings.NewReader(data), int64(len(data)), nil)
+	if err == nil {
+		t.Fatal("expected error from PutObject on dead connection")
+	}
+	if got := fs.accepts.Load(); got != 1 {
+		t.Fatalf("expected no retry dial for upload, got %d connections", got)
+	}
+}
+
+func TestGetConn_DiscardsIdleConnection(t *testing.T) {
+	fs := startFakeServer(t, func(i int32, nc net.Conn, br *bufio.Reader, bw *bufio.Writer) {
+		serveRequests(nc, br, bw)
+	})
+
+	c, err := Dial(fs.addr(), "tok", "sec", 2)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Backdate the pooled connection past the idle threshold.
+	stale := <-c.pool
+	stale.lastUsed = time.Now().Add(-maxConnIdle - time.Second)
+	c.pool <- stale
+
+	got, pooled, err := c.getConn()
+	if err != nil {
+		t.Fatalf("getConn: %v", err)
+	}
+	defer c.putConn(got)
+
+	if got == stale {
+		t.Fatal("stale connection must not be reused")
+	}
+	if pooled {
+		t.Fatal("replacement connection must be reported as fresh, not pooled")
+	}
+	if n := fs.accepts.Load(); n != 2 {
+		t.Fatalf("expected a new dial after discarding stale conn, got %d connections", n)
+	}
+	// The stale connection's socket must actually be closed.
+	if err := stale.nc.SetDeadline(time.Now()); err == nil {
+		t.Fatal("expected stale connection to be closed")
+	}
+}
+
+func TestGetConn_ReusesFreshConnection(t *testing.T) {
+	fs := startFakeServer(t, func(i int32, nc net.Conn, br *bufio.Reader, bw *bufio.Writer) {
+		serveRequests(nc, br, bw)
+	})
+
+	c, err := Dial(fs.addr(), "tok", "sec", 2)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	fresh := <-c.pool
+	c.pool <- fresh
+
+	got, pooled, err := c.getConn()
+	if err != nil {
+		t.Fatalf("getConn: %v", err)
+	}
+	defer c.putConn(got)
+
+	if got != fresh {
+		t.Fatal("recently used connection must be reused")
+	}
+	if !pooled {
+		t.Fatal("reused connection must be reported as pooled")
+	}
+	if n := fs.accepts.Load(); n != 1 {
+		t.Fatalf("expected no extra dial, got %d connections", n)
+	}
+}
+
+func TestOpTimeout_Scaling(t *testing.T) {
+	// No payload: floor applies.
+	if got := opTimeout(0); got != minOpTimeout {
+		t.Fatalf("opTimeout(0) = %v, want %v", got, minOpTimeout)
+	}
+	// Small payload still under the floor.
+	if got := opTimeout(1024); got != minOpTimeout {
+		t.Fatalf("opTimeout(1KB) = %v, want %v", got, minOpTimeout)
+	}
+	// Large payload scales at opBytesPerSec plus slack.
+	size := int64(100 << 20) // 100 MB
+	want := 100*time.Second + opTimeoutSlack
+	if got := opTimeout(size); got != want {
+		t.Fatalf("opTimeout(100MB) = %v, want %v", got, want)
+	}
+}
+
+func TestTimeoutConstants_Sane(t *testing.T) {
+	if dialTimeout <= 0 {
+		t.Fatal("dialTimeout must be positive")
+	}
+	// The server closes idle connections after 60s (proto/server.go
+	// idleTimeout); the pool must discard strictly earlier to avoid handing
+	// out connections the server is about to (or already did) close.
+	if maxConnIdle >= 60*time.Second {
+		t.Fatalf("maxConnIdle (%v) must stay below the server's 60s idle timeout", maxConnIdle)
+	}
+}
+
+func TestClose_Twice(t *testing.T) {
+	env := setup(t)
+
+	c, err := Dial(env.addr, env.tokenID, env.secret, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := c.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
 }

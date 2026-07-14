@@ -1,13 +1,16 @@
 package auth
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -81,16 +84,71 @@ func (a *Auth) AuthenticateSigV4(r *http.Request) (*meta.Token, error) {
 		return nil, ErrInvalidCredentials
 	}
 
-	// Verify account
-	account, err := a.db.GetAccount(token.AccountID)
-	if err != nil {
-		return nil, ErrInvalidCredentials
+	// The signature only covers the *declared* payload hash. Without checking
+	// that the body actually hashes to it, anyone replaying a captured request
+	// (or a MITM) could swap the body and keep the signature valid. Done after
+	// the signature check so an unauthenticated caller can never make us buffer
+	// a body.
+	if err := verifyPayloadHash(r, r.Header.Get("x-amz-content-sha256")); err != nil {
+		return nil, err
 	}
-	if account.Status != "active" {
-		return nil, ErrAccessDenied
+
+	// Verify account
+	if err := a.checkAccountActive(token.AccountID); err != nil {
+		return nil, err
 	}
 
 	return token, nil
+}
+
+// maxSignedPayloadSize bounds how much request body we are willing to buffer in
+// order to verify x-amz-content-sha256. Signing a payload requires hashing it
+// end-to-end anyway, so real S3 clients switch to UNSIGNED-PAYLOAD or
+// STREAMING-AWS4-HMAC-SHA256-PAYLOAD well below this. A request that declares a
+// signed payload larger than this is rejected rather than buffered.
+const maxSignedPayloadSize = 32 << 20 // 32 MiB
+
+// verifyPayloadHash checks that the request body actually hashes to the value
+// declared in x-amz-content-sha256, and leaves the body readable by handlers.
+//
+// Skipped for UNSIGNED-PAYLOAD, the STREAMING-* variants (chunk signatures
+// carry their own integrity) and an absent header, which the canonical request
+// already treats as UNSIGNED-PAYLOAD.
+func verifyPayloadHash(r *http.Request, declared string) error {
+	if declared == "" || declared == "UNSIGNED-PAYLOAD" || strings.HasPrefix(declared, "STREAMING-") {
+		return nil
+	}
+
+	if r.ContentLength > maxSignedPayloadSize {
+		return fmt.Errorf("%w: signed payload exceeds %d bytes, use UNSIGNED-PAYLOAD or streaming",
+			ErrInvalidCredentials, maxSignedPayloadSize)
+	}
+
+	var body []byte
+	if r.Body != nil {
+		var err error
+		// +1 so an over-sized body with an unknown/lying Content-Length is
+		// detected instead of being silently truncated (and hashed wrong).
+		body, err = io.ReadAll(io.LimitReader(r.Body, maxSignedPayloadSize+1))
+		if err != nil {
+			return ErrInvalidCredentials
+		}
+		if len(body) > maxSignedPayloadSize {
+			return fmt.Errorf("%w: signed payload exceeds %d bytes, use UNSIGNED-PAYLOAD or streaming",
+				ErrInvalidCredentials, maxSignedPayloadSize)
+		}
+	}
+
+	// Hand the buffered body back to the handler chain.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+
+	sum := sha256.Sum256(body)
+	actual := hex.EncodeToString(sum[:])
+	if subtle.ConstantTimeCompare([]byte(actual), []byte(strings.ToLower(declared))) != 1 {
+		return fmt.Errorf("%w: payload hash mismatch", ErrInvalidCredentials)
+	}
+	return nil
 }
 
 func parseSigV4Header(header string) map[string]string {
@@ -132,8 +190,9 @@ func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
 		uri = "/"
 	}
 
-	// Canonical query string
-	queryString := r.URL.RawQuery
+	// Canonical query string — SigV4 requires it normalised (sorted, RFC 3986
+	// percent-encoded), not the raw string as it arrived on the wire.
+	queryString := canonicalQueryString(r.URL.RawQuery)
 
 	// Canonical headers — header names must be lowercased per SigV4 spec.
 	headerNames := strings.Split(signedHeaders, ";")
@@ -164,6 +223,78 @@ func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
 
 	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
 		method, uri, queryString, canonHeaders.String(), signedHeadersLower, payloadHash)
+}
+
+// canonicalQueryString normalises a raw query string per the SigV4 spec:
+// each parameter name and value is percent-encoded with RFC 3986 rules
+// (unreserved characters kept, everything else %XX, uppercase hex), the pairs
+// are sorted by encoded name and then by encoded value, and joined with "&".
+// Parameters with no value are signed as "name=".
+func canonicalQueryString(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+
+	type pair struct{ key, val string }
+	var pairs []pair
+
+	for part := range strings.SplitSeq(rawQuery, "&") {
+		if part == "" {
+			continue
+		}
+		rawKey, rawVal, _ := strings.Cut(part, "=")
+		// Decode first: the client may have used a different (but equivalent)
+		// encoding than the one SigV4 mandates.
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			key = rawKey
+		}
+		val, err := url.QueryUnescape(rawVal)
+		if err != nil {
+			val = rawVal
+		}
+		pairs = append(pairs, pair{key: rfc3986Escape(key), val: rfc3986Escape(val)})
+	}
+
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].key != pairs[j].key {
+			return pairs[i].key < pairs[j].key
+		}
+		return pairs[i].val < pairs[j].val
+	})
+
+	var b strings.Builder
+	for i, p := range pairs {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(p.key)
+		b.WriteByte('=')
+		b.WriteString(p.val)
+	}
+	return b.String()
+}
+
+// rfc3986Escape percent-encodes s per RFC 3986: A-Z a-z 0-9 - _ . ~ are left
+// as-is, every other byte becomes %XX with uppercase hex. Unlike
+// url.QueryEscape it does NOT encode spaces as "+".
+func rfc3986Escape(s string) string {
+	const upperhex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := range len(s) {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.', c == '~':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(upperhex[c>>4])
+			b.WriteByte(upperhex[c&0x0f])
+		}
+	}
+	return b.String()
 }
 
 func buildStringToSign(dateStr, amzDate, region, canonicalRequest string) string {

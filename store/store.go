@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ivangsm/jay/meta"
 	"golang.org/x/time/rate"
@@ -193,14 +194,39 @@ func (s *Store) DeleteObject(locationRef string) error {
 }
 
 // Quarantine moves a file from its location to the quarantine directory.
+//
+// The destination name is derived from the FULL locationRef (path separators
+// flattened) plus a nanosecond suffix, not from its basename: multipart parts
+// are named "part-00001" under every upload, so a basename-only destination
+// would silently clobber a previously quarantined part from another upload.
+// The quarantine directory is fsync'd after the rename so the entry survives
+// a crash — quarantined files are forensic evidence of corruption.
 func (s *Store) Quarantine(locationRef string) error {
 	src, err := s.SafePath(locationRef)
 	if err != nil {
 		return err
 	}
-	dst := filepath.Join(s.dataDir, "quarantine", filepath.Base(locationRef))
+	qdir := filepath.Join(s.dataDir, "quarantine")
+	if err := os.MkdirAll(qdir, 0o755); err != nil {
+		return fmt.Errorf("store: quarantine: create dir: %w", err)
+	}
+
+	flat := strings.ReplaceAll(filepath.ToSlash(filepath.Clean(locationRef)), "/", "_")
+	dst := filepath.Join(qdir, fmt.Sprintf("%s.%d", flat, time.Now().UnixNano()))
+	// Nanosecond timestamps can still collide under a parallel scrub; probe
+	// for a free name rather than overwrite existing evidence.
+	for i := 1; ; i++ {
+		if _, statErr := os.Lstat(dst); os.IsNotExist(statErr) {
+			break
+		}
+		dst = filepath.Join(qdir, fmt.Sprintf("%s.%d-%d", flat, time.Now().UnixNano(), i))
+	}
+
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("store: quarantine: %w", err)
+	}
+	if err := fsyncDir(qdir); err != nil {
+		return fmt.Errorf("store: quarantine: fsync dir: %w", err)
 	}
 	return nil
 }

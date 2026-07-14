@@ -71,7 +71,8 @@ func (h *connHandler) handleCreateMultipartUpload(req *request) error {
 	}
 
 	// Encode uploadID as a simple string
-	return h.writeResponseCombined(StatusOK, req.streamID, EncodeBucket(upload.UploadID))
+	resp, encErr := EncodeBucket(upload.UploadID)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }
 
 func (h *connHandler) handleUploadPart(req *request) error {
@@ -132,6 +133,12 @@ func (h *connHandler) handleUploadPart(req *request) error {
 	checksum, size, locationRef, err := h.store.WritePart(uploadID, partNumber, body)
 	if err != nil {
 		h.log.Error("write part", "err", err)
+		// WritePart may have failed before or mid-way through consuming the
+		// body. Drain the remainder so the next ReadHeader on this
+		// connection doesn't read leftover body bytes as a frame header.
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		return h.writeError(StatusInternal, req.streamID, "failed to write part", "InternalError")
 	}
 
@@ -149,10 +156,16 @@ func (h *connHandler) handleUploadPart(req *request) error {
 	if err := h.db.AddMultipartPart(uploadID, part); err != nil {
 		h.store.Cleanup(locationRef)
 		h.log.Error("add part meta", "err", err)
+		// The body was fully consumed by WritePart at this point; drain
+		// defensively anyway — drainData treats an exhausted body as a no-op.
+		if derr := drainData(req); derr != nil {
+			return derr
+		}
 		return h.writeError(StatusInternal, req.streamID, "failed to register part", "InternalError")
 	}
 
-	return h.writeResponseCombined(StatusOK, req.streamID, EncodePutResponse(etag, checksum))
+	resp, encErr := EncodePutResponse(etag, checksum)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }
 
 func (h *connHandler) handleCompleteMultipart(req *request) error {
@@ -232,8 +245,16 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 	}
 
 	if err := h.db.MarkMultipartUploadCompleted(uploadID); err != nil {
-		h.log.Error("mark multipart completed", "err", err, "upload_id", uploadID)
-		return h.writeError(StatusInternal, req.streamID, "failed to finalize upload", "InternalError")
+		// The object is already durably committed above, so a concurrent
+		// Complete that got here first (upload no longer "initiated") must not
+		// turn into an error for this caller — Complete is idempotent past the
+		// metadata commit. Mirrors the HTTP handler.
+		if errors.Is(err, meta.ErrUploadNotActive) || errors.Is(err, meta.ErrUploadNotFound) {
+			h.log.Warn("multipart already finalized by a concurrent complete", "upload_id", uploadID)
+		} else {
+			h.log.Error("mark multipart completed", "err", err, "upload_id", uploadID)
+			return h.writeError(StatusInternal, req.streamID, "failed to finalize upload", "InternalError")
+		}
 	}
 
 	if err := h.store.CleanupUploadParts(uploadID); err != nil {
@@ -243,7 +264,8 @@ func (h *connHandler) handleCompleteMultipart(req *request) error {
 		h.log.Warn("delete multipart upload record", "err", err, "upload_id", uploadID)
 	}
 
-	return h.writeResponseCombined(StatusOK, req.streamID, EncodeCompleteMultipartResponse(etag, checksum, size))
+	resp, encErr := EncodeCompleteMultipartResponse(etag, checksum, size)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }
 
 func (h *connHandler) handleAbortMultipart(req *request) error {
@@ -276,7 +298,9 @@ func (h *connHandler) handleAbortMultipart(req *request) error {
 
 	upload, err := h.db.AbortMultipartUpload(uploadID)
 	if err != nil {
-		if errors.Is(err, meta.ErrUploadNotFound) {
+		// A completed/aborted upload is no longer an active upload, so S3
+		// semantics say NoSuchUpload rather than an internal error.
+		if errors.Is(err, meta.ErrUploadNotFound) || errors.Is(err, meta.ErrUploadNotActive) {
 			return h.writeError(StatusNotFound, req.streamID, "upload not found", "NoSuchUpload")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
@@ -322,7 +346,8 @@ func (h *connHandler) handleListParts(req *request) error {
 		}
 	}
 
-	return h.writeResponseCombined(StatusOK, req.streamID, EncodeListPartsResponse(entries))
+	resp, encErr := EncodeListPartsResponse(entries)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }
 
 func computeMultipartETag(parts []meta.MultipartPart) string {

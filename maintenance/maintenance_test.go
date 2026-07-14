@@ -40,6 +40,23 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// testGC returns a GC rooted at dir, backed by a fresh meta DB + store living
+// in a separate temp dir. Suitable for tests that only exercise the tmp-file
+// GC paths, where the multipart/db wiring just needs to be valid.
+func testGC(t *testing.T, dir string, interval time.Duration) *GC {
+	t.Helper()
+	db, st := openTestDB(t)
+	return NewGC(dir, db, st, discardLogger(), interval)
+}
+
+// testGCWithStore returns a GC whose dataDir, meta DB and store all share the
+// same root, for tests that exercise the multipart cleanup paths.
+func testGCWithStore(t *testing.T, interval time.Duration) (*GC, *meta.DB, *store.Store) {
+	t.Helper()
+	db, st := openTestDB(t)
+	return NewGC(st.DataDir(), db, st, discardLogger(), interval), db, st
+}
+
 // sha256Hex returns the hex-encoded SHA-256 of b.
 func sha256Hex(b []byte) string {
 	h := sha256.Sum256(b)
@@ -77,174 +94,6 @@ func createTestBucketAndObject(t *testing.T, db *meta.DB, content []byte) (bucke
 		t.Fatalf("QuarantineObject: %v", err)
 	}
 	return bucketID, key
-}
-
-// ── ReadVerifier ──────────────────────────────────────────────────────────────
-
-func TestReadVerifier_HappyPath(t *testing.T) {
-	content := []byte("hello, jay!")
-	expected := sha256Hex(content)
-
-	rv := NewReadVerifier(bytes.NewReader(content), expected)
-
-	got, err := io.ReadAll(rv)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if !bytes.Equal(got, content) {
-		t.Fatalf("content mismatch: got %q want %q", got, content)
-	}
-	if !rv.Valid() {
-		t.Error("Valid() should be true for correct checksum")
-	}
-}
-
-func TestReadVerifier_Corrupted(t *testing.T) {
-	content := []byte("hello, jay!")
-	wrong := strings.Repeat("0", 64) // 32 zero bytes in hex
-
-	rv := NewReadVerifier(bytes.NewReader(content), wrong)
-	if _, err := io.ReadAll(rv); err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if rv.Valid() {
-		t.Error("Valid() should be false for wrong checksum")
-	}
-}
-
-func TestReadVerifier_ValidBeforeEOF(t *testing.T) {
-	content := []byte("partial read test")
-	expected := sha256Hex(content)
-
-	rv := NewReadVerifier(bytes.NewReader(content), expected)
-
-	// Read only the first byte — not at EOF yet.
-	buf := make([]byte, 1)
-	if _, err := rv.Read(buf); err != nil && err != io.EOF {
-		t.Fatalf("Read: %v", err)
-	}
-
-	// Before EOF, Valid() must return true (not-finished assumption).
-	if !rv.Valid() {
-		t.Error("Valid() should return true before EOF")
-	}
-}
-
-func TestReadVerifier_ActualChecksum(t *testing.T) {
-	content := []byte("checksum content")
-	wrong := strings.Repeat("0", 64)
-
-	rv := NewReadVerifier(bytes.NewReader(content), wrong)
-	if _, err := io.ReadAll(rv); err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-
-	got := rv.ActualChecksum()
-	if got != sha256Hex(content) {
-		t.Errorf("ActualChecksum mismatch: got %q want %q", got, sha256Hex(content))
-	}
-}
-
-func TestReadVerifier_EmptyContent(t *testing.T) {
-	content := []byte{}
-	expected := sha256Hex(content)
-
-	rv := NewReadVerifier(bytes.NewReader(content), expected)
-	if _, err := io.ReadAll(rv); err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if !rv.Valid() {
-		t.Error("Valid() should be true for empty content with correct checksum")
-	}
-}
-
-// ── ReadChecker ───────────────────────────────────────────────────────────────
-
-func TestReadChecker_RateClamp(t *testing.T) {
-	t.Run("negative clamped to 0", func(t *testing.T) {
-		rc := NewReadChecker(-1.5)
-		// rate=0 → ShouldVerify always false
-		for i := 0; i < 100; i++ {
-			if rc.ShouldVerify() {
-				t.Error("ShouldVerify() should never be true when rate=0")
-				break
-			}
-		}
-	})
-
-	t.Run("greater-than-1 clamped to 1", func(t *testing.T) {
-		rc := NewReadChecker(9999)
-		// rate=1.0 → ShouldVerify always true
-		for i := 0; i < 100; i++ {
-			if !rc.ShouldVerify() {
-				t.Error("ShouldVerify() should always be true when rate=1.0")
-				break
-			}
-		}
-	})
-}
-
-func TestReadChecker_ShouldVerify_Zero(t *testing.T) {
-	rc := NewReadChecker(0)
-	for i := 0; i < 200; i++ {
-		if rc.ShouldVerify() {
-			t.Fatal("ShouldVerify() must always be false for rate=0")
-		}
-	}
-}
-
-func TestReadChecker_ShouldVerify_One(t *testing.T) {
-	rc := NewReadChecker(1.0)
-	for i := 0; i < 200; i++ {
-		if !rc.ShouldVerify() {
-			t.Fatal("ShouldVerify() must always be true for rate=1.0")
-		}
-	}
-}
-
-func TestReadChecker_ShouldVerify_Probabilistic(t *testing.T) {
-	rc := NewReadChecker(0.5)
-	trueCount := 0
-	const n = 500
-	for i := 0; i < n; i++ {
-		if rc.ShouldVerify() {
-			trueCount++
-		}
-	}
-	// With p=0.5 and n=500, we expect around 250. Allow generous bounds to
-	// avoid flakiness — just verify it's not always true or always false.
-	if trueCount == 0 {
-		t.Error("ShouldVerify() was never true for rate=0.5 over 500 calls")
-	}
-	if trueCount == n {
-		t.Error("ShouldVerify() was always true for rate=0.5 over 500 calls")
-	}
-}
-
-func TestReadChecker_RecordCheck(t *testing.T) {
-	rc := NewReadChecker(1.0)
-
-	rc.RecordCheck(true)
-	rc.RecordCheck(true)
-	rc.RecordCheck(false)
-	rc.RecordCheck(false)
-	rc.RecordCheck(false)
-
-	checked, failed := rc.Stats()
-	if checked != 5 {
-		t.Errorf("checked: got %d, want 5", checked)
-	}
-	if failed != 3 {
-		t.Errorf("failed: got %d, want 3", failed)
-	}
-}
-
-func TestReadChecker_Stats_InitialZero(t *testing.T) {
-	rc := NewReadChecker(0.5)
-	checked, failed := rc.Stats()
-	if checked != 0 || failed != 0 {
-		t.Errorf("expected (0,0), got (%d,%d)", checked, failed)
-	}
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -391,7 +240,7 @@ func TestMetrics_MarshalJSON(t *testing.T) {
 func TestGC_NewGC(t *testing.T) {
 	dir := t.TempDir()
 	interval := 5 * time.Minute
-	gc := NewGC(dir, discardLogger(), interval)
+	gc := testGC(t, dir, interval)
 	if gc == nil {
 		t.Fatal("NewGC returned nil")
 	}
@@ -405,7 +254,7 @@ func TestGC_NewGC(t *testing.T) {
 
 func TestGC_StartStop_NoPanic(t *testing.T) {
 	dir := t.TempDir()
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 
 	// Start once
 	gc.Start()
@@ -420,7 +269,7 @@ func TestGC_StartStop_NoPanic(t *testing.T) {
 
 func TestGC_NotifyDeletion_NonBlocking(t *testing.T) {
 	dir := t.TempDir()
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 
 	// Call many times without starting the loop — should never block.
 	for i := 0; i < 100; i++ {
@@ -435,7 +284,7 @@ func TestGC_RunOnce_NoPanicWithRealDir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "tmp"), 0o755); err != nil {
 		t.Fatalf("mkdir tmp: %v", err)
 	}
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 	// Must not panic, even on an empty directory.
 	gc.RunOnce()
 }
@@ -443,7 +292,7 @@ func TestGC_RunOnce_NoPanicWithRealDir(t *testing.T) {
 func TestGC_RunOnce_NoPanicMissingTmpDir(t *testing.T) {
 	// dataDir with no tmp subdir — cleanOldTempFiles must return silently.
 	dir := t.TempDir()
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 	gc.RunOnce() // must not panic
 }
 
@@ -467,7 +316,7 @@ func TestGC_CleanOldTempFiles_OldRegularFileDeleted(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 	gc.RunOnce()
 
 	if _, err := os.Stat(f.Name()); !os.IsNotExist(err) {
@@ -497,7 +346,7 @@ func TestGC_CleanOldTempFiles_RecentFileKept(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 	gc.RunOnce()
 
 	if _, err := os.Stat(f.Name()); os.IsNotExist(err) {
@@ -528,7 +377,7 @@ func TestGC_CleanOldTempFiles_WritingFileSurvivesLessThan24h(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 	gc.RunOnce()
 
 	if _, err := os.Stat(f.Name()); os.IsNotExist(err) {
@@ -558,7 +407,7 @@ func TestGC_CleanOldTempFiles_WritingFileOlderThan24hDeleted(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 	gc.RunOnce()
 
 	if _, err := os.Stat(f.Name()); !os.IsNotExist(err) {
@@ -597,11 +446,145 @@ func TestGC_FilesCollected_Counter(t *testing.T) {
 	}
 	_ = rf.Close()
 
-	gc := NewGC(dir, discardLogger(), 1*time.Hour)
+	gc := testGC(t, dir, 1*time.Hour)
 	gc.RunOnce()
 
 	if gc.FilesCollected.Load() != 3 {
 		t.Errorf("FilesCollected: got %d, want 3", gc.FilesCollected.Load())
+	}
+}
+
+// ── GC: multipart cleanup ─────────────────────────────────────────────────────
+
+func TestGC_CleanupExpiredUploads_ReclaimsRecordAndParts(t *testing.T) {
+	gc, db, st := testGCWithStore(t, 1*time.Hour)
+
+	up := &meta.MultipartUpload{
+		UploadID:  "expired-upload",
+		BucketID:  "bucket-1",
+		ObjectKey: "some/key",
+		CreatedAt: time.Now().Add(-25 * time.Hour),
+		State:     "initiated",
+	}
+	if err := db.CreateMultipartUpload(up); err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	if _, _, _, err := st.WritePart(up.UploadID, 1, bytes.NewReader([]byte("part data"))); err != nil {
+		t.Fatalf("WritePart: %v", err)
+	}
+
+	partsDir := filepath.Join(st.DataDir(), "multipart", up.UploadID)
+	if _, err := os.Stat(partsDir); err != nil {
+		t.Fatalf("parts dir should exist before GC: %v", err)
+	}
+
+	gc.RunOnce()
+
+	if _, err := db.GetMultipartUpload(up.UploadID); err != meta.ErrUploadNotFound {
+		t.Errorf("expired upload record should be gone, got err=%v", err)
+	}
+	if _, err := os.Stat(partsDir); !os.IsNotExist(err) {
+		t.Errorf("parts dir should have been removed, stat err=%v", err)
+	}
+}
+
+func TestGC_CleanupExpiredUploads_KeepsRecentUpload(t *testing.T) {
+	gc, db, st := testGCWithStore(t, 1*time.Hour)
+
+	up := &meta.MultipartUpload{
+		UploadID:  "recent-upload",
+		BucketID:  "bucket-1",
+		ObjectKey: "some/key",
+		State:     "initiated", // CreatedAt defaults to now
+	}
+	if err := db.CreateMultipartUpload(up); err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	if _, _, _, err := st.WritePart(up.UploadID, 1, bytes.NewReader([]byte("part data"))); err != nil {
+		t.Fatalf("WritePart: %v", err)
+	}
+
+	gc.RunOnce()
+
+	if _, err := db.GetMultipartUpload(up.UploadID); err != nil {
+		t.Errorf("recent upload record should survive, got err=%v", err)
+	}
+	partsDir := filepath.Join(st.DataDir(), "multipart", up.UploadID)
+	if _, err := os.Stat(partsDir); err != nil {
+		t.Errorf("recent upload parts should survive: %v", err)
+	}
+}
+
+func TestGC_SweepOrphanMultipartDirs_RemovesOldOrphan(t *testing.T) {
+	gc, _, st := testGCWithStore(t, 1*time.Hour)
+
+	// A part dir with no bbolt record at all (e.g. record deleted while the
+	// best-effort part cleanup failed).
+	orphanDir := filepath.Join(st.DataDir(), "multipart", "ghost-upload")
+	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, "part-00001"), []byte("leftover"), 0o600); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(orphanDir, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	gc.RunOnce()
+
+	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
+		t.Errorf("old orphan multipart dir should have been removed, stat err=%v", err)
+	}
+}
+
+func TestGC_SweepOrphanMultipartDirs_KeepsRecentOrphan(t *testing.T) {
+	gc, _, st := testGCWithStore(t, 1*time.Hour)
+
+	// Fresh dir without a record: could be an upload whose record is being
+	// created concurrently — must be left alone until it ages past 24h.
+	orphanDir := filepath.Join(st.DataDir(), "multipart", "brand-new-upload")
+	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	gc.RunOnce()
+
+	if _, err := os.Stat(orphanDir); err != nil {
+		t.Errorf("recent orphan dir should survive: %v", err)
+	}
+}
+
+func TestGC_SweepOrphanMultipartDirs_KeepsRegisteredUpload(t *testing.T) {
+	gc, db, st := testGCWithStore(t, 1*time.Hour)
+
+	up := &meta.MultipartUpload{
+		UploadID:  "registered-upload",
+		BucketID:  "bucket-1",
+		ObjectKey: "some/key",
+		State:     "initiated", // recent CreatedAt — not expired
+	}
+	if err := db.CreateMultipartUpload(up); err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	if _, _, _, err := st.WritePart(up.UploadID, 1, bytes.NewReader([]byte("part data"))); err != nil {
+		t.Fatalf("WritePart: %v", err)
+	}
+	// Age the dir past the sweep cutoff; the bbolt record must still protect it.
+	partsDir := filepath.Join(st.DataDir(), "multipart", up.UploadID)
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(partsDir, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	gc.RunOnce()
+
+	if _, err := os.Stat(partsDir); err != nil {
+		t.Errorf("registered upload parts dir should survive the orphan sweep: %v", err)
+	}
+	if _, err := db.GetMultipartUpload(up.UploadID); err != nil {
+		t.Errorf("registered upload record should survive: %v", err)
 	}
 }
 
@@ -666,6 +649,26 @@ func TestBackup_Verify_AfterRun(t *testing.T) {
 	}
 	if result.Version == "" {
 		t.Error("Verify result Version should be non-empty")
+	}
+}
+
+func TestBackup_VerifyAndCleanup_RemovesCorruptFile(t *testing.T) {
+	db, _ := openTestDB(t)
+	backupDir := t.TempDir()
+	bm := NewBackupManager(db, backupDir, discardLogger())
+
+	// A file that is not a valid bbolt database must fail verification and be
+	// deleted so it can never be mistaken for a restorable snapshot.
+	corrupt := filepath.Join(backupDir, "jay-corrupt.db")
+	if err := os.WriteFile(corrupt, []byte("definitely not a bolt db"), 0o600); err != nil {
+		t.Fatalf("write corrupt file: %v", err)
+	}
+
+	if err := bm.verifyAndCleanup(corrupt); err == nil {
+		t.Error("verifyAndCleanup should fail for a corrupt backup")
+	}
+	if _, err := os.Stat(corrupt); !os.IsNotExist(err) {
+		t.Errorf("corrupt backup should have been removed, stat err=%v", err)
 	}
 }
 
@@ -777,17 +780,225 @@ func TestBackup_Prune_RecentFilesKept(t *testing.T) {
 	}
 }
 
-func TestBackup_BackupToWriter(t *testing.T) {
-	db, _ := openTestDB(t)
-	backupDir := t.TempDir()
-	bm := NewBackupManager(db, backupDir, discardLogger())
+// ── Scrubber ──────────────────────────────────────────────────────────────────
 
-	var buf bytes.Buffer
-	if err := bm.BackupToWriter(&buf); err != nil {
-		t.Fatalf("BackupToWriter: %v", err)
+// createActiveObject creates a bucket plus an active object whose physical
+// file exists on disk with the given content. checksum defaults to the real
+// content checksum unless overrideChecksum is non-empty.
+func createActiveObject(t *testing.T, db *meta.DB, st *store.Store, content []byte, overrideChecksum string) (bucketID, key string) {
+	t.Helper()
+	bucketID = uuid.NewString()
+	key = "scrub-key-" + uuid.NewString()
+
+	b := &meta.Bucket{
+		ID:   bucketID,
+		Name: "scrub-bucket-" + bucketID,
 	}
-	if buf.Len() == 0 {
-		t.Error("BackupToWriter wrote 0 bytes")
+	if err := db.CreateBucket(b); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	objectID := uuid.NewString()
+	checksum, size, locationRef, err := st.WriteObject(bucketID, objectID, bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	if overrideChecksum != "" {
+		checksum = overrideChecksum
+	}
+
+	obj := &meta.Object{
+		BucketID:       bucketID,
+		Key:            key,
+		ObjectID:       objectID,
+		State:          "active",
+		SizeBytes:      size,
+		ChecksumSHA256: checksum,
+		LocationRef:    locationRef,
+	}
+	if _, err := db.PutObjectMeta(obj); err != nil {
+		t.Fatalf("PutObjectMeta: %v", err)
+	}
+	return bucketID, key
+}
+
+func newTestScrubber(db *meta.DB, st *store.Store) *Scrubber {
+	return NewScrubber(db, st, discardLogger(), time.Hour, 0, 100)
+}
+
+func TestScrubber_RunIncremental_Healthy(t *testing.T) {
+	db, st := openTestDB(t)
+	content := []byte("healthy scrub content")
+	bucketID, key := createActiveObject(t, db, st, content, "")
+
+	s := newTestScrubber(db, st)
+	m := NewMetrics()
+	s.SetMetrics(m)
+
+	result := s.RunIncremental(100)
+	if result.Checked != 1 {
+		t.Errorf("Checked: got %d, want 1", result.Checked)
+	}
+	if result.Healthy != 1 {
+		t.Errorf("Healthy: got %d, want 1", result.Healthy)
+	}
+	if result.Quarantined != 0 || result.Missing != 0 || result.Errors != 0 {
+		t.Errorf("unexpected failures: %+v", result)
+	}
+	if m.ChecksumFailures.Load() != 0 || m.ObjectsQuarantined.Load() != 0 {
+		t.Errorf("metrics should be zero: checksum=%d quarantined=%d",
+			m.ChecksumFailures.Load(), m.ObjectsQuarantined.Load())
+	}
+
+	obj, err := db.GetObjectMetaAny(bucketID, key)
+	if err != nil {
+		t.Fatalf("GetObjectMetaAny: %v", err)
+	}
+	if obj.State != "active" {
+		t.Errorf("healthy object state: got %q, want active", obj.State)
+	}
+}
+
+func TestScrubber_RunIncremental_ChecksumMismatch(t *testing.T) {
+	db, st := openTestDB(t)
+	content := []byte("mismatch scrub content")
+	wrong := strings.Repeat("0", 64)
+	bucketID, key := createActiveObject(t, db, st, content, wrong)
+
+	s := newTestScrubber(db, st)
+	m := NewMetrics()
+	s.SetMetrics(m)
+
+	result := s.RunIncremental(100)
+	if result.Quarantined != 1 {
+		t.Errorf("Quarantined: got %d, want 1", result.Quarantined)
+	}
+	if m.ChecksumFailures.Load() != 1 {
+		t.Errorf("ChecksumFailures: got %d, want 1", m.ChecksumFailures.Load())
+	}
+	if m.ObjectsQuarantined.Load() != 1 {
+		t.Errorf("ObjectsQuarantined: got %d, want 1", m.ObjectsQuarantined.Load())
+	}
+
+	obj, err := db.GetObjectMetaAny(bucketID, key)
+	if err != nil {
+		t.Fatalf("GetObjectMetaAny: %v", err)
+	}
+	if obj.State != "quarantined" {
+		t.Errorf("state: got %q, want quarantined", obj.State)
+	}
+	// Mismatched physical file must have been moved aside.
+	absPath, err := st.SafePath(obj.LocationRef)
+	if err != nil {
+		t.Fatalf("SafePath: %v", err)
+	}
+	if _, err := os.Stat(absPath); !os.IsNotExist(err) {
+		t.Errorf("mismatched file should have been quarantined on disk; stat err = %v", err)
+	}
+}
+
+func TestScrubber_RunIncremental_MissingFile(t *testing.T) {
+	db, st := openTestDB(t)
+	content := []byte("missing scrub content")
+	bucketID, key := createActiveObject(t, db, st, content, "")
+
+	// Remove the physical file so the object goes missing.
+	obj, err := db.GetObjectMetaAny(bucketID, key)
+	if err != nil {
+		t.Fatalf("GetObjectMetaAny: %v", err)
+	}
+	absPath, err := st.SafePath(obj.LocationRef)
+	if err != nil {
+		t.Fatalf("SafePath: %v", err)
+	}
+	if err := os.Remove(absPath); err != nil {
+		t.Fatalf("remove physical file: %v", err)
+	}
+
+	s := newTestScrubber(db, st)
+	m := NewMetrics()
+	s.SetMetrics(m)
+
+	result := s.RunIncremental(100)
+	if result.Missing != 1 {
+		t.Errorf("Missing: got %d, want 1", result.Missing)
+	}
+	if m.ObjectsQuarantined.Load() != 1 {
+		t.Errorf("ObjectsQuarantined: got %d, want 1", m.ObjectsQuarantined.Load())
+	}
+	if m.ChecksumFailures.Load() != 0 {
+		t.Errorf("ChecksumFailures: got %d, want 0", m.ChecksumFailures.Load())
+	}
+
+	after, err := db.GetObjectMetaAny(bucketID, key)
+	if err != nil {
+		t.Fatalf("GetObjectMetaAny: %v", err)
+	}
+	if after.State != "quarantined" {
+		t.Errorf("state: got %q, want quarantined", after.State)
+	}
+}
+
+func TestScrubber_RunIncremental_NilMetricsSafe(t *testing.T) {
+	db, st := openTestDB(t)
+	content := []byte("nil metrics scrub content")
+	wrong := strings.Repeat("0", 64)
+	createActiveObject(t, db, st, content, wrong)
+
+	s := newTestScrubber(db, st)
+	// No SetMetrics call — must not panic on mismatch/quarantine.
+	result := s.RunIncremental(100)
+	if result.Quarantined != 1 {
+		t.Errorf("Quarantined: got %d, want 1", result.Quarantined)
+	}
+}
+
+func TestScrubber_RunIncremental_CursorAdvancesAcrossRuns(t *testing.T) {
+	db, st := openTestDB(t)
+
+	// One bucket with 3 objects; maxPerRun=1 so each run checks exactly one
+	// and the lastKey cursor must resume where the previous run stopped.
+	bucketID := uuid.NewString()
+	b := &meta.Bucket{ID: bucketID, Name: "cursor-bucket-" + bucketID}
+	if err := db.CreateBucket(b); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		objectID := uuid.NewString()
+		content := []byte("cursor content " + objectID)
+		checksum, size, locationRef, err := st.WriteObject(bucketID, objectID, bytes.NewReader(content))
+		if err != nil {
+			t.Fatalf("WriteObject: %v", err)
+		}
+		obj := &meta.Object{
+			BucketID:       bucketID,
+			Key:            "cursor-key-" + objectID,
+			ObjectID:       objectID,
+			State:          "active",
+			SizeBytes:      size,
+			ChecksumSHA256: checksum,
+			LocationRef:    locationRef,
+		}
+		if _, err := db.PutObjectMeta(obj); err != nil {
+			t.Fatalf("PutObjectMeta: %v", err)
+		}
+	}
+
+	s := NewScrubber(db, st, discardLogger(), time.Hour, 0, 1)
+
+	total := 0
+	for i := 0; i < 3; i++ {
+		r := s.RunIncremental(1)
+		total += r.Checked
+		if r.Checked != 1 {
+			t.Fatalf("run %d: Checked = %d, want 1", i, r.Checked)
+		}
+		if r.Healthy != 1 {
+			t.Fatalf("run %d: Healthy = %d, want 1", i, r.Healthy)
+		}
+	}
+	if total != 3 {
+		t.Errorf("total checked across runs: got %d, want 3", total)
 	}
 }
 

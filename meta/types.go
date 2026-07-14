@@ -75,17 +75,17 @@ type MultipartPart struct {
 
 // Actions
 const (
-	ActionBucketList     = "bucket:list"
-	ActionBucketReadMeta = "bucket:read-meta"
-	ActionBucketWriteMeta = "bucket:write-meta"
-	ActionObjectGet      = "object:get"
-	ActionObjectPut      = "object:put"
-	ActionObjectDelete   = "object:delete"
-	ActionObjectList     = "object:list"
-	ActionMultipartCreate = "multipart:create"
-	ActionMultipartUpload = "multipart:upload-part"
+	ActionBucketList        = "bucket:list"
+	ActionBucketReadMeta    = "bucket:read-meta"
+	ActionBucketWriteMeta   = "bucket:write-meta"
+	ActionObjectGet         = "object:get"
+	ActionObjectPut         = "object:put"
+	ActionObjectDelete      = "object:delete"
+	ActionObjectList        = "object:list"
+	ActionMultipartCreate   = "multipart:create"
+	ActionMultipartUpload   = "multipart:upload-part"
 	ActionMultipartComplete = "multipart:complete"
-	ActionMultipartAbort = "multipart:abort"
+	ActionMultipartAbort    = "multipart:abort"
 )
 
 // AllActions is the full set of actions for admin/full-access tokens.

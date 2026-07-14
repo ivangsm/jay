@@ -3,6 +3,7 @@ package recovery
 import (
 	"log/slog"
 
+	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
 )
@@ -11,6 +12,14 @@ import (
 // It cleans orphaned temp files, detects inconsistencies between metadata
 // and physical files, and quarantines anything that doesn't match.
 func Run(db *meta.DB, st *store.Store, log *slog.Logger) error {
+	return RunWithMetrics(db, st, log, nil)
+}
+
+// RunWithMetrics is Run with an optional metrics sink. m may be nil, in which
+// case no counters are recorded. Every effective quarantine (metadata entry
+// quarantined or orphaned physical file moved aside) increments
+// ObjectsQuarantined.
+func RunWithMetrics(db *meta.DB, st *store.Store, log *slog.Logger, m *maintenance.Metrics) error {
 	log.Info("recovery: starting reconciliation")
 
 	// 1. Clean temp directory
@@ -44,7 +53,17 @@ func Run(db *meta.DB, st *store.Store, log *slog.Logger) error {
 			physicalFiles[f] = true
 		}
 
-		// Check each metadata entry has a matching physical file
+		// Check each metadata entry has a matching physical file. Only
+		// collect the keys to quarantine here: QuarantineObject opens a
+		// bbolt write transaction, and committing a write while a view
+		// transaction is open on the same goroutine can deadlock if the
+		// commit needs to remap the mmap (database growth). Apply the
+		// quarantines after the view transaction has closed.
+		type quarantineTarget struct {
+			key         string
+			locationRef string
+		}
+		var toQuarantine []quarantineTarget
 		knownLocations := make(map[string]bool)
 		err = db.ForEachObject(bucket.ID, func(obj meta.Object) error {
 			if obj.State != "active" {
@@ -53,20 +72,30 @@ func Run(db *meta.DB, st *store.Store, log *slog.Logger) error {
 			knownLocations[obj.LocationRef] = true
 
 			if !st.ObjectExists(&obj) {
-				log.Warn("recovery: metadata without file, quarantining",
-					"bucket", bucket.Name,
-					"key", obj.Key,
-					"location", obj.LocationRef,
-				)
-				if err := db.QuarantineObject(bucket.ID, obj.Key); err != nil {
-					log.Error("recovery: quarantine object", "err", err, "key", obj.Key)
-				}
-				quarantinedMeta++
+				toQuarantine = append(toQuarantine, quarantineTarget{
+					key:         obj.Key,
+					locationRef: obj.LocationRef,
+				})
 			}
 			return nil
 		})
 		if err != nil {
 			log.Warn("recovery: iterate objects", "err", err, "bucket", bucket.Name)
+		}
+
+		// Quarantine outside the View transaction to avoid deadlock.
+		for _, qt := range toQuarantine {
+			log.Warn("recovery: metadata without file, quarantining",
+				"bucket", bucket.Name,
+				"key", qt.key,
+				"location", qt.locationRef,
+			)
+			if err := db.QuarantineObject(bucket.ID, qt.key); err != nil {
+				log.Error("recovery: quarantine object", "err", err, "key", qt.key)
+			} else if m != nil {
+				m.ObjectsQuarantined.Add(1)
+			}
+			quarantinedMeta++
 		}
 
 		// Check for physical files without metadata
@@ -81,6 +110,9 @@ func Run(db *meta.DB, st *store.Store, log *slog.Logger) error {
 					orphanedFiles++
 				} else {
 					quarantinedFiles++
+					if m != nil {
+						m.ObjectsQuarantined.Add(1)
+					}
 				}
 			}
 		}

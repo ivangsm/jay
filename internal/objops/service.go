@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,6 +45,9 @@ var (
 	// ErrBadPolicy: the bucket policy JSON could not be unmarshalled. Treated
 	// as deny (fail-closed) — never as allow.
 	ErrBadPolicy = errors.New("objops: malformed bucket policy")
+	// ErrObjectTooLarge: the request body exceeded the configured maximum
+	// object size. The partially written file is removed before returning.
+	ErrObjectTooLarge = errors.New("objops: object exceeds maximum allowed size")
 )
 
 // Identity carries the authenticated caller context needed for policy
@@ -64,11 +68,33 @@ type Service struct {
 	db    *meta.DB
 	store *store.Store
 	log   *slog.Logger
+
+	// maxObjectSize is the largest object body accepted by PutObject, in bytes.
+	// 0 means unlimited. Stored atomically because it is set from main() during
+	// wiring while handlers may already be constructed.
+	maxObjectSize atomic.Int64
 }
 
 // New constructs a Service. db, st, and log must all be non-nil.
 func New(db *meta.DB, st *store.Store, log *slog.Logger) *Service {
 	return &Service{db: db, store: st, log: log}
+}
+
+// SetMaxObjectSize sets the maximum accepted object size in bytes. 0 (or a
+// negative value, normalized to 0) disables the limit. Intended to be called
+// once during wiring, before the listeners start serving.
+func (s *Service) SetMaxObjectSize(n int64) {
+	if n < 0 {
+		n = 0
+	}
+	s.maxObjectSize.Store(n)
+}
+
+// MaxObjectSize returns the configured maximum object size in bytes (0 =
+// unlimited). Transports that write bytes outside PutObject — e.g. the S3
+// multipart part upload — read it to enforce the same ceiling per part.
+func (s *Service) MaxObjectSize() int64 {
+	return s.maxObjectSize.Load()
 }
 
 // md5Pool is shared between PUT paths so every transport can compute ETag
@@ -227,17 +253,34 @@ func (s *Service) PutObject(
 	md5Hash.Reset()
 	defer md5Pool.Put(md5Hash)
 
-	var teeBody io.Reader
+	var src io.Reader = emptyReader{}
 	if body != nil {
-		teeBody = io.TeeReader(body, md5Hash)
-	} else {
-		teeBody = emptyReader{}
+		src = body
 	}
+
+	// Cap the body at max+1 bytes: if the store ends up writing more than max,
+	// the client sent an over-sized object. Reading one extra byte is what lets
+	// us distinguish "exactly at the limit" from "over the limit".
+	maxSize := s.maxObjectSize.Load()
+	if maxSize > 0 {
+		src = io.LimitReader(src, maxSize+1)
+	}
+
+	teeBody := io.TeeReader(src, md5Hash)
 
 	checksum, size, locationRef, err := s.store.WriteObject(bucket.ID, objectID, teeBody)
 	if err != nil {
 		s.log.Error("objops: write object", "err", err, "bucket", bucketName, "key", key)
 		return nil, err
+	}
+
+	if maxSize > 0 && size > maxSize {
+		// Never commit metadata for an over-sized object — drop the bytes we
+		// just wrote so a rejected upload cannot fill the disk.
+		s.store.Cleanup(locationRef)
+		s.log.Warn("objops: object exceeds max size",
+			"bucket", bucketName, "key", key, "size", size, "max", maxSize)
+		return nil, ErrObjectTooLarge
 	}
 
 	etag := hex.EncodeToString(md5Hash.Sum(nil))

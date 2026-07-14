@@ -538,3 +538,48 @@ func TestCleanupExpiredUploads_RemovesCompletedAndAborted(t *testing.T) {
 		t.Fatalf("completed old upload should be cleaned up, got %v", err)
 	}
 }
+
+func TestAbortMultipartUpload_RejectsCompletedUpload(t *testing.T) {
+	db := openMultipartTestDB(t)
+	upload := &MultipartUpload{
+		UploadID:  uuid.New().String(),
+		BucketID:  uuid.New().String(),
+		ObjectKey: "x",
+	}
+	if err := db.CreateMultipartUpload(upload); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := db.MarkMultipartUploadCompleted(upload.UploadID); err != nil {
+		t.Fatalf("mark completed: %v", err)
+	}
+
+	if _, err := db.AbortMultipartUpload(upload.UploadID); !errors.Is(err, ErrUploadNotActive) {
+		t.Fatalf("want ErrUploadNotActive, got %v", err)
+	}
+
+	got, err := db.GetMultipartUpload(upload.UploadID)
+	if err != nil {
+		t.Fatalf("get after rejected abort: %v", err)
+	}
+	if got.State != "completed" {
+		t.Fatalf("rejected abort must not overwrite state, got %s", got.State)
+	}
+}
+
+func TestAbortMultipartUpload_RejectsAlreadyAborted(t *testing.T) {
+	db := openMultipartTestDB(t)
+	upload := &MultipartUpload{
+		UploadID:  uuid.New().String(),
+		BucketID:  uuid.New().String(),
+		ObjectKey: "x",
+	}
+	if err := db.CreateMultipartUpload(upload); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.AbortMultipartUpload(upload.UploadID); err != nil {
+		t.Fatalf("first abort: %v", err)
+	}
+	if _, err := db.AbortMultipartUpload(upload.UploadID); !errors.Is(err, ErrUploadNotActive) {
+		t.Fatalf("second abort: want ErrUploadNotActive, got %v", err)
+	}
+}

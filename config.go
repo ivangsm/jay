@@ -23,9 +23,11 @@ type Config struct {
 	SeedTokenSecret   string  // JAY_SEED_TOKEN_SECRET
 	TrustProxyHeaders bool    // JAY_TRUST_PROXY_HEADERS — if true, trust X-Forwarded-For / X-Real-IP
 	ScrubInterval     time.Duration
-	ScrubSampleRate   float64
 	ScrubBytesPerSec  int64
 	ScrubMaxPerRun    int
+	BackupDir         string // JAY_BACKUP_DIR / backup.dir — where hourly bbolt snapshots land; defaults to <DataDir>/backups, point it at a separate volume for real DR
+	MinFreeBytes      int64  // JAY_MIN_FREE_BYTES / min_free_bytes — readiness fails when the DataDir filesystem has less free space; 0 disables the check
+	MaxObjectSize     int64  // JAY_MAX_OBJECT_SIZE / max_object_size — largest accepted object body (and multipart part), in bytes; 0 disables the limit
 }
 
 // LoadConfig keeps the legacy env-only contract. It delegates to

@@ -264,10 +264,62 @@ func TestQuarantine_MovesFile(t *testing.T) {
 		t.Error("file still at original location after quarantine")
 	}
 
-	// File must be in quarantine dir
-	qPath := filepath.Join(s.dataDir, "quarantine", filepath.Base(locationRef))
-	if _, err := os.Stat(qPath); err != nil {
-		t.Errorf("file not in quarantine dir: %v", err)
+	// File must be in quarantine dir. The destination name flattens the full
+	// locationRef and appends a uniquifying suffix, so match on the prefix.
+	flat := strings.ReplaceAll(filepath.Clean(locationRef), string(filepath.Separator), "_")
+	matches, err := filepath.Glob(filepath.Join(s.dataDir, "quarantine", flat+".*"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("expected 1 quarantined file for %q, got %v", flat, matches)
+	}
+}
+
+// Multipart parts are named "part-00001" under every upload, so a
+// basename-keyed quarantine destination would clobber the previous upload's
+// evidence. Both files must survive.
+func TestQuarantine_MultipartPartsDoNotCollide(t *testing.T) {
+	s := newTestStore(t)
+
+	refs := make([]string, 0, 2)
+	for _, uploadID := range []string{"upload-aaa", "upload-bbb"} {
+		dir := filepath.Join(s.dataDir, "buckets", "bkt-mp", "multipart", uploadID)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		ref := filepath.Join("buckets", "bkt-mp", "multipart", uploadID, "part-00001")
+		if err := os.WriteFile(filepath.Join(s.dataDir, ref), []byte(uploadID), 0o644); err != nil {
+			t.Fatalf("write part: %v", err)
+		}
+		refs = append(refs, ref)
+	}
+
+	for _, ref := range refs {
+		if err := s.Quarantine(ref); err != nil {
+			t.Fatalf("Quarantine(%s): %v", ref, err)
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Join(s.dataDir, "quarantine"))
+	if err != nil {
+		t.Fatalf("read quarantine dir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 quarantined parts, got %d: %v", len(entries), entries)
+	}
+
+	// Contents must be distinct — neither part overwrote the other.
+	seen := map[string]bool{}
+	for _, e := range entries {
+		b, err := os.ReadFile(filepath.Join(s.dataDir, "quarantine", e.Name()))
+		if err != nil {
+			t.Fatalf("read quarantined file: %v", err)
+		}
+		seen[string(b)] = true
+	}
+	if !seen["upload-aaa"] || !seen["upload-bbb"] {
+		t.Errorf("quarantined contents collided: %v", seen)
 	}
 }
 

@@ -30,7 +30,6 @@ rate_burst: 200
 trust_proxy_headers: true
 scrub:
   interval_hours: 6
-  sample_rate: 0.1
   bytes_per_sec: 52428800
   max_per_run: 100
 seed_token:
@@ -73,7 +72,6 @@ func TestYAMLToEnv_RoundTrip(t *testing.T) {
 		"JAY_RATE_BURST":           "200",
 		"JAY_TRUST_PROXY_HEADERS":  "true",
 		"JAY_SCRUB_INTERVAL_HOURS": "6",
-		"JAY_SCRUB_SAMPLE_RATE":    "0.1",
 		"JAY_SCRUB_BYTES_PER_SEC":  "52428800",
 		"JAY_SCRUB_MAX_PER_RUN":    "100",
 		"JAY_SEED_TOKEN_ACCOUNT":   "acct_123",
@@ -116,7 +114,6 @@ func TestYAMLToEnv_NestedNamespaces(t *testing.T) {
 	out := filepath.Join(dir, ".env")
 	writeFile(t, in, `scrub:
   interval_hours: 12
-  sample_rate: 0.25
 seed_token:
   account: a
   id: i
@@ -130,7 +127,6 @@ seed_token:
 	content := string(data)
 	wants := []string{
 		"JAY_SCRUB_INTERVAL_HOURS=12",
-		"JAY_SCRUB_SAMPLE_RATE=0.25",
 		"JAY_SEED_TOKEN_ACCOUNT=a",
 		"JAY_SEED_TOKEN_ID=i",
 		"JAY_SEED_TOKEN_SECRET=s",
@@ -182,7 +178,6 @@ JAY_RATE_LIMIT=100
 JAY_RATE_BURST=200
 JAY_TRUST_PROXY_HEADERS=true
 JAY_SCRUB_INTERVAL_HOURS=6
-JAY_SCRUB_SAMPLE_RATE=0.1
 JAY_SCRUB_BYTES_PER_SEC=52428800
 JAY_SCRUB_MAX_PER_RUN=100
 JAY_SEED_TOKEN_ACCOUNT=acct
@@ -214,10 +209,9 @@ func TestEnvToYAML_TypeInference(t *testing.T) {
 	in := filepath.Join(dir, ".env")
 	out := filepath.Join(dir, "config.yml")
 	writeFile(t, in, `JAY_DATA_DIR=./data
-JAY_RATE_LIMIT=100
+JAY_RATE_LIMIT=250.5
 JAY_RATE_BURST=200
 JAY_TRUST_PROXY_HEADERS=true
-JAY_SCRUB_SAMPLE_RATE=0.5
 `)
 	code, _, _ := runCLI(t, "env-to-yaml", "--input", in, "--output", out)
 	if code != 0 {
@@ -232,8 +226,8 @@ JAY_SCRUB_SAMPLE_RATE=0.5
 	if !strings.Contains(content, "trust_proxy_headers: true") {
 		t.Errorf("trust_proxy_headers should render as bool: %s", content)
 	}
-	if !strings.Contains(content, "sample_rate: 0.5") {
-		t.Errorf("sample_rate should render as float: %s", content)
+	if !strings.Contains(content, "rate_limit: 250.5") {
+		t.Errorf("rate_limit should render as float: %s", content)
 	}
 	if !strings.Contains(content, "data_dir: ./data") {
 		t.Errorf("data_dir should render as string: %s", content)
@@ -337,23 +331,6 @@ seed_token:
 	}
 }
 
-func TestValidate_InvalidSampleRate(t *testing.T) {
-	dir := t.TempDir()
-	in := filepath.Join(dir, "config.yml")
-	writeFile(t, in, `admin_token: `+longSecret+`
-signing_secret: `+longSecret+`
-scrub:
-  sample_rate: 2.0
-`)
-	code, _, stderrOut := runCLI(t, "validate", "--input", in)
-	if code == 0 {
-		t.Fatal("expected non-zero exit")
-	}
-	if !strings.Contains(stderrOut, "sample_rate") {
-		t.Errorf("expected sample_rate error: %s", stderrOut)
-	}
-}
-
 func TestValidate_UnknownKey(t *testing.T) {
 	dir := t.TempDir()
 	in := filepath.Join(dir, "config.yml")
@@ -427,4 +404,3 @@ JAY_SCRUB_INTERVAL_HOURS=${INTERVAL}
 		t.Errorf("interpolation on int field not preserved: %s", content)
 	}
 }
-

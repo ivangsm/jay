@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/google/uuid"
@@ -354,4 +355,157 @@ func TestListObjectsPaginatedSemantics_PrefixNoMatches(t *testing.T) {
 	if len(res.Objects) != 0 {
 		t.Fatalf("want 0 objects, got %d", len(res.Objects))
 	}
+}
+
+// putActiveObjects inserts the given keys as active objects.
+func putActiveObjects(t *testing.T, db *DB, bucketID string, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		obj := &Object{
+			BucketID:  bucketID,
+			Key:       k,
+			ObjectID:  uuid.New().String(),
+			SizeBytes: 1,
+			State:     "active",
+		}
+		if _, err := db.PutObjectMeta(obj); err != nil {
+			t.Fatalf("put %q: %v", k, err)
+		}
+	}
+}
+
+// drainList pages through ListObjects following NextStartAfter, returning the
+// concatenated objects and common prefixes. Fails the test if pagination does
+// not terminate (i.e. the continuation token stops making progress).
+func drainList(t *testing.T, db *DB, bucketID, prefix, delimiter string, maxKeys int) (objects, prefixes []string) {
+	t.Helper()
+	startAfter := ""
+	for page := 0; ; page++ {
+		if page > 50 {
+			t.Fatalf("pagination did not terminate after 50 pages (startAfter=%q)", startAfter)
+		}
+		res, err := db.ListObjects(bucketID, prefix, delimiter, startAfter, maxKeys)
+		if err != nil {
+			t.Fatalf("ListObjects page %d: %v", page, err)
+		}
+		for _, o := range res.Objects {
+			objects = append(objects, o.Key)
+		}
+		prefixes = append(prefixes, res.CommonPrefixes...)
+		if !res.IsTruncated {
+			return objects, prefixes
+		}
+		if res.NextStartAfter == "" || res.NextStartAfter == startAfter {
+			t.Fatalf("page %d: truncated but NextStartAfter=%q does not advance past %q",
+				page, res.NextStartAfter, startAfter)
+		}
+		startAfter = res.NextStartAfter
+	}
+}
+
+func assertNoDuplicates(t *testing.T, label string, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: want %v, got %v", label, want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s: want %v, got %v", label, want, got)
+		}
+	}
+}
+
+func TestListObjects_DelimiterPagination_NoDuplicateCommonPrefixes(t *testing.T) {
+	db := openObjectsTestDB(t)
+	bkt := &Bucket{ID: uuid.New().String(), Name: "cpp", Visibility: "private", Status: "active"}
+	if err := db.CreateBucket(bkt); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	putActiveObjects(t, db, bkt.ID, "a/1", "a/2", "b/1", "b/2", "c/1")
+
+	objects, prefixes := drainList(t, db, bkt.ID, "", "/", 2)
+	if len(objects) != 0 {
+		t.Fatalf("want no top-level objects, got %v", objects)
+	}
+	assertNoDuplicates(t, "common prefixes", prefixes, []string{"a/", "b/", "c/"})
+}
+
+func TestListObjects_DelimiterPagination_MixedRootObjectsAndPrefixes(t *testing.T) {
+	db := openObjectsTestDB(t)
+	bkt := &Bucket{ID: uuid.New().String(), Name: "mix", Visibility: "private", Status: "active"}
+	if err := db.CreateBucket(bkt); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	// Sorted order: a/1, a/2, b.txt, c/1, c/2, d.txt, e/1
+	putActiveObjects(t, db, bkt.ID, "a/1", "a/2", "b.txt", "c/1", "c/2", "d.txt", "e/1")
+
+	for _, maxKeys := range []int{1, 2, 3} {
+		objects, prefixes := drainList(t, db, bkt.ID, "", "/", maxKeys)
+		assertNoDuplicates(t, "objects (maxKeys="+strconv.Itoa(maxKeys)+")", objects,
+			[]string{"b.txt", "d.txt"})
+		assertNoDuplicates(t, "common prefixes (maxKeys="+strconv.Itoa(maxKeys)+")", prefixes,
+			[]string{"a/", "c/", "e/"})
+	}
+}
+
+func TestListObjects_DelimiterPagination_TrailingCommonPrefixTruncates(t *testing.T) {
+	db := openObjectsTestDB(t)
+	bkt := &Bucket{ID: uuid.New().String(), Name: "trail", Visibility: "private", Status: "active"}
+	if err := db.CreateBucket(bkt); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	putActiveObjects(t, db, bkt.ID, "a/1", "a/2", "b/1")
+
+	// maxKeys=1 → page 1 emits only common prefix "a/". NextStartAfter must point
+	// past the last key rolled up into "a/" (i.e. "a/2"), never to "" or "a/1".
+	page1, err := db.ListObjects(bkt.ID, "", "/", "", 1)
+	if err != nil {
+		t.Fatalf("page1: %v", err)
+	}
+	if !page1.IsTruncated {
+		t.Fatalf("page1: want IsTruncated=true")
+	}
+	if len(page1.CommonPrefixes) != 1 || page1.CommonPrefixes[0] != "a/" {
+		t.Fatalf("page1: want [a/], got %v", page1.CommonPrefixes)
+	}
+	if page1.NextStartAfter != "a/2" {
+		t.Fatalf("page1: want NextStartAfter=%q, got %q", "a/2", page1.NextStartAfter)
+	}
+
+	page2, err := db.ListObjects(bkt.ID, "", "/", page1.NextStartAfter, 1)
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if page2.IsTruncated {
+		t.Fatalf("page2: want IsTruncated=false")
+	}
+	if len(page2.CommonPrefixes) != 1 || page2.CommonPrefixes[0] != "b/" {
+		t.Fatalf("page2: want [b/], got %v", page2.CommonPrefixes)
+	}
+}
+
+func TestListObjects_NoDelimiterPagination_Unchanged(t *testing.T) {
+	// Regression guard: without a delimiter, NextStartAfter must still be the key
+	// of the last object returned, and pages must remain disjoint.
+	db := openObjectsTestDB(t)
+	bkt := &Bucket{ID: uuid.New().String(), Name: "flat", Visibility: "private", Status: "active"}
+	if err := db.CreateBucket(bkt); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	keys := seedListObjectsBucket(t, db, bkt.ID, "k/", 7)
+
+	res, err := db.ListObjects(bkt.ID, "", "", "", 3)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if !res.IsTruncated || res.NextStartAfter != keys[2] {
+		t.Fatalf("want truncated with NextStartAfter=%q, got truncated=%v next=%q",
+			keys[2], res.IsTruncated, res.NextStartAfter)
+	}
+
+	objects, prefixes := drainList(t, db, bkt.ID, "", "", 3)
+	if len(prefixes) != 0 {
+		t.Fatalf("want no common prefixes, got %v", prefixes)
+	}
+	assertNoDuplicates(t, "objects", objects, keys)
 }

@@ -28,7 +28,10 @@ func (c *Client) CreateMultipartUpload(bucket, key string, opts *PutOptions) (st
 		contentType = opts.ContentType
 	}
 
-	meta := proto.EncodeCreateMultipartRequest(bucket, key, contentType)
+	meta, err := proto.EncodeCreateMultipartRequest(bucket, key, contentType)
+	if err != nil {
+		return "", fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpCreateMultipartUpload, meta)
 	if err != nil {
 		return "", err
@@ -46,7 +49,10 @@ func (c *Client) CreateMultipartUpload(bucket, key string, opts *PutOptions) (st
 
 // UploadPart uploads a single part of a multipart upload.
 func (c *Client) UploadPart(bucket, key, uploadID string, partNumber int, data io.Reader, size int64) (string, error) {
-	meta := proto.EncodeUploadPartRequest(bucket, key, uploadID, partNumber)
+	meta, err := proto.EncodeUploadPartRequest(bucket, key, uploadID, partNumber)
+	if err != nil {
+		return "", fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequestWithData(proto.OpUploadPart, meta, data, size)
 	if err != nil {
 		return "", err
@@ -69,7 +75,10 @@ func (c *Client) CompleteMultipartUpload(bucket, key, uploadID string, parts []C
 		partNumbers[i] = p.PartNumber
 	}
 
-	meta := proto.EncodeCompleteMultipartRequest(bucket, key, uploadID, partNumbers)
+	meta, err := proto.EncodeCompleteMultipartRequest(bucket, key, uploadID, partNumbers)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpCompleteMultipart, meta)
 	if err != nil {
 		return nil, err
@@ -87,7 +96,10 @@ func (c *Client) CompleteMultipartUpload(bucket, key, uploadID string, parts []C
 
 // AbortMultipartUpload cancels a multipart upload.
 func (c *Client) AbortMultipartUpload(bucket, key, uploadID string) error {
-	meta := proto.EncodeBucketKeyUpload(bucket, key, uploadID)
+	meta, err := proto.EncodeBucketKeyUpload(bucket, key, uploadID)
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpAbortMultipart, meta)
 	if err != nil {
 		return err
@@ -97,7 +109,10 @@ func (c *Client) AbortMultipartUpload(bucket, key, uploadID string) error {
 
 // ListParts returns the parts that have been uploaded for a multipart upload.
 func (c *Client) ListParts(bucket, key, uploadID string) ([]PartInfo, error) {
-	meta := proto.EncodeBucketKeyUpload(bucket, key, uploadID)
+	meta, err := proto.EncodeBucketKeyUpload(bucket, key, uploadID)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpListParts, meta)
 	if err != nil {
 		return nil, err

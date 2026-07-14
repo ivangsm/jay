@@ -1,15 +1,57 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 )
+
+// denyCopyPolicy evaluates the bucket-policy deny overlay for one side of a
+// copy (source or destination). requireAuth only checks the token scope; bucket
+// policies are an additional deny layer that PUT/GET/DELETE get through
+// objops.Service.authorize. Copy talks to the store directly, so it has to
+// evaluate the overlay itself or a token denied object:get on the source bucket
+// could still exfiltrate objects into a bucket it controls.
+//
+// A policy that fails to unmarshal is fail-closed (deny), matching objops.
+// Returns true when the request was denied and a response has been written.
+func (h *Handler) denyCopyPolicy(w http.ResponseWriter, r *http.Request, bucket *meta.Bucket, action, objectKey, resource string) bool {
+	if len(bucket.PolicyJSON) == 0 {
+		return false
+	}
+
+	var policy auth.BucketPolicy
+	if err := json.Unmarshal(bucket.PolicyJSON, &policy); err != nil {
+		h.log.Warn("copy: malformed bucket policy, failing closed", "bucket", bucket.Name, "err", err)
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", resource)
+		return true
+	}
+	policy.Compile()
+
+	tokenID := ""
+	if tok := tokenFromContext(r.Context()); tok != nil {
+		tokenID = tok.TokenID
+	}
+	if auth.EvaluatePolicyDeny(&policy, tokenID, action, objectKey, clientIP(r, h.trustProxyHeaders)) {
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", resource)
+		return true
+	}
+	return false
+}
 
 // handleCopyObject handles PUT /<bucket>/<key> with x-amz-copy-source header
 func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBucket, dstKey string) {
@@ -60,6 +102,11 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 		return
 	}
 
+	// Bucket-policy deny overlay on the source (read side).
+	if h.denyCopyPolicy(w, r, srcBucketMeta, meta.ActionObjectGet, srcKey, "/"+copySource) {
+		return
+	}
+
 	srcObj, err := h.db.GetObjectMeta(srcBucketMeta.ID, srcKey)
 	if err != nil {
 		if errors.Is(err, meta.ErrObjectNotFound) {
@@ -83,9 +130,23 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 		return
 	}
 
+	// Bucket-policy deny overlay on the destination (write side).
+	if h.denyCopyPolicy(w, r, dstBucketMeta, meta.ActionObjectPut, dstKey, "/"+dstBucket+"/"+dstKey) {
+		return
+	}
+
 	// Open source file and copy to new object
 	srcFile, err := h.store.ReadObject(srcObj.LocationRef)
 	if err != nil {
+		// Metadata without a backing file (GC race, manual removal): report the
+		// object as missing rather than as an internal error.
+		if errors.Is(err, os.ErrNotExist) {
+			h.log.Warn("copy: source file missing for existing metadata",
+				"bucket", srcBucket, "key", srcKey, "location", srcObj.LocationRef)
+			writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchKey,
+				"Source object not found", copySource)
+			return
+		}
 		h.log.Error("copy: read source", "err", err)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 			"Failed to read source", copySource)
@@ -139,4 +200,3 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 		ETag:         formatETag(newObj.ETag),
 	})
 }
-
