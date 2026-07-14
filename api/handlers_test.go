@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -536,6 +538,363 @@ func TestListObjects_WithObjects(t *testing.T) {
 	for _, key := range keys {
 		if !got[key] {
 			t.Fatalf("key %q not found in list response", key)
+		}
+	}
+}
+
+// ── CopyObject ─────────────────────────────────────────────────────────────
+
+// putObjectForTest stores an object through the S3 handler.
+func putObjectForTest(t *testing.T, h *Handler, tok *meta.Token, secret, bucket, key, body string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "/"+bucket+"/"+key, strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(tok, secret))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put %s/%s: want 200, got %d: %s", bucket, key, w.Code, w.Body.String())
+	}
+}
+
+// copyRequest issues PUT /<dst>/<key> with x-amz-copy-source.
+func copyRequest(t *testing.T, h *Handler, tok *meta.Token, secret, source, dstBucket, dstKey string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "/"+dstBucket+"/"+dstKey, nil)
+	req.Header.Set("Authorization", authHeader(tok, secret))
+	req.Header.Set("x-amz-copy-source", source)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// denyPolicy builds a bucket policy that denies `action` for every subject.
+func denyPolicy(action string) json.RawMessage {
+	return json.RawMessage(`{"version":"1","statements":[{"effect":"deny","actions":["` +
+		action + `"],"subjects":["*"]}]}`)
+}
+
+func TestCopyObject_NoPolicy_Success(t *testing.T) {
+	h, db, tok, secret := fullSetupTestHandler(t)
+	createBucketForTest(t, db, tok.AccountID, "copy-src")
+	dst := createBucketForTest(t, db, tok.AccountID, "copy-dst")
+	putObjectForTest(t, h, tok, secret, "copy-src", "a.txt", "hello copy")
+
+	w := copyRequest(t, h, tok, secret, "/copy-src/a.txt", "copy-dst", "b.txt")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	obj, err := db.GetObjectMeta(dst.ID, "b.txt")
+	if err != nil {
+		t.Fatalf("copied object should exist: %v", err)
+	}
+	if obj.SizeBytes != int64(len("hello copy")) {
+		t.Fatalf("want size %d, got %d", len("hello copy"), obj.SizeBytes)
+	}
+}
+
+func TestCopyObject_SourcePolicyDeniesGet(t *testing.T) {
+	h, db, tok, secret := fullSetupTestHandler(t)
+	createBucketForTest(t, db, tok.AccountID, "copy-src")
+	dst := createBucketForTest(t, db, tok.AccountID, "copy-dst")
+	putObjectForTest(t, h, tok, secret, "copy-src", "a.txt", "secret data")
+
+	if err := db.UpdateBucketPolicy("copy-src", denyPolicy(meta.ActionObjectGet)); err != nil {
+		t.Fatalf("update policy: %v", err)
+	}
+
+	w := copyRequest(t, h, tok, secret, "/copy-src/a.txt", "copy-dst", "b.txt")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("want 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := db.GetObjectMeta(dst.ID, "b.txt"); !errors.Is(err, meta.ErrObjectNotFound) {
+		t.Fatalf("denied copy must not create the destination object, got err=%v", err)
+	}
+}
+
+func TestCopyObject_DestPolicyDeniesPut(t *testing.T) {
+	h, db, tok, secret := fullSetupTestHandler(t)
+	createBucketForTest(t, db, tok.AccountID, "copy-src")
+	dst := createBucketForTest(t, db, tok.AccountID, "copy-dst")
+	putObjectForTest(t, h, tok, secret, "copy-src", "a.txt", "payload")
+
+	if err := db.UpdateBucketPolicy("copy-dst", denyPolicy(meta.ActionObjectPut)); err != nil {
+		t.Fatalf("update policy: %v", err)
+	}
+
+	w := copyRequest(t, h, tok, secret, "/copy-src/a.txt", "copy-dst", "b.txt")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("want 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := db.GetObjectMeta(dst.ID, "b.txt"); !errors.Is(err, meta.ErrObjectNotFound) {
+		t.Fatalf("denied copy must not create the destination object, got err=%v", err)
+	}
+}
+
+func TestCopyObject_MalformedPolicyFailsClosed(t *testing.T) {
+	h, db, tok, secret := fullSetupTestHandler(t)
+	createBucketForTest(t, db, tok.AccountID, "copy-src")
+	createBucketForTest(t, db, tok.AccountID, "copy-dst")
+	putObjectForTest(t, h, tok, secret, "copy-src", "a.txt", "payload")
+
+	// Syntactically valid JSON (so it can be persisted) but not a BucketPolicy:
+	// unmarshalling into the policy struct fails, which must fail closed.
+	if err := db.UpdateBucketPolicy("copy-src", json.RawMessage(`{"statements":"nope"}`)); err != nil {
+		t.Fatalf("update policy: %v", err)
+	}
+
+	w := copyRequest(t, h, tok, secret, "/copy-src/a.txt", "copy-dst", "b.txt")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("want 403 for malformed policy, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCopyObject_SourceFileMissing_404(t *testing.T) {
+	h, db, tok, secret := fullSetupTestHandler(t)
+	src := createBucketForTest(t, db, tok.AccountID, "copy-src")
+	createBucketForTest(t, db, tok.AccountID, "copy-dst")
+	putObjectForTest(t, h, tok, secret, "copy-src", "a.txt", "will vanish")
+
+	// Drop the physical file, keep the metadata: metadata/disk skew must map to
+	// NoSuchKey (404), not InternalError (500).
+	obj, err := db.GetObjectMeta(src.ID, "a.txt")
+	if err != nil {
+		t.Fatalf("get object meta: %v", err)
+	}
+	if err := h.store.DeleteObject(obj.LocationRef); err != nil {
+		t.Fatalf("delete physical file: %v", err)
+	}
+
+	w := copyRequest(t, h, tok, secret, "/copy-src/a.txt", "copy-dst", "b.txt")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("want 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── Cross-account bucket ownership ─────────────────────────────────────────
+
+// foreignToken creates a token belonging to a DIFFERENT account than the one
+// setupTestHandler seeds, with full permissions and no bucket scope.
+func foreignToken(t *testing.T, db *meta.DB, bucketScope []string) (*meta.Token, string) {
+	t.Helper()
+	acc := &meta.Account{AccountID: uuid.New().String(), Name: "attacker", Status: "active"}
+	if err := db.CreateAccount(acc); err != nil {
+		t.Fatalf("create foreign account: %v", err)
+	}
+	secret := "foreign-secret-value"
+	hash, _ := auth.HashSecret(secret)
+	tok := &meta.Token{
+		TokenID:        "foreign-token",
+		AccountID:      acc.AccountID,
+		Name:           "foreign",
+		SecretHash:     hash,
+		SecretKey:      secret,
+		AllowedActions: meta.AllActions,
+		BucketScope:    bucketScope,
+		Status:         "active",
+	}
+	if err := db.CreateToken(tok); err != nil {
+		t.Fatalf("create foreign token: %v", err)
+	}
+	return tok, secret
+}
+
+// seedBucket inserts a bucket owned by ownerAccountID directly in meta.
+func seedBucket(t *testing.T, db *meta.DB, name, ownerAccountID string) {
+	t.Helper()
+	if err := db.CreateBucket(&meta.Bucket{
+		ID:             uuid.New().String(),
+		Name:           name,
+		OwnerAccountID: ownerAccountID,
+		Visibility:     "private",
+		Status:         "active",
+	}); err != nil {
+		t.Fatalf("create bucket %s: %v", name, err)
+	}
+}
+
+func TestDeleteBucket_CrossAccountDenied(t *testing.T) {
+	h, db, owner, _ := setupTestHandler(t)
+	seedBucket(t, db, "victim-bucket", owner.AccountID)
+
+	attacker, attackerSecret := foreignToken(t, db, nil)
+
+	req := httptest.NewRequest(http.MethodDelete, "/victim-bucket", nil)
+	req.Header.Set("Authorization", authHeader(attacker, attackerSecret))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("want 403 for cross-account delete, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := db.GetBucket("victim-bucket"); err != nil {
+		t.Fatalf("bucket must still exist after denied delete: %v", err)
+	}
+}
+
+func TestDeleteBucket_OwnerAllowed(t *testing.T) {
+	h, db, owner, secret := setupTestHandler(t)
+	seedBucket(t, db, "own-bucket", owner.AccountID)
+
+	req := httptest.NewRequest(http.MethodDelete, "/own-bucket", nil)
+	req.Header.Set("Authorization", authHeader(owner, secret))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("want 204 for owner delete, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := db.GetBucket("own-bucket"); !errors.Is(err, meta.ErrBucketNotFound) {
+		t.Fatalf("bucket should be gone, got %v", err)
+	}
+}
+
+func TestDeleteBucket_ExplicitBucketScopeAllowed(t *testing.T) {
+	h, db, owner, _ := setupTestHandler(t)
+	seedBucket(t, db, "shared-bucket", owner.AccountID)
+
+	// Operator delegated this exact bucket to another account's token.
+	delegate, delegateSecret := foreignToken(t, db, []string{"shared-bucket"})
+
+	req := httptest.NewRequest(http.MethodDelete, "/shared-bucket", nil)
+	req.Header.Set("Authorization", authHeader(delegate, delegateSecret))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("want 204 for delegated delete, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeleteBucket_LegacyOwnerlessAllowed(t *testing.T) {
+	h, db, _, _ := setupTestHandler(t)
+	seedBucket(t, db, "legacy-bucket", "")
+
+	attacker, attackerSecret := foreignToken(t, db, nil)
+
+	req := httptest.NewRequest(http.MethodDelete, "/legacy-bucket", nil)
+	req.Header.Set("Authorization", authHeader(attacker, attackerSecret))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("want 204 for ownerless bucket, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHeadBucket_CrossAccountDenied(t *testing.T) {
+	h, db, owner, _ := setupTestHandler(t)
+	seedBucket(t, db, "private-bucket", owner.AccountID)
+
+	attacker, attackerSecret := foreignToken(t, db, nil)
+
+	req := httptest.NewRequest(http.MethodHead, "/private-bucket", nil)
+	req.Header.Set("Authorization", authHeader(attacker, attackerSecret))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("want 403 for cross-account head, got %d", w.Code)
+	}
+}
+
+func TestHeadBucket_OwnerAllowed(t *testing.T) {
+	h, db, owner, secret := setupTestHandler(t)
+	seedBucket(t, db, "owned-head-bucket", owner.AccountID)
+
+	req := httptest.NewRequest(http.MethodHead, "/owned-head-bucket", nil)
+	req.Header.Set("Authorization", authHeader(owner, secret))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 for owner head, got %d", w.Code)
+	}
+}
+
+// ── Pre-auth rate limiting ─────────────────────────────────────────────────
+
+// Requests with bogus credentials must be throttled by IP BEFORE authentication
+// runs, so bcrypt is never reached by an attacker without valid credentials.
+func TestIPRateLimit_ThrottlesUnauthenticatedRequests(t *testing.T) {
+	h, _, _, _ := setupTestHandler(t)
+	h.rateLimiter = newRateLimiter(RateLimiterConfig{Rate: 1, Burst: 2})
+	h.ipRateLimiter = newRateLimiter(RateLimiterConfig{Rate: 1, Burst: 2})
+
+	var last int
+	for i := range 5 {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.7:1234"
+		req.Header.Set("Authorization", "Bearer bogus:credentials")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		last = w.Code
+		if i < 2 && last == http.StatusTooManyRequests {
+			t.Fatalf("request %d throttled before burst was exhausted", i)
+		}
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("want 429 once the IP burst is exhausted, got %d", last)
+	}
+}
+
+// Authenticated traffic is limited per token; the IP bucket must not throttle a
+// legitimate client below its configured rate.
+func TestIPRateLimit_AuthenticatedRequestsPassWithinBudget(t *testing.T) {
+	h, _, tok, secret := setupTestHandler(t)
+	h.rateLimiter = newRateLimiter(RateLimiterConfig{Rate: 100, Burst: 200})
+	h.ipRateLimiter = newRateLimiter(RateLimiterConfig{Rate: 100, Burst: 200})
+
+	for i := range 10 {
+		req := httptest.NewRequest(http.MethodHead, "/no-such-bucket", nil)
+		req.RemoteAddr = "203.0.113.8:1234"
+		req.Header.Set("Authorization", authHeader(tok, secret))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d unexpectedly rate limited", i)
+		}
+	}
+}
+
+// --- parseRange -------------------------------------------------------------
+
+// A zero-byte object has no satisfiable range: every form must be rejected so
+// the caller answers 416 instead of emitting a bogus Content-Range / length.
+func TestParseRange_EmptyObject(t *testing.T) {
+	for _, hdr := range []string{"bytes=0-", "bytes=0-0", "bytes=-1", "bytes=-500", "bytes=1-2"} {
+		start, end, ok := parseRange(hdr, 0)
+		if ok {
+			t.Errorf("parseRange(%q, 0) = (%d, %d, true), want not-satisfiable", hdr, start, end)
+		}
+		if length := end - start + 1; ok && length <= 0 {
+			t.Errorf("parseRange(%q, 0) produced non-positive length %d", hdr, length)
+		}
+	}
+}
+
+func TestParseRange_NonEmptyObject(t *testing.T) {
+	tests := []struct {
+		hdr        string
+		total      int64
+		start, end int64
+		ok         bool
+	}{
+		{"bytes=0-", 10, 0, 9, true},
+		{"bytes=0-0", 10, 0, 0, true},
+		{"bytes=5-", 10, 5, 9, true},
+		{"bytes=-3", 10, 7, 9, true},
+		{"bytes=-99", 10, 0, 9, true},
+		{"bytes=2-99", 10, 2, 9, true},
+		{"bytes=10-", 10, 0, 0, false}, // start == totalSize
+		{"bytes=5-4", 10, 0, 0, false}, // end < start
+		{"bytes=0-1,3-4", 10, 0, 0, false},
+		{"chars=0-1", 10, 0, 0, false},
+	}
+	for _, tc := range tests {
+		start, end, ok := parseRange(tc.hdr, tc.total)
+		if ok != tc.ok || start != tc.start || end != tc.end {
+			t.Errorf("parseRange(%q, %d) = (%d, %d, %v), want (%d, %d, %v)",
+				tc.hdr, tc.total, start, end, ok, tc.start, tc.end, tc.ok)
 		}
 	}
 }

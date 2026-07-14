@@ -21,20 +21,12 @@ var (
 	ErrTooManyParts      = errors.New("upload exceeds maximum number of parts (10000)")
 )
 
-// ensureMultipartBucket creates the multipart bbolt bucket if needed.
-func (db *DB) ensureMultipartBucket() error {
-	return db.bolt.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(bucketMultipart)
-		return err
-	})
-}
-
 // CreateMultipartUpload starts a new multipart upload.
+//
+// The multipart bbolt bucket is created once by bootstrap() at Open time, so
+// this path only opens a single write transaction (previously it opened an
+// extra one per create just to CreateBucketIfNotExists).
 func (db *DB) CreateMultipartUpload(upload *MultipartUpload) error {
-	if err := db.ensureMultipartBucket(); err != nil {
-		return fmt.Errorf("ensure multipart bucket: %w", err)
-	}
-
 	if upload.CreatedAt.IsZero() {
 		upload.CreatedAt = time.Now().UTC()
 	}
@@ -48,7 +40,17 @@ func (db *DB) CreateMultipartUpload(upload *MultipartUpload) error {
 	}
 
 	return db.bolt.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketMultipart).Put([]byte(upload.UploadID), data)
+		bk := tx.Bucket(bucketMultipart)
+		if bk == nil {
+			// Defensive: bootstrap() creates this bucket, but a DB handle built
+			// outside Open() (e.g. a hand-rolled test fixture) may not have it.
+			var err error
+			bk, err = tx.CreateBucketIfNotExists(bucketMultipart)
+			if err != nil {
+				return fmt.Errorf("meta: create multipart bucket: %w", err)
+			}
+		}
+		return bk.Put([]byte(upload.UploadID), data)
 	})
 }
 
@@ -217,6 +219,12 @@ func (db *DB) MarkMultipartUploadCompleted(uploadID string) error {
 }
 
 // AbortMultipartUpload marks the upload as aborted.
+//
+// Only an upload still in the "initiated" state can be aborted. Aborting a
+// completed upload used to overwrite its record with state "aborted" and let
+// the caller delete the part files of an upload whose object had already been
+// committed; it now returns ErrUploadNotActive, which transports map to the
+// S3 NoSuchUpload semantics (the upload no longer exists as an active one).
 func (db *DB) AbortMultipartUpload(uploadID string) (*MultipartUpload, error) {
 	var upload MultipartUpload
 	err := db.bolt.Update(func(tx *bolt.Tx) error {
@@ -230,6 +238,9 @@ func (db *DB) AbortMultipartUpload(uploadID string) (*MultipartUpload, error) {
 		}
 		if err := json.Unmarshal(data, &upload); err != nil {
 			return err
+		}
+		if upload.State != "initiated" {
+			return ErrUploadNotActive
 		}
 
 		upload.State = "aborted"

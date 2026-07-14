@@ -10,12 +10,24 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 )
+
+// s3ErrInvalidPart is returned by CompleteMultipartUpload when a part listed by
+// the client is unknown or its ETag does not match the stored one.
+const s3ErrInvalidPart = "InvalidPart"
+
+// normalizeETag strips the surrounding quotes (and any surrounding whitespace)
+// clients wrap ETags in, so a client-supplied `"abc"` compares equal to the
+// bare `abc` we store. Inverse of formatETag.
+func normalizeETag(etag string) string {
+	return strings.Trim(strings.TrimSpace(etag), `"`)
+}
 
 func (h *Handler) denyMultipartPolicy(w http.ResponseWriter, r *http.Request, bucket *meta.Bucket, action, objectKey string) bool {
 	if len(bucket.PolicyJSON) == 0 {
@@ -164,14 +176,31 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	// Write part to disk
+	// Write part to disk. The same ceiling that guards PutObject applies per
+	// part — otherwise multipart would be a trivial bypass of the size limit.
+	// Read at most max+1 bytes so we can tell "at the limit" from "over it".
+	var src io.Reader = r.Body
+	maxSize := h.objops.MaxObjectSize()
+	if maxSize > 0 {
+		src = io.LimitReader(r.Body, maxSize+1)
+	}
+
 	md5Hash := md5.New()
-	body := io.TeeReader(r.Body, md5Hash)
+	body := io.TeeReader(src, md5Hash)
 
 	checksum, size, locationRef, err := h.store.WritePart(uploadID, partNumber, body)
 	if err != nil {
 		h.log.Error("write part", "err", err, "upload", uploadID, "part", partNumber)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to write part", "/"+bucketName+"/"+objectKey)
+		return
+	}
+
+	if maxSize > 0 && size > maxSize {
+		h.store.Cleanup(locationRef)
+		h.log.Warn("upload part exceeds max size",
+			"upload", uploadID, "part", partNumber, "size", size, "max", maxSize)
+		writeS3Error(w, r, http.StatusBadRequest, s3ErrEntityTooLarge,
+			"Your proposed upload exceeds the maximum allowed object size", "/"+bucketName+"/"+objectKey)
 		return
 	}
 
@@ -204,21 +233,13 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	bucket, _, ok := h.multipartUploadForRequest(w, r, bucketName, objectKey, uploadID)
+	// multipartUploadForRequest already loaded the upload record — reuse it
+	// instead of issuing a second GetMultipartUpload for the ownership check.
+	bucket, existing, ok := h.multipartUploadForRequest(w, r, bucketName, objectKey, uploadID)
 	if !ok {
 		return
 	}
 	if h.denyMultipartPolicy(w, r, bucket, meta.ActionMultipartComplete, objectKey) {
-		return
-	}
-
-	existing, err := h.db.GetMultipartUpload(uploadID)
-	if err != nil {
-		if errors.Is(err, meta.ErrUploadNotFound) {
-			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
-			return
-		}
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Internal error", "/"+bucketName+"/"+objectKey)
 		return
 	}
 	if token == nil || existing.InitiatedBy != token.AccountID {
@@ -233,9 +254,27 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// S3 validates that the ETag the client reports for each part matches the
+	// one the server stored, and answers InvalidPart on mismatch. An empty
+	// client ETag is tolerated (some minimal clients omit it).
+	storedETags := make(map[int]string, len(existing.Parts))
+	for _, p := range existing.Parts {
+		storedETags[p.PartNumber] = p.ETag
+	}
+
 	partNumbers := make([]int, len(input.Parts))
 	for i, p := range input.Parts {
 		partNumbers[i] = p.PartNumber
+		if normalizeETag(p.ETag) == "" {
+			continue
+		}
+		stored, found := storedETags[p.PartNumber]
+		if !found || !strings.EqualFold(normalizeETag(p.ETag), stored) {
+			writeS3Error(w, r, http.StatusBadRequest, s3ErrInvalidPart,
+				"One or more of the specified parts could not be found or the ETag did not match",
+				"/"+bucketName+"/"+objectKey)
+			return
+		}
 	}
 
 	upload, err := h.db.CompleteMultipartUpload(uploadID, partNumbers)
@@ -294,9 +333,21 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	}
 
 	if err := h.db.MarkMultipartUploadCompleted(uploadID); err != nil {
-		h.log.Error("mark multipart completed", "err", err, "upload_id", uploadID)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to finalize upload", "/"+bucketName+"/"+objectKey)
-		return
+		// The object is already durably committed at this point (PutObjectMeta
+		// succeeded). If the upload record is no longer active — because a
+		// concurrent Complete for the same uploadID won the race, or a retry
+		// arrived after the record was deleted — failing with a 500 would be a
+		// lie: the client's object IS in place. Complete is therefore treated
+		// as idempotent from here on; we log and return the success response.
+		// Any other error (bbolt failure) is still a real 500.
+		if errors.Is(err, meta.ErrUploadNotActive) || errors.Is(err, meta.ErrUploadNotFound) {
+			h.log.Warn("multipart upload already finalized by a concurrent complete; object committed, responding success",
+				"err", err, "upload_id", uploadID, "bucket", bucketName, "key", objectKey)
+		} else {
+			h.log.Error("mark multipart completed", "err", err, "upload_id", uploadID)
+			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to finalize upload", "/"+bucketName+"/"+objectKey)
+			return
+		}
 	}
 
 	// Cleanup parts (best-effort)
@@ -337,7 +388,11 @@ func (h *Handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Requ
 
 	upload, err := h.db.AbortMultipartUpload(uploadID)
 	if err != nil {
-		if errors.Is(err, meta.ErrUploadNotFound) {
+		// ErrUploadNotActive means the upload was already completed (or already
+		// aborted): there is no active upload left to abort, and its parts must
+		// not be touched — the completed object may still reference them mid
+		// cleanup. S3 answers NoSuchUpload in that situation.
+		if errors.Is(err, meta.ErrUploadNotFound) || errors.Is(err, meta.ErrUploadNotActive) {
 			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "Upload not found", "/"+bucketName+"/"+objectKey)
 			return
 		}
