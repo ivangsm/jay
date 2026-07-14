@@ -91,4 +91,3 @@ func TestCodecDecodeUnknownFormatByte(t *testing.T) {
 		t.Fatalf("decodeObject with leading 0x02 expected error, got nil")
 	}
 }
-

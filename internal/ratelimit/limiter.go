@@ -4,10 +4,10 @@
 // side tracked a rateBurst field but never applied it. This package is the
 // single source of truth — both transports import it and burst is now real.
 //
-// Keys are transport-specific: the HTTP middleware uses "ip:<client>" for
-// anonymous requests and "<token_id>" for authenticated ones; the proto
-// server uses "<token_id>@<remote_addr>" so per-connection bursts can't be
-// evaded by opening multiple connections with the same token.
+// Keys are transport-specific: the HTTP middleware limits by "ip:<client>"
+// before authentication and by "<token_id>" after it; the proto server limits
+// by "<token_id>" alone (see proto/server.go), so a token's budget is shared
+// across all of its connections rather than granted per connection.
 package ratelimit
 
 import (

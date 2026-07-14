@@ -291,13 +291,6 @@ func validateScrub(path string, fields map[string]*yaml.Node, errs *[]string, wa
 		}
 	}
 
-	if n := findChild(scrub, "sample_rate"); n != nil && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
-		if f, ok := parseFloat(n.Value); ok {
-			if !(f > 0.0 && f <= 1.0) {
-				*errs = append(*errs, fmt.Sprintf("%s: scrub.sample_rate must be in (0.0, 1.0], got %v", locLabel(path, n), f))
-			}
-		}
-	}
 	if n := findChild(scrub, "interval_hours"); n != nil && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
 		if i, ok := parseInt(n.Value); ok && i <= 0 {
 			*errs = append(*errs, fmt.Sprintf("%s: scrub.interval_hours must be > 0", locLabel(path, n)))

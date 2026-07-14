@@ -49,11 +49,11 @@ func (h *connHandler) handleListObjects(req *request) error {
 		}
 	}
 
-	resp := EncodeListObjectsResponse(entries, result.CommonPrefixes, result.IsTruncated, result.NextStartAfter)
+	resp, encErr := EncodeListObjectsResponse(entries, result.CommonPrefixes, result.IsTruncated, result.NextStartAfter)
 
 	if h.metrics != nil {
 		h.metrics.ListObjectsTotal.Add(1)
 	}
 
-	return h.writeResponseCombined(StatusOK, req.streamID, resp)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }

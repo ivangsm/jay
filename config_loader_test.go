@@ -86,9 +86,11 @@ rate_burst: 500
 trust_proxy_headers: true
 scrub:
   interval_hours: 12
-  sample_rate: 0.25
   bytes_per_sec: 104857600
   max_per_run: 200
+backup:
+  dir: /mnt/dr/jay-backups
+min_free_bytes: 1073741824
 seed_token:
   account: falco
   id: falco-native
@@ -115,8 +117,9 @@ func TestReadYAMLFile_Valid(t *testing.T) {
 		"rate_burst":           500,
 		"trust_proxy_headers":  true,
 		"scrub.interval_hours": 12,
-		"scrub.sample_rate":    0.25,
 		"scrub.max_per_run":    200,
+		"backup.dir":           "/mnt/dr/jay-backups",
+		"min_free_bytes":       1073741824,
 		"seed_token.account":   "falco",
 		"seed_token.id":        "falco-native",
 		"seed_token.secret":    "seed-secret-value",
@@ -191,9 +194,6 @@ func TestLoadConfigFromSources_YAMLOnly(t *testing.T) {
 	if cfg.ScrubInterval != 12*time.Hour {
 		t.Errorf("ScrubInterval: want 12h, got %v", cfg.ScrubInterval)
 	}
-	if cfg.ScrubSampleRate != 0.25 {
-		t.Errorf("ScrubSampleRate: want 0.25, got %v", cfg.ScrubSampleRate)
-	}
 	if cfg.ScrubBytesPerSec != 104857600 {
 		t.Errorf("ScrubBytesPerSec: want 104857600, got %v", cfg.ScrubBytesPerSec)
 	}
@@ -202,6 +202,12 @@ func TestLoadConfigFromSources_YAMLOnly(t *testing.T) {
 	}
 	if cfg.SeedTokenAccount != "falco" || cfg.SeedTokenID != "falco-native" || cfg.SeedTokenSecret != "seed-secret-value" {
 		t.Errorf("seed token mismatch: %+v", cfg)
+	}
+	if cfg.BackupDir != "/mnt/dr/jay-backups" {
+		t.Errorf("BackupDir: want /mnt/dr/jay-backups, got %q", cfg.BackupDir)
+	}
+	if cfg.MinFreeBytes != 1073741824 {
+		t.Errorf("MinFreeBytes: want 1073741824, got %d", cfg.MinFreeBytes)
 	}
 
 	// No env overrides, so no conflict warnings.
@@ -335,8 +341,153 @@ func TestLoadConfigFromSources_Defaults(t *testing.T) {
 		t.Fatalf("LoadConfigFromSources: %v", err)
 	}
 	want := defaultConfig()
+	// BackupDir is a derived default resolved by LoadConfigFromSources after
+	// all overlays, so defaultConfig leaves it empty.
+	want.BackupDir = filepath.Join(want.DataDir, "backups")
 	if cfg != want {
 		t.Errorf("defaults mismatch:\nwant %+v\ngot  %+v", want, cfg)
+	}
+}
+
+// --- backup dir + min free bytes ---------------------------------------------
+
+func TestLoadConfigFromSources_BackupDirDefaultFollowsDataDir(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_DATA_DIR", "/env/data")
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if want := filepath.Join("/env/data", "backups"); cfg.BackupDir != want {
+		t.Errorf("BackupDir: want %q, got %q", want, cfg.BackupDir)
+	}
+}
+
+func TestLoadConfigFromSources_BackupDirEnvOverridesYAML(t *testing.T) {
+	clearJAYEnv(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "jay.yaml")
+	if err := os.WriteFile(path, []byte("backup:\n  dir: /yaml/backups\n"), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	t.Setenv("JAY_BACKUP_DIR", "/env/backups")
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources(path, log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.BackupDir != "/env/backups" {
+		t.Errorf("BackupDir: want /env/backups, got %q", cfg.BackupDir)
+	}
+}
+
+func TestLoadConfigFromSources_MinFreeBytesDefault(t *testing.T) {
+	clearJAYEnv(t)
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if want := int64(500 << 20); cfg.MinFreeBytes != want {
+		t.Errorf("MinFreeBytes default: want %d, got %d", want, cfg.MinFreeBytes)
+	}
+}
+
+func TestLoadConfigFromSources_MinFreeBytesFromEnv(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_MIN_FREE_BYTES", "0") // 0 = check disabled
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.MinFreeBytes != 0 {
+		t.Errorf("MinFreeBytes: want 0, got %d", cfg.MinFreeBytes)
+	}
+}
+
+func TestLoadConfigFromSources_MinFreeBytesInvalidEnvKeepsDefault(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_MIN_FREE_BYTES", "-42")
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if want := int64(500 << 20); cfg.MinFreeBytes != want {
+		t.Errorf("MinFreeBytes: want default %d, got %d", want, cfg.MinFreeBytes)
+	}
+	if !strings.Contains(buf.String(), "JAY_MIN_FREE_BYTES") {
+		t.Errorf("expected error log for invalid JAY_MIN_FREE_BYTES, got: %s", buf.String())
+	}
+}
+
+func TestLoadConfigFromSources_MaxObjectSizeDefault(t *testing.T) {
+	clearJAYEnv(t)
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if want := int64(5 << 30); cfg.MaxObjectSize != want {
+		t.Errorf("MaxObjectSize default: want %d, got %d", want, cfg.MaxObjectSize)
+	}
+}
+
+func TestLoadConfigFromSources_MaxObjectSizeFromEnv(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_MAX_OBJECT_SIZE", "0") // 0 = unlimited
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.MaxObjectSize != 0 {
+		t.Errorf("MaxObjectSize: want 0, got %d", cfg.MaxObjectSize)
+	}
+}
+
+func TestLoadConfigFromSources_MaxObjectSizeFromYAML(t *testing.T) {
+	clearJAYEnv(t)
+
+	path := filepath.Join(t.TempDir(), "jay.yaml")
+	if err := os.WriteFile(path, []byte("max_object_size: 1048576\n"), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources(path, log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.MaxObjectSize != 1048576 {
+		t.Errorf("MaxObjectSize: want 1048576, got %d", cfg.MaxObjectSize)
+	}
+}
+
+func TestLoadConfigFromSources_MaxObjectSizeInvalidEnvKeepsDefault(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_MAX_OBJECT_SIZE", "-1")
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if want := int64(5 << 30); cfg.MaxObjectSize != want {
+		t.Errorf("MaxObjectSize: want default %d, got %d", want, cfg.MaxObjectSize)
+	}
+	if !strings.Contains(buf.String(), "JAY_MAX_OBJECT_SIZE") {
+		t.Errorf("expected error log for invalid JAY_MAX_OBJECT_SIZE, got: %s", buf.String())
 	}
 }
 
@@ -351,8 +502,9 @@ func clearJAYEnv(t *testing.T) {
 		"JAY_ADMIN_TOKEN", "JAY_SIGNING_SECRET", "JAY_LOG_LEVEL",
 		"JAY_TLS_CERT", "JAY_TLS_KEY",
 		"JAY_RATE_LIMIT", "JAY_RATE_BURST", "JAY_TRUST_PROXY_HEADERS",
-		"JAY_SCRUB_INTERVAL_HOURS", "JAY_SCRUB_SAMPLE_RATE",
+		"JAY_SCRUB_INTERVAL_HOURS",
 		"JAY_SCRUB_BYTES_PER_SEC", "JAY_SCRUB_MAX_PER_RUN",
+		"JAY_BACKUP_DIR", "JAY_MIN_FREE_BYTES", "JAY_MAX_OBJECT_SIZE",
 		"JAY_SEED_TOKEN_ACCOUNT", "JAY_SEED_TOKEN_ID", "JAY_SEED_TOKEN_SECRET",
 		"JAY_CONFIG_FILE",
 	}

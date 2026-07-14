@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -131,8 +132,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Health checker (not ready until recovery completes)
-	hc := NewHealthChecker(db)
+	// Health checker (not ready until recovery completes). Beyond the ready
+	// flag it probes bbolt and free disk space on every readiness request.
+	hc := NewHealthChecker(db, cfg.DataDir, cfg.MinFreeBytes)
 
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
@@ -167,7 +169,7 @@ func main() {
 	}
 
 	// Run startup recovery
-	if err := recovery.Run(db, st, log); err != nil {
+	if err := recovery.RunWithMetrics(db, st, log, metrics); err != nil {
 		log.Error("recovery failed", "err", err)
 		os.Exit(1)
 	}
@@ -186,21 +188,30 @@ func main() {
 	// durability loss without grepping logs.
 	st.SetFsyncErrorHook(func(err error) { metrics.RecordFsyncFailure() })
 
-	scrubber := maintenance.NewScrubber(db, st, log, cfg.ScrubInterval, cfg.ScrubSampleRate, cfg.ScrubBytesPerSec, cfg.ScrubMaxPerRun)
+	scrubber := maintenance.NewScrubber(db, st, log, cfg.ScrubInterval, cfg.ScrubBytesPerSec, cfg.ScrubMaxPerRun)
+	// Must be set before Start — the scrub goroutines read the field without
+	// synchronization.
+	scrubber.SetMetrics(metrics)
 	scrubber.Start()
 	defer scrubber.Stop()
 
 	// Start background GC (every 15 minutes). Wire deletion notifications so
 	// GC wakes immediately on delete instead of waiting for the next tick.
-	gc := maintenance.NewGC(cfg.DataDir, log, 15*time.Minute)
+	// The GC also reclaims expired multipart uploads (bbolt record + parts).
+	gc := maintenance.NewGC(cfg.DataDir, db, st, log, 15*time.Minute)
 	db.SetDeletionHook(gc.NotifyDeletion)
 	gc.Start()
 	defer gc.Stop()
 
-	// Start background backup (every 1 hour, keep 24, prune after 7 days)
-	backupMgr := maintenance.NewBackupManager(db, filepath.Join(cfg.DataDir, "backups"), log)
+	// Start background backup (every 1 hour, keep 24, prune after 7 days).
+	// BackupDir defaults to <DataDir>/backups; point JAY_BACKUP_DIR at a
+	// separate volume for real disaster recovery.
+	backupMgr := maintenance.NewBackupManager(db, cfg.BackupDir, log)
 	backupDone := make(chan struct{})
+	var backupWG sync.WaitGroup
+	backupWG.Add(1)
 	go func() {
+		defer backupWG.Done()
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for {
@@ -225,6 +236,7 @@ func main() {
 	}
 	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret, rlCfg)
 	s3Handler.SetTrustProxyHeaders(cfg.TrustProxyHeaders)
+	s3Handler.SetMaxObjectSize(cfg.MaxObjectSize)
 
 	shutdownS3, err := startServer(cfg.ListenAddr, s3Handler, log, "s3", cfg.TLSCert, cfg.TLSKey)
 	if err != nil {
@@ -239,6 +251,7 @@ func main() {
 	var shutdownNative func() error
 	if cfg.NativeAddr != "" {
 		nativeServer := jayproto.NewServer(db, st, au, log, metrics, int(cfg.RateLimit), cfg.RateBurst)
+		nativeServer.SetMaxObjectSize(cfg.MaxObjectSize)
 		var err error
 		shutdownNative, err = nativeServer.ListenAndServe(cfg.NativeAddr)
 		if err != nil {
@@ -262,8 +275,11 @@ func main() {
 	log.Info("jay: shutting down")
 
 	// Stop backup loop before the deferred db.Close so no Run() is in
-	// flight when bbolt.Close fires.
+	// flight when bbolt.Close fires. Wait for the goroutine to actually
+	// exit — close() alone only signals it, and an in-flight Run() would
+	// otherwise race the deferred bbolt.Close.
 	close(backupDone)
+	backupWG.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

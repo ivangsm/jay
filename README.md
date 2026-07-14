@@ -22,7 +22,7 @@ Jay provides dual API access: a fully S3-compatible HTTP API and a high-performa
 - **Bucket policies** -- prefix-based allow/deny rules with IP conditions
 - **Token authentication** -- scoped by actions, buckets, and key prefixes
 - **AWS SigV4** -- HMAC-validated mode for AWS CLI compatibility
-- **Integrity scrubbing** -- periodic SHA-256 verification (10% sample/6h)
+- **Integrity scrubbing** -- incremental SHA-256 verification (cursor-based, resumes across ticks)
 - **Quarantine** -- automatic isolation of corrupted objects
 - **Rate limiting** -- per-token token bucket with configurable rate/burst
 - **TLS** -- optional HTTPS for S3 and admin APIs
@@ -74,9 +74,14 @@ Jay accepts configuration from environment variables, a YAML config file, or bot
 | `JAY_RATE_BURST` | `200` | Rate limit burst size |
 | `JAY_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` headers |
 | `JAY_SCRUB_INTERVAL_HOURS` | `6` | Scrubber interval |
-| `JAY_SCRUB_SAMPLE_RATE` | `0.1` | Fraction of objects verified per pass, in `(0, 1]` |
 | `JAY_SCRUB_BYTES_PER_SEC` | `52428800` | Scrubber read throttle (0 = unlimited) |
-| `JAY_SCRUB_MAX_PER_RUN` | `100` | Max objects visited per bucket per pass |
+| `JAY_SCRUB_MAX_PER_RUN` | `100` | Max objects visited per bucket per scrub tick |
+| `JAY_BACKUP_DIR` | `<data_dir>/backups` | Where hourly bbolt snapshots are written; point at a separate volume for real DR |
+| `JAY_MIN_FREE_BYTES` | `524288000` (500 MiB) | Readiness fails below this free space on the data filesystem (`0` disables) |
+| `JAY_MAX_OBJECT_SIZE` | `5368709120` (5 GiB) | Largest accepted object body and multipart part (`0` disables) |
+| `JAY_SEED_TOKEN_ACCOUNT` | *(optional)* | Idempotent account+token seed; all three seed vars must be set together |
+| `JAY_SEED_TOKEN_ID` | *(optional)* | Seed token ID |
+| `JAY_SEED_TOKEN_SECRET` | *(optional)* | Seed token secret (bcrypt-hashed before persisting) |
 
 ### YAML Configuration File
 
@@ -105,9 +110,13 @@ tls_key: ${JAY_TLS_KEY:-}
 
 scrub:
   interval_hours: 6
-  sample_rate: 0.1
   bytes_per_sec: 52428800
   max_per_run: 100
+
+backup:
+  dir: ${JAY_BACKUP_DIR:-}
+min_free_bytes: 524288000
+max_object_size: 5368709120
 
 seed_token:
   account: ${JAY_SEED_TOKEN_ACCOUNT:-}
@@ -413,8 +422,8 @@ Returns JSON with counters for PutObject, GetObject, DeleteObject, HeadObject, L
 
 - **Metadata**: bbolt embedded key-value store (single-file, ACID)
 - **Object storage**: Atomic writes (temp file, fsync, rename, fsync dir) with 2-level sharded directory layout
-- **Checksums**: SHA-256 computed on every write, verified probabilistically on reads (5% sample)
-- **Scrubber**: Background goroutine checks 10% of objects every 6 hours
-- **GC**: Cleans temp files and empty dirs every 15 minutes
-- **Backup**: Hourly metadata snapshots, keeps 24, prunes after 7 days
+- **Checksums**: SHA-256 computed on every write; reads are not re-hashed (integrity is the scrubber's job)
+- **Scrubber**: Background goroutine, every `JAY_SCRUB_INTERVAL_HOURS`; each tick verifies up to `JAY_SCRUB_MAX_PER_RUN` objects per bucket, resuming from a per-bucket cursor until the whole bucket has been covered
+- **GC**: Cleans temp files and empty dirs every 15 minutes, and reclaims multipart uploads abandoned for >24h
+- **Backup**: Hourly metadata snapshots, verified after write (corrupt snapshots are deleted), keeps 24, prunes after 7 days
 - **Recovery**: On startup, reconciles metadata and physical files, quarantines inconsistencies

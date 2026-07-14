@@ -31,7 +31,6 @@ var fieldSpecs = []fieldSpec{
 	{yamlKey: "trust_proxy_headers", yamlPath: []string{"trust_proxy_headers"}, envKey: "JAY_TRUST_PROXY_HEADERS", kind: typeBool},
 
 	{yamlKey: "scrub.interval_hours", yamlPath: []string{"scrub", "interval_hours"}, envKey: "JAY_SCRUB_INTERVAL_HOURS", kind: typeInt},
-	{yamlKey: "scrub.sample_rate", yamlPath: []string{"scrub", "sample_rate"}, envKey: "JAY_SCRUB_SAMPLE_RATE", kind: typeFloat},
 	{yamlKey: "scrub.bytes_per_sec", yamlPath: []string{"scrub", "bytes_per_sec"}, envKey: "JAY_SCRUB_BYTES_PER_SEC", kind: typeInt},
 	{yamlKey: "scrub.max_per_run", yamlPath: []string{"scrub", "max_per_run"}, envKey: "JAY_SCRUB_MAX_PER_RUN", kind: typeInt},
 
@@ -68,7 +67,6 @@ var topLevelKnownKeys = map[string]bool{
 
 var scrubKnownKeys = map[string]bool{
 	"interval_hours": true,
-	"sample_rate":    true,
 	"bytes_per_sec":  true,
 	"max_per_run":    true,
 }
