@@ -42,10 +42,10 @@ const (
 	OpListObjects  byte = 0x14
 
 	OpCreateMultipartUpload byte = 0x20
-	OpUploadPart           byte = 0x21
-	OpCompleteMultipart    byte = 0x22
-	OpAbortMultipart       byte = 0x23
-	OpListParts            byte = 0x24
+	OpUploadPart            byte = 0x21
+	OpCompleteMultipart     byte = 0x22
+	OpAbortMultipart        byte = 0x23
+	OpListParts             byte = 0x24
 
 	OpPing byte = 0xFF
 )

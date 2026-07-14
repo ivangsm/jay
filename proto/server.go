@@ -27,6 +27,16 @@ const (
 	idleTimeout         = 60 * time.Second
 	minDataReadTimeout  = 30 * time.Second
 	dataReadBytesPerSec = 1 << 20 // 1 MB/s minimum expected throughput
+
+	// Write-side mirror of the read throughput policy. A client that stops
+	// reading its response would otherwise block the handler goroutine
+	// indefinitely in io.Copy / Flush, pinning an fd and a maxConns slot.
+	minDataWriteTimeout  = 30 * time.Second
+	dataWriteBytesPerSec = 1 << 20 // 1 MB/s minimum expected throughput
+
+	// shutdownGrace is how long Shutdown waits for in-flight requests to
+	// finish on their own before force-closing the remaining connections.
+	shutdownGrace = 5 * time.Second
 )
 
 // Server is the native TCP protocol server.
@@ -47,6 +57,14 @@ type Server struct {
 	maxConns int
 	active   atomic.Int64
 
+	// conns tracks live connections so Shutdown can force-close them when
+	// they don't drain within shutdownGrace (they only observe quit between
+	// requests, and an idle conn can sit in ReadHeader for up to 60s).
+	connMu       sync.Mutex
+	conns        map[net.Conn]struct{}
+	closing      bool
+	shutdownOnce sync.Once
+
 	limiter *ratelimit.Limiter
 }
 
@@ -66,11 +84,19 @@ func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, me
 		metrics:  metrics,
 		quit:     make(chan struct{}),
 		maxConns: defaultMaxConns,
+		conns:    make(map[net.Conn]struct{}),
 		limiter: ratelimit.New(ratelimit.Config{
 			Rate:  float64(rateLimit),
 			Burst: rateBurst,
 		}),
 	}
+}
+
+// SetMaxObjectSize caps the size of a single PutObject/UploadPart body.
+// 0 means unlimited. Must be called before ListenAndServe. The HTTP handler
+// owns a separate objops.Service and is configured through its own setter.
+func (s *Server) SetMaxObjectSize(n int64) {
+	s.objops.SetMaxObjectSize(n)
 }
 
 // ListenAndServe starts the TCP server on the given address.
@@ -88,15 +114,59 @@ func (s *Server) ListenAndServe(addr string) (func() error, error) {
 	return s.Shutdown, nil
 }
 
-// Shutdown gracefully stops the server.
+// Shutdown gracefully stops the server. It closes the listener, gives
+// in-flight connections shutdownGrace to finish on their own, then
+// force-closes whatever is still alive so shutdown time is bounded (a
+// connection blocked in ReadHeader only re-checks quit between requests and
+// could otherwise hold shutdown for the full 60s idle deadline).
+// Idempotent: subsequent calls return immediately.
 func (s *Server) Shutdown() error {
-	close(s.quit)
-	if err := s.listener.Close(); err != nil {
-		s.log.Debug("close listener", "err", err)
-	}
-	s.wg.Wait()
-	s.limiter.Stop()
+	s.shutdownOnce.Do(func() {
+		close(s.quit)
+		if err := s.listener.Close(); err != nil {
+			s.log.Debug("close listener", "err", err)
+		}
+
+		done := make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(shutdownGrace):
+			s.connMu.Lock()
+			s.closing = true
+			for c := range s.conns {
+				_ = c.Close()
+			}
+			s.connMu.Unlock()
+			<-done
+		}
+
+		s.limiter.Stop()
+	})
 	return nil
+}
+
+// trackConn registers an accepted connection for Shutdown's force-close
+// sweep. Returns false when the sweep already ran — the caller must close
+// the connection and bail instead of serving it.
+func (s *Server) trackConn(c net.Conn) bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.conns[c] = struct{}{}
+	return true
+}
+
+func (s *Server) untrackConn(c net.Conn) {
+	s.connMu.Lock()
+	delete(s.conns, c)
+	s.connMu.Unlock()
 }
 
 func (s *Server) acceptLoop() {
@@ -118,9 +188,14 @@ func (s *Server) acceptLoop() {
 			continue
 		}
 
+		if !s.trackConn(conn) {
+			_ = conn.Close()
+			continue
+		}
 		s.active.Add(1)
 		s.wg.Go(func() {
 			defer s.active.Add(-1)
+			defer s.untrackConn(conn)
 			s.handleConn(conn)
 		})
 	}
@@ -276,10 +351,13 @@ func (h *connHandler) handleOneRequest() error {
 			}
 		}
 		errMeta := EncodeError("rate limit exceeded", "RateLimitExceeded")
-		if wErr := WriteFrameCombined(h.bw, StatusBadRequest, streamID, errMeta); wErr != nil {
+		if wErr := h.writeResponseCombined(StatusBadRequest, streamID, errMeta); wErr != nil {
 			return wErr
 		}
-		return h.bw.Flush()
+		if err := h.bw.Flush(); err != nil {
+			return err
+		}
+		return h.conn.SetWriteDeadline(time.Time{})
 	}
 
 	// Clear the idle deadline now that we have a request header.
@@ -328,7 +406,15 @@ func (h *connHandler) handleOneRequest() error {
 		return fmt.Errorf("clear data read deadline: %w", err)
 	}
 
-	return h.bw.Flush()
+	if err := h.bw.Flush(); err != nil {
+		return err
+	}
+	// Clear the write deadline armed by the response writers so it cannot
+	// leak into the next request's response.
+	if err := h.conn.SetWriteDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear write deadline: %w", err)
+	}
+	return nil
 }
 
 type request struct {
@@ -339,7 +425,22 @@ type request struct {
 	dataLen  int64
 }
 
+// armWriteDeadline sets a write deadline scaled by the response payload size:
+// max(minDataWriteTimeout, payload at dataWriteBytesPerSec + 1s). Every
+// response writer must call it before touching the connection; the deadline
+// is cleared after the final flush in handleOneRequest.
+func (h *connHandler) armWriteDeadline(payloadLen int64) error {
+	timeout := time.Duration(payloadLen/dataWriteBytesPerSec+1) * time.Second
+	if timeout < minDataWriteTimeout {
+		timeout = minDataWriteTimeout
+	}
+	return h.conn.SetWriteDeadline(time.Now().Add(timeout))
+}
+
 func (h *connHandler) writeResponse(status byte, streamID uint32, meta []byte, data io.Reader, dataLen int64) error {
+	if err := h.armWriteDeadline(int64(len(meta)) + dataLen); err != nil {
+		return err
+	}
 	return WriteFrame(h.bw, status, streamID, meta, data, dataLen)
 }
 

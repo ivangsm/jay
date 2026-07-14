@@ -23,6 +23,8 @@ func mapObjopsStatus(err error) (status byte, msg, code string, handled bool) {
 		return StatusNotFound, "object not found", "NoSuchKey", true
 	case errors.Is(err, objops.ErrPolicyDenied), errors.Is(err, objops.ErrAccessDenied):
 		return StatusForbidden, "access denied", "AccessDenied", true
+	case errors.Is(err, objops.ErrObjectTooLarge):
+		return StatusBadRequest, "object exceeds the configured maximum size", "EntityTooLarge", true
 	}
 	return 0, "", "", false
 }
@@ -75,7 +77,8 @@ func (h *connHandler) handlePutObject(req *request) error {
 		h.metrics.BytesUploaded.Add(obj.SizeBytes)
 	}
 
-	return h.writeResponseCombined(StatusOK, req.streamID, EncodePutResponse(obj.ETag, obj.ChecksumSHA256))
+	resp, encErr := EncodePutResponse(obj.ETag, obj.ChecksumSHA256)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }
 
 // handleGetObject streams the object body directly from the underlying
@@ -104,12 +107,16 @@ func (h *connHandler) handleGetObject(req *request) error {
 	}
 	defer func() { _ = f.Close() }()
 
-	resp := EncodeObjectInfo(
+	resp, encErr := EncodeObjectInfo(
 		obj.ContentType, obj.SizeBytes,
 		obj.ETag, obj.ChecksumSHA256,
 		obj.UpdatedAt.Format(time.RFC3339),
 		obj.MetadataHeaders,
 	)
+	if encErr != nil {
+		h.log.Error("encode response", "err", encErr)
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 
 	if h.metrics != nil {
 		h.metrics.GetObjectTotal.Add(1)
@@ -123,6 +130,12 @@ func (h *connHandler) handleGetObject(req *request) error {
 // writer, flushes, then copies the file body straight to the raw net.Conn so
 // (*net.TCPConn).ReadFrom can delegate to sendfile(2).
 func (h *connHandler) writeResponseStreaming(status byte, streamID uint32, meta []byte, file *os.File, dataLen int64) error {
+	// Arm a size-scaled write deadline so a client that stops reading cannot
+	// pin this goroutine in io.Copy below. Cleared after the final flush in
+	// handleOneRequest.
+	if err := h.armWriteDeadline(int64(len(meta)) + dataLen); err != nil {
+		return err
+	}
 	if err := WriteHeader(h.bw, status, streamID, uint32(len(meta)), dataLen); err != nil {
 		return err
 	}
@@ -158,12 +171,16 @@ func (h *connHandler) handleHeadObject(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	resp := EncodeObjectInfo(
+	resp, encErr := EncodeObjectInfo(
 		obj.ContentType, obj.SizeBytes,
 		obj.ETag, obj.ChecksumSHA256,
 		obj.UpdatedAt.Format(time.RFC3339),
 		obj.MetadataHeaders,
 	)
+	if encErr != nil {
+		h.log.Error("encode response", "err", encErr)
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
 
 	if h.metrics != nil {
 		h.metrics.HeadObjectTotal.Add(1)
@@ -209,6 +226,16 @@ func drainData(req *request) error {
 		return errDataTooLarge
 	}
 	_, err := io.CopyN(io.Discard, req.data, req.dataLen)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		// req.data is an io.LimitReader capped at dataLen over the frame
+		// body. Hitting EOF before dataLen means the handler already
+		// consumed part (or all) of the body before failing — the frame is
+		// fully consumed and the connection is still correctly framed, so
+		// this is success, not a reason to kill the connection. (A genuinely
+		// truncated connection also surfaces as EOF here, but then the
+		// subsequent response write/flush fails and closes the conn anyway.)
+		return nil
+	}
 	return err
 }
 

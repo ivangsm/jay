@@ -2,16 +2,11 @@ package proto
 
 import (
 	"errors"
-	"net"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/ivangsm/jay/meta"
 )
-
-var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$`)
 
 func (h *connHandler) handleCreateBucket(req *request) error {
 	bucket, err := DecodeBucket(req.meta)
@@ -23,10 +18,7 @@ func (h *connHandler) handleCreateBucket(req *request) error {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
-	if !validBucketName.MatchString(bucket) ||
-		strings.Contains(bucket, "..") ||
-		strings.Contains(bucket, "--") ||
-		net.ParseIP(bucket) != nil {
+	if !meta.ValidBucketName(bucket) {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid bucket name", "InvalidBucketName")
 	}
 
@@ -50,8 +42,8 @@ func (h *connHandler) handleCreateBucket(req *request) error {
 		h.log.Error("ensure bucket dir", "err", err, "bucket", b.Name)
 	}
 
-	resp := EncodeBucketInfo(b.ID, b.Name, b.CreatedAt.Format(time.RFC3339), b.Visibility)
-	return h.writeResponseCombined(StatusOK, req.streamID, resp)
+	resp, encErr := EncodeBucketInfo(b.ID, b.Name, b.CreatedAt.Format(time.RFC3339), b.Visibility)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }
 
 func (h *connHandler) handleDeleteBucket(req *request) error {
@@ -70,6 +62,12 @@ func (h *connHandler) handleDeleteBucket(req *request) error {
 			return h.writeError(StatusNotFound, req.streamID, "bucket not found", "NoSuchBucket")
 		}
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+
+	// Token scope alone is not enough to destroy a bucket owned by another
+	// account — mirrors the HTTP handler (api/bucket_handlers.go).
+	if err := h.auth.AuthorizeBucketOwnership(h.token, bkt); err != nil {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
 	if err := h.db.DeleteBucket(bucket); err != nil {
@@ -103,8 +101,14 @@ func (h *connHandler) handleHeadBucket(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
-	resp := EncodeBucketInfo(bkt.ID, bkt.Name, bkt.CreatedAt.Format(time.RFC3339), bkt.Visibility)
-	return h.writeResponseCombined(StatusOK, req.streamID, resp)
+	// Reading another account's bucket metadata requires ownership (or an
+	// explicit BucketScope) — mirrors the HTTP handler.
+	if err := h.auth.AuthorizeBucketOwnership(h.token, bkt); err != nil {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
+	}
+
+	resp, encErr := EncodeBucketInfo(bkt.ID, bkt.Name, bkt.CreatedAt.Format(time.RFC3339), bkt.Visibility)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }
 
 func (h *connHandler) handleListBuckets(req *request) error {
@@ -125,5 +129,6 @@ func (h *connHandler) handleListBuckets(req *request) error {
 		createdAts[i] = b.CreatedAt.Format(time.RFC3339)
 	}
 
-	return h.writeResponseCombined(StatusOK, req.streamID, EncodeBucketList(names, createdAts))
+	resp, encErr := EncodeBucketList(names, createdAts)
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }

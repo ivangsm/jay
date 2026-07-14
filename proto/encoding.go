@@ -16,30 +16,71 @@ import (
 
 var errShortBuffer = errors.New("proto: short buffer")
 
-// Encoder appends binary-encoded fields to a byte slice.
+// Wire-format limits. Strings are length-prefixed with a uint16, and maps /
+// slices are count-prefixed with a uint16, so neither can exceed 65535.
+// Exceeding either used to wrap silently and produce a frame the peer would
+// decode as garbage; the Encoder now records an error instead.
+const (
+	maxWireStringLen = math.MaxUint16 // 65535 bytes
+	maxWireCount     = math.MaxUint16 // 65535 elements
+)
+
+// ErrFieldTooLarge is returned when a value does not fit the wire format.
+var ErrFieldTooLarge = errors.New("proto: field exceeds wire limit")
+
+// Encoder appends binary-encoded fields to a byte slice. It accumulates the
+// first encoding error; subsequent writes are no-ops and Err reports it.
+// Callers MUST check Err before putting Bytes on the wire.
 type Encoder struct {
 	buf []byte
+	err error
 }
 
 func NewEncoder(buf []byte) *Encoder {
 	return &Encoder{buf: buf[:0]}
 }
 
+// Bytes returns the encoded buffer. Only valid when Err returns nil.
 func (e *Encoder) Bytes() []byte { return e.buf }
 
+// Err returns the first error hit while encoding, if any.
+func (e *Encoder) Err() error { return e.err }
+
+func (e *Encoder) fail(err error) {
+	if e.err == nil {
+		e.err = err
+	}
+}
+
 func (e *Encoder) String(s string) {
+	if e.err != nil {
+		return
+	}
+	if len(s) > maxWireStringLen {
+		e.fail(fmt.Errorf("%w: string of %d bytes exceeds %d", ErrFieldTooLarge, len(s), maxWireStringLen))
+		return
+	}
 	e.buf = appendString(e.buf, s)
 }
 
 func (e *Encoder) Int64(v int64) {
+	if e.err != nil {
+		return
+	}
 	e.buf = binary.BigEndian.AppendUint64(e.buf, uint64(v))
 }
 
 func (e *Encoder) Int32(v int32) {
+	if e.err != nil {
+		return
+	}
 	e.buf = binary.BigEndian.AppendUint32(e.buf, uint32(v))
 }
 
 func (e *Encoder) Bool(v bool) {
+	if e.err != nil {
+		return
+	}
 	if v {
 		e.buf = append(e.buf, 1)
 	} else {
@@ -47,31 +88,58 @@ func (e *Encoder) Bool(v bool) {
 	}
 }
 
+// Count writes a uint16 element count, failing if n does not fit.
+func (e *Encoder) Count(n int) {
+	if e.err != nil {
+		return
+	}
+	if n < 0 || n > maxWireCount {
+		e.fail(fmt.Errorf("%w: collection of %d elements exceeds %d", ErrFieldTooLarge, n, maxWireCount))
+		return
+	}
+	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(n))
+}
+
 func (e *Encoder) StringMap(m map[string]string) {
-	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(len(m)))
+	e.Count(len(m))
 	for k, v := range m {
-		e.buf = appendString(e.buf, k)
-		e.buf = appendString(e.buf, v)
+		e.String(k)
+		e.String(v)
 	}
 }
 
 func (e *Encoder) Strings(ss []string) {
-	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(len(ss)))
+	e.Count(len(ss))
 	for _, s := range ss {
-		e.buf = appendString(e.buf, s)
+		e.String(s)
 	}
 }
 
 func (e *Encoder) Ints(ii []int) {
-	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(len(ii)))
+	e.Count(len(ii))
+	if e.err != nil {
+		return
+	}
 	for _, v := range ii {
 		e.buf = binary.BigEndian.AppendUint32(e.buf, uint32(v))
 	}
 }
 
+// appendString is the raw length-prefixed string writer. Callers must have
+// already validated len(s) <= maxWireStringLen (Encoder.String does).
 func appendString(buf []byte, s string) []byte {
 	buf = binary.BigEndian.AppendUint16(buf, uint16(len(s)))
 	return append(buf, s...)
+}
+
+// truncateForWire clamps s to the wire limit. Only used for human-readable
+// error strings, where a shortened message is strictly better than failing to
+// report the error at all. Never use it for keys or identifiers.
+func truncateForWire(s string) string {
+	if len(s) > maxWireStringLen {
+		return s[:maxWireStringLen]
+	}
+	return s
 }
 
 // Decoder reads binary-encoded fields from a byte slice.
@@ -219,13 +287,18 @@ func (d *Decoder) Ints() []int {
 }
 
 // --- Encoding functions for common wire types ---
+//
+// Every Encode* function returns an error when a field does not fit the wire
+// format (strings > 64 KiB, collections > 65535 elements). Callers must not
+// put the returned bytes on the wire when err != nil — the frame would be
+// truncated/corrupt.
 
 // EncodeBucketKey encodes a bucket+key pair (used by Get, Head, Delete).
-func EncodeBucketKey(bucket, key string) []byte {
-	buf := make([]byte, 0, 4+len(bucket)+len(key))
-	buf = appendString(buf, bucket)
-	buf = appendString(buf, key)
-	return buf
+func EncodeBucketKey(bucket, key string) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 4+len(bucket)+len(key)))
+	e.String(bucket)
+	e.String(key)
+	return e.Bytes(), e.Err()
 }
 
 // DecodeBucketKey decodes a bucket+key pair.
@@ -237,9 +310,10 @@ func DecodeBucketKey(data []byte) (bucket, key string, err error) {
 }
 
 // EncodeBucket encodes a bucket name.
-func EncodeBucket(bucket string) []byte {
-	buf := make([]byte, 0, 2+len(bucket))
-	return appendString(buf, bucket)
+func EncodeBucket(bucket string) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 2+len(bucket)))
+	e.String(bucket)
+	return e.Bytes(), e.Err()
 }
 
 // DecodeBucket decodes a bucket name.
@@ -250,7 +324,7 @@ func DecodeBucket(data []byte) (string, error) {
 }
 
 // EncodePutObjectRequest encodes a PutObject request.
-func EncodePutObjectRequest(bucket, key, contentType string, metadata map[string]string) []byte {
+func EncodePutObjectRequest(bucket, key, contentType string, metadata map[string]string) ([]byte, error) {
 	n := 2 + len(bucket) + 2 + len(key) + 2 + len(contentType) + 2
 	for k, v := range metadata {
 		n += 4 + len(k) + len(v)
@@ -260,7 +334,7 @@ func EncodePutObjectRequest(bucket, key, contentType string, metadata map[string
 	e.String(key)
 	e.String(contentType)
 	e.StringMap(metadata)
-	return e.Bytes()
+	return e.Bytes(), e.Err()
 }
 
 // DecodePutObjectRequest decodes a PutObject request.
@@ -274,11 +348,11 @@ func DecodePutObjectRequest(data []byte) (bucket, key, contentType string, metad
 }
 
 // EncodePutResponse encodes a PutObject/UploadPart response.
-func EncodePutResponse(etag, checksum string) []byte {
-	buf := make([]byte, 0, 4+len(etag)+len(checksum))
-	buf = appendString(buf, etag)
-	buf = appendString(buf, checksum)
-	return buf
+func EncodePutResponse(etag, checksum string) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 4+len(etag)+len(checksum)))
+	e.String(etag)
+	e.String(checksum)
+	return e.Bytes(), e.Err()
 }
 
 // DecodePutResponse decodes a PutObject/UploadPart response.
@@ -290,7 +364,7 @@ func DecodePutResponse(data []byte) (etag, checksum string, err error) {
 }
 
 // EncodeObjectInfo encodes object metadata for Get/Head responses.
-func EncodeObjectInfo(contentType string, size int64, etag, checksum, lastModified string, metadata map[string]string) []byte {
+func EncodeObjectInfo(contentType string, size int64, etag, checksum, lastModified string, metadata map[string]string) ([]byte, error) {
 	n := 2 + len(contentType) + 8 + 2 + len(etag) + 2 + len(checksum) + 2 + len(lastModified) + 2
 	for k, v := range metadata {
 		n += 4 + len(k) + len(v)
@@ -302,7 +376,7 @@ func EncodeObjectInfo(contentType string, size int64, etag, checksum, lastModifi
 	e.String(checksum)
 	e.String(lastModified)
 	e.StringMap(metadata)
-	return e.Bytes()
+	return e.Bytes(), e.Err()
 }
 
 // DecodeObjectInfo decodes object metadata.
@@ -317,12 +391,14 @@ func DecodeObjectInfo(data []byte) (contentType string, size int64, etag, checks
 	return contentType, size, etag, checksum, lastModified, metadata, d.Err()
 }
 
-// EncodeError encodes an error response.
+// EncodeError encodes an error response. Unlike the other encoders it cannot
+// fail: message and code are clamped to the wire limit so the server can
+// always report an error, even one triggered by an oversized field.
 func EncodeError(message, code string) []byte {
-	buf := make([]byte, 0, 4+len(message)+len(code))
-	buf = appendString(buf, message)
-	buf = appendString(buf, code)
-	return buf
+	e := NewEncoder(make([]byte, 0, 4+len(message)+len(code)))
+	e.String(truncateForWire(message))
+	e.String(truncateForWire(code))
+	return e.Bytes()
 }
 
 // DecodeError decodes an error response.
@@ -334,14 +410,14 @@ func DecodeError(data []byte) (message, code string, err error) {
 }
 
 // EncodeBucketInfo encodes bucket metadata.
-func EncodeBucketInfo(bucketID, name, createdAt, visibility string) []byte {
+func EncodeBucketInfo(bucketID, name, createdAt, visibility string) ([]byte, error) {
 	n := 2 + len(bucketID) + 2 + len(name) + 2 + len(createdAt) + 2 + len(visibility)
-	buf := make([]byte, 0, n)
-	buf = appendString(buf, bucketID)
-	buf = appendString(buf, name)
-	buf = appendString(buf, createdAt)
-	buf = appendString(buf, visibility)
-	return buf
+	e := NewEncoder(make([]byte, 0, n))
+	e.String(bucketID)
+	e.String(name)
+	e.String(createdAt)
+	e.String(visibility)
+	return e.Bytes(), e.Err()
 }
 
 // DecodeBucketInfo decodes bucket metadata.
@@ -355,7 +431,7 @@ func DecodeBucketInfo(data []byte) (bucketID, name, createdAt, visibility string
 }
 
 // EncodeListObjectsRequest encodes a ListObjects request.
-func EncodeListObjectsRequest(bucket, prefix, delimiter, startAfter string, maxKeys int) []byte {
+func EncodeListObjectsRequest(bucket, prefix, delimiter, startAfter string, maxKeys int) ([]byte, error) {
 	n := 2 + len(bucket) + 2 + len(prefix) + 2 + len(delimiter) + 2 + len(startAfter) + 4
 	e := NewEncoder(make([]byte, n))
 	e.String(bucket)
@@ -363,7 +439,7 @@ func EncodeListObjectsRequest(bucket, prefix, delimiter, startAfter string, maxK
 	e.String(delimiter)
 	e.String(startAfter)
 	e.Int32(int32(maxKeys))
-	return e.Bytes()
+	return e.Bytes(), e.Err()
 }
 
 // DecodeListObjectsRequest decodes a ListObjects request.
@@ -388,7 +464,7 @@ type ListObjectEntry struct {
 }
 
 // EncodeListObjectsResponse encodes a ListObjects response.
-func EncodeListObjectsResponse(objects []ListObjectEntry, commonPrefixes []string, isTruncated bool, nextStartAfter string) []byte {
+func EncodeListObjectsResponse(objects []ListObjectEntry, commonPrefixes []string, isTruncated bool, nextStartAfter string) ([]byte, error) {
 	// Estimate size
 	n := 2 // object count
 	for _, o := range objects {
@@ -401,7 +477,7 @@ func EncodeListObjectsResponse(objects []ListObjectEntry, commonPrefixes []strin
 	n += 1 + 2 + len(nextStartAfter) // bool + string
 
 	e := NewEncoder(make([]byte, n))
-	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(len(objects)))
+	e.Count(len(objects))
 	for _, o := range objects {
 		e.String(o.Key)
 		e.Int64(o.Size)
@@ -413,7 +489,7 @@ func EncodeListObjectsResponse(objects []ListObjectEntry, commonPrefixes []strin
 	e.Strings(commonPrefixes)
 	e.Bool(isTruncated)
 	e.String(nextStartAfter)
-	return e.Bytes()
+	return e.Bytes(), e.Err()
 }
 
 // DecodeListObjectsResponse decodes a ListObjects response.
@@ -440,12 +516,12 @@ func DecodeListObjectsResponse(data []byte) (objects []ListObjectEntry, commonPr
 }
 
 // EncodeCreateMultipartRequest encodes a CreateMultipartUpload request.
-func EncodeCreateMultipartRequest(bucket, key, contentType string) []byte {
-	buf := make([]byte, 0, 6+len(bucket)+len(key)+len(contentType))
-	buf = appendString(buf, bucket)
-	buf = appendString(buf, key)
-	buf = appendString(buf, contentType)
-	return buf
+func EncodeCreateMultipartRequest(bucket, key, contentType string) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 6+len(bucket)+len(key)+len(contentType)))
+	e.String(bucket)
+	e.String(key)
+	e.String(contentType)
+	return e.Bytes(), e.Err()
 }
 
 // DecodeCreateMultipartRequest decodes a CreateMultipartUpload request.
@@ -458,13 +534,13 @@ func DecodeCreateMultipartRequest(data []byte) (bucket, key, contentType string,
 }
 
 // EncodeUploadPartRequest encodes an UploadPart request.
-func EncodeUploadPartRequest(bucket, key, uploadID string, partNumber int) []byte {
-	buf := make([]byte, 0, 10+len(bucket)+len(key)+len(uploadID))
-	buf = appendString(buf, bucket)
-	buf = appendString(buf, key)
-	buf = appendString(buf, uploadID)
-	buf = binary.BigEndian.AppendUint32(buf, uint32(partNumber))
-	return buf
+func EncodeUploadPartRequest(bucket, key, uploadID string, partNumber int) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 10+len(bucket)+len(key)+len(uploadID)))
+	e.String(bucket)
+	e.String(key)
+	e.String(uploadID)
+	e.Int32(int32(partNumber))
+	return e.Bytes(), e.Err()
 }
 
 // DecodeUploadPartRequest decodes an UploadPart request.
@@ -478,14 +554,14 @@ func DecodeUploadPartRequest(data []byte) (bucket, key, uploadID string, partNum
 }
 
 // EncodeCompleteMultipartRequest encodes a CompleteMultipartUpload request.
-func EncodeCompleteMultipartRequest(bucket, key, uploadID string, partNumbers []int) []byte {
+func EncodeCompleteMultipartRequest(bucket, key, uploadID string, partNumbers []int) ([]byte, error) {
 	n := 6 + len(bucket) + len(key) + 2 + len(uploadID) + 2 + 4*len(partNumbers)
 	e := NewEncoder(make([]byte, n))
 	e.String(bucket)
 	e.String(key)
 	e.String(uploadID)
 	e.Ints(partNumbers)
-	return e.Bytes()
+	return e.Bytes(), e.Err()
 }
 
 // DecodeCompleteMultipartRequest decodes a CompleteMultipartUpload request.
@@ -499,12 +575,12 @@ func DecodeCompleteMultipartRequest(data []byte) (bucket, key, uploadID string, 
 }
 
 // EncodeBucketKeyUpload encodes a bucket+key+uploadID triple (for abort/list parts).
-func EncodeBucketKeyUpload(bucket, key, uploadID string) []byte {
-	buf := make([]byte, 0, 6+len(bucket)+len(key)+len(uploadID))
-	buf = appendString(buf, bucket)
-	buf = appendString(buf, key)
-	buf = appendString(buf, uploadID)
-	return buf
+func EncodeBucketKeyUpload(bucket, key, uploadID string) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 6+len(bucket)+len(key)+len(uploadID)))
+	e.String(bucket)
+	e.String(key)
+	e.String(uploadID)
+	return e.Bytes(), e.Err()
 }
 
 // DecodeBucketKeyUpload decodes a bucket+key+uploadID triple.
@@ -517,12 +593,12 @@ func DecodeBucketKeyUpload(data []byte) (bucket, key, uploadID string, err error
 }
 
 // EncodeCompleteMultipartResponse encodes a CompleteMultipartUpload response.
-func EncodeCompleteMultipartResponse(etag, checksum string, size int64) []byte {
-	buf := make([]byte, 0, 4+len(etag)+len(checksum)+8)
-	buf = appendString(buf, etag)
-	buf = appendString(buf, checksum)
-	buf = binary.BigEndian.AppendUint64(buf, uint64(size))
-	return buf
+func EncodeCompleteMultipartResponse(etag, checksum string, size int64) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 4+len(etag)+len(checksum)+8))
+	e.String(etag)
+	e.String(checksum)
+	e.Int64(size)
+	return e.Bytes(), e.Err()
 }
 
 // DecodeCompleteMultipartResponse decodes a CompleteMultipartUpload response.
@@ -543,20 +619,20 @@ type PartInfoEntry struct {
 }
 
 // EncodeListPartsResponse encodes a ListParts response.
-func EncodeListPartsResponse(parts []PartInfoEntry) []byte {
+func EncodeListPartsResponse(parts []PartInfoEntry) ([]byte, error) {
 	n := 2
 	for _, p := range parts {
 		n += 4 + 8 + 2 + len(p.ETag) + 2 + len(p.ChecksumSHA256)
 	}
 	e := NewEncoder(make([]byte, n))
-	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(len(parts)))
+	e.Count(len(parts))
 	for _, p := range parts {
 		e.Int32(int32(p.PartNumber))
 		e.Int64(p.Size)
 		e.String(p.ETag)
 		e.String(p.ChecksumSHA256)
 	}
-	return e.Bytes()
+	return e.Bytes(), e.Err()
 }
 
 // DecodeListPartsResponse decodes a ListParts response.
@@ -578,18 +654,18 @@ func DecodeListPartsResponse(data []byte) ([]PartInfoEntry, error) {
 }
 
 // EncodeBucketList encodes a list of buckets.
-func EncodeBucketList(names []string, createdAts []string) []byte {
+func EncodeBucketList(names []string, createdAts []string) ([]byte, error) {
 	n := 2
 	for i := range names {
 		n += 2 + len(names[i]) + 2 + len(createdAts[i])
 	}
 	e := NewEncoder(make([]byte, n))
-	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(len(names)))
+	e.Count(len(names))
 	for i := range names {
 		e.String(names[i])
 		e.String(createdAts[i])
 	}
-	return e.Bytes()
+	return e.Bytes(), e.Err()
 }
 
 // DecodeBucketList decodes a list of buckets.
