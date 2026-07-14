@@ -22,7 +22,10 @@ type BucketEntry struct {
 
 // CreateBucket creates a new bucket.
 func (c *Client) CreateBucket(name string) (*BucketInfo, error) {
-	meta := proto.EncodeBucket(name)
+	meta, err := proto.EncodeBucket(name)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpCreateBucket, meta)
 	if err != nil {
 		return nil, err
@@ -39,7 +42,10 @@ func (c *Client) CreateBucket(name string) (*BucketInfo, error) {
 
 // DeleteBucket deletes a bucket.
 func (c *Client) DeleteBucket(name string) error {
-	meta := proto.EncodeBucket(name)
+	meta, err := proto.EncodeBucket(name)
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpDeleteBucket, meta)
 	if err != nil {
 		return err
@@ -49,7 +55,10 @@ func (c *Client) DeleteBucket(name string) error {
 
 // HeadBucket returns metadata about a bucket.
 func (c *Client) HeadBucket(name string) (*BucketInfo, error) {
-	meta := proto.EncodeBucket(name)
+	meta, err := proto.EncodeBucket(name)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpHeadBucket, meta)
 	if err != nil {
 		return nil, err

@@ -45,7 +45,10 @@ func (c *Client) PutObject(bucket, key string, data io.Reader, size int64, opts 
 		metadata = opts.Metadata
 	}
 
-	meta := proto.EncodePutObjectRequest(bucket, key, contentType, metadata)
+	meta, err := proto.EncodePutObjectRequest(bucket, key, contentType, metadata)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequestWithData(proto.OpPutObject, meta, data, size)
 	if err != nil {
 		return nil, err
@@ -63,7 +66,10 @@ func (c *Client) PutObject(bucket, key string, data io.Reader, size int64, opts 
 // GetObject downloads an object. Returns object info and a streaming body.
 // The caller must call result.Body.Close() when done reading.
 func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
-	meta := proto.EncodeBucketKey(bucket, key)
+	meta, err := proto.EncodeBucketKey(bucket, key)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, dataReader, _, err := c.doRequestWithDataResponse(proto.OpGetObject, meta)
 	if err != nil {
 		return nil, err
@@ -103,7 +109,10 @@ func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
 
 // HeadObject returns object metadata without downloading the content.
 func (c *Client) HeadObject(bucket, key string) (*ObjectInfo, error) {
-	meta := proto.EncodeBucketKey(bucket, key)
+	meta, err := proto.EncodeBucketKey(bucket, key)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpHeadObject, meta)
 	if err != nil {
 		return nil, err
@@ -127,7 +136,10 @@ func (c *Client) HeadObject(bucket, key string) (*ObjectInfo, error) {
 
 // DeleteObject deletes an object.
 func (c *Client) DeleteObject(bucket, key string) error {
-	meta := proto.EncodeBucketKey(bucket, key)
+	meta, err := proto.EncodeBucketKey(bucket, key)
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpDeleteObject, meta)
 	if err != nil {
 		return err

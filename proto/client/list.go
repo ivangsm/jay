@@ -43,7 +43,10 @@ func (c *Client) ListObjects(bucket string, opts *ListOptions) (*ListResult, err
 		maxKeys = opts.MaxKeys
 	}
 
-	meta := proto.EncodeListObjectsRequest(bucket, prefix, delimiter, startAfter, maxKeys)
+	meta, err := proto.EncodeListObjectsRequest(bucket, prefix, delimiter, startAfter, maxKeys)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	status, respMeta, err := c.doRequest(proto.OpListObjects, meta)
 	if err != nil {
 		return nil, err
