@@ -19,8 +19,8 @@ var (
 	bucketSys       = []byte("sys")
 
 	// Nested buckets under bucketSys.
-	sysBucketStats         = []byte("bucket_stats")
-	sysAccountBucketCount  = []byte("account_bucket_count")
+	sysBucketStats        = []byte("bucket_stats")
+	sysAccountBucketCount = []byte("account_bucket_count")
 )
 
 func objectsBucketName(bucketID string) []byte {
@@ -38,6 +38,7 @@ type DB struct {
 
 	hookMu              sync.RWMutex
 	tokenInvalidateHook func(tokenID string)
+	deletionHook        func()
 }
 
 // Open opens or creates the bbolt database at the given path.
@@ -84,7 +85,9 @@ func (db *DB) Backup(w io.Writer) error {
 
 func (db *DB) bootstrap() error {
 	return db.bolt.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketAccounts, bucketBuckets, bucketBucketsID, bucketTokens, bucketSys} {
+		// bucketMultipart is created here (not lazily on each CreateMultipartUpload)
+		// so the multipart hot path never needs an extra write transaction.
+		for _, name := range [][]byte{bucketAccounts, bucketBuckets, bucketBucketsID, bucketTokens, bucketSys, bucketMultipart} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return fmt.Errorf("meta: create bucket %s: %w", name, err)
 			}

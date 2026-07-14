@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
 )
@@ -121,6 +122,169 @@ func TestRun_QuarantinesMetaWithoutFile(t *testing.T) {
 	}
 }
 
+// TestRunWithMetrics_CountsQuarantines verifies that RunWithMetrics increments
+// ObjectsQuarantined for every effective quarantine (metadata without file and
+// orphaned physical file), and that Run (nil metrics) keeps working.
+func TestRunWithMetrics_CountsQuarantines(t *testing.T) {
+	db, st, log := openTestEnv(t)
+
+	bucketID := uuid.New().String()
+	bkt := &meta.Bucket{
+		ID:         bucketID,
+		Name:       "test-bucket-metrics",
+		Visibility: "private",
+		Status:     "active",
+	}
+	if err := db.CreateBucket(bkt); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	// 1. Active metadata entry with no physical file → meta quarantine.
+	orphanMetaID := uuid.New().String()
+	obj := &meta.Object{
+		BucketID:    bucketID,
+		Key:         "metrics-orphan-meta.bin",
+		ObjectID:    orphanMetaID,
+		State:       "active",
+		SizeBytes:   7,
+		ContentType: "application/octet-stream",
+		LocationRef: store.ObjectPath(bucketID, orphanMetaID),
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+	if _, err := db.PutObjectMeta(obj); err != nil {
+		t.Fatalf("PutObjectMeta: %v", err)
+	}
+
+	// 2. Physical file with no metadata → file quarantine.
+	if err := st.EnsureBucketDir(bucketID); err != nil {
+		t.Fatalf("EnsureBucketDir: %v", err)
+	}
+	if _, _, _, err := st.WriteObject(bucketID, uuid.New().String(), strings.NewReader("orphan file")); err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+
+	m := maintenance.NewMetrics()
+	if err := RunWithMetrics(db, st, log, m); err != nil {
+		t.Fatalf("RunWithMetrics: %v", err)
+	}
+
+	if got := m.ObjectsQuarantined.Load(); got != 2 {
+		t.Errorf("ObjectsQuarantined: got %d, want 2", got)
+	}
+
+	// Metadata entry must actually be quarantined.
+	got, err := db.GetObjectMetaAny(bucketID, "metrics-orphan-meta.bin")
+	if err != nil {
+		t.Fatalf("GetObjectMetaAny: %v", err)
+	}
+	if got.State != "quarantined" {
+		t.Errorf("want state=quarantined, got %q", got.State)
+	}
+}
+
+// TestRunWithMetrics_NilMetrics verifies nil metrics are tolerated even when
+// quarantines occur.
+func TestRunWithMetrics_NilMetrics(t *testing.T) {
+	db, st, log := openTestEnv(t)
+
+	bucketID := uuid.New().String()
+	bkt := &meta.Bucket{
+		ID:         bucketID,
+		Name:       "test-bucket-nil-metrics",
+		Visibility: "private",
+		Status:     "active",
+	}
+	if err := db.CreateBucket(bkt); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	objectID := uuid.New().String()
+	obj := &meta.Object{
+		BucketID:    bucketID,
+		Key:         "nil-metrics-orphan.bin",
+		ObjectID:    objectID,
+		State:       "active",
+		SizeBytes:   3,
+		ContentType: "application/octet-stream",
+		LocationRef: store.ObjectPath(bucketID, objectID),
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+	if _, err := db.PutObjectMeta(obj); err != nil {
+		t.Fatalf("PutObjectMeta: %v", err)
+	}
+
+	if err := RunWithMetrics(db, st, log, nil); err != nil {
+		t.Fatalf("RunWithMetrics(nil): %v", err)
+	}
+
+	got, err := db.GetObjectMetaAny(bucketID, "nil-metrics-orphan.bin")
+	if err != nil {
+		t.Fatalf("GetObjectMetaAny: %v", err)
+	}
+	if got.State != "quarantined" {
+		t.Errorf("want state=quarantined, got %q", got.State)
+	}
+}
+
+// TestRun_ManyMissingObjects exercises the collect-then-quarantine path with
+// enough entries to require multiple write transactions after the view tx.
+func TestRun_ManyMissingObjects(t *testing.T) {
+	db, st, log := openTestEnv(t)
+
+	bucketID := uuid.New().String()
+	bkt := &meta.Bucket{
+		ID:         bucketID,
+		Name:       "test-bucket-many-missing",
+		Visibility: "private",
+		Status:     "active",
+	}
+	if err := db.CreateBucket(bkt); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	const n = 50
+	keys := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		objectID := uuid.New().String()
+		key := "missing-" + objectID
+		keys = append(keys, key)
+		obj := &meta.Object{
+			BucketID:    bucketID,
+			Key:         key,
+			ObjectID:    objectID,
+			State:       "active",
+			SizeBytes:   1,
+			ContentType: "application/octet-stream",
+			LocationRef: store.ObjectPath(bucketID, objectID),
+			CreatedAt:   time.Now().UTC(),
+			UpdatedAt:   time.Now().UTC(),
+		}
+		if _, err := db.PutObjectMeta(obj); err != nil {
+			t.Fatalf("PutObjectMeta %d: %v", i, err)
+		}
+	}
+
+	m := maintenance.NewMetrics()
+	if err := RunWithMetrics(db, st, log, m); err != nil {
+		t.Fatalf("RunWithMetrics: %v", err)
+	}
+
+	if got := m.ObjectsQuarantined.Load(); got != n {
+		t.Errorf("ObjectsQuarantined: got %d, want %d", got, n)
+	}
+	for _, key := range keys {
+		got, err := db.GetObjectMetaAny(bucketID, key)
+		if err != nil {
+			t.Fatalf("GetObjectMetaAny(%q): %v", key, err)
+		}
+		if got.State != "quarantined" {
+			t.Fatalf("key %q: want state=quarantined, got %q", key, got.State)
+		}
+	}
+}
+
 // TestRun_QuarantinesOrphanedPhysicalFile verifies that a physical file with no
 // corresponding metadata entry is moved to the quarantine directory.
 func TestRun_QuarantinesOrphanedPhysicalFile(t *testing.T) {
@@ -164,10 +328,17 @@ func TestRun_QuarantinesOrphanedPhysicalFile(t *testing.T) {
 		t.Errorf("orphaned file should be removed from original location; stat err = %v", err)
 	}
 
-	// The file must have been moved to the quarantine directory.
-	qPath := filepath.Join(st.DataDir(), "quarantine", filepath.Base(locationRef))
-	if _, err := os.Stat(qPath); err != nil {
-		t.Errorf("orphaned file should be in quarantine dir: %v", err)
+	// The file must have been moved to the quarantine directory. The
+	// destination name flattens the full locationRef (so multipart parts from
+	// different uploads can't collide) and appends a uniquifying suffix, so
+	// match on the prefix rather than on the basename.
+	flat := strings.ReplaceAll(filepath.Clean(locationRef), string(filepath.Separator), "_")
+	matches, err := filepath.Glob(filepath.Join(st.DataDir(), "quarantine", flat+".*"))
+	if err != nil {
+		t.Fatalf("glob quarantine dir: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("orphaned file should be in quarantine dir as %q.*, got %v", flat, matches)
 	}
 }
 

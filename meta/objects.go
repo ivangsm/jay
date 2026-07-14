@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -17,29 +16,24 @@ var (
 	ErrObjectNotFound = errors.New("object not found")
 )
 
-// deletionHooks holds per-DB deletion callbacks. Stored in a package-level
-// sync.Map to avoid mutating the DB struct definition (owned elsewhere).
-// The callback fires after a successful DeleteObjectMeta commit and is used
-// by the maintenance GC to wake immediately instead of polling.
-var deletionHooks sync.Map // key: *DB, value: func()
-
 // SetDeletionHook registers a callback invoked after a successful
-// DeleteObjectMeta commit. Safe to call with nil to clear. Single callback
-// per DB instance — a second call overwrites.
+// DeleteObjectMeta commit. It is used by the maintenance GC to wake
+// immediately instead of polling. Safe to call with nil to clear. Single
+// callback per DB instance — a second call overwrites. Invocations are
+// serialized via hookMu, like the token-invalidate hook.
 func (db *DB) SetDeletionHook(fn func()) {
-	if fn == nil {
-		deletionHooks.Delete(db)
-		return
-	}
-	deletionHooks.Store(db, fn)
+	db.hookMu.Lock()
+	db.deletionHook = fn
+	db.hookMu.Unlock()
 }
 
+// fireDeletionHook invokes the registered hook (if any).
+// Callers MUST only call this after a successful bbolt commit.
 func (db *DB) fireDeletionHook() {
-	v, ok := deletionHooks.Load(db)
-	if !ok {
-		return
-	}
-	if fn, ok := v.(func()); ok && fn != nil {
+	db.hookMu.RLock()
+	fn := db.deletionHook
+	db.hookMu.RUnlock()
+	if fn != nil {
 		fn()
 	}
 }
@@ -224,8 +218,23 @@ type ListObjectsResult struct {
 // batch resumes from the last key seen.
 //
 // Externally observable semantics (returned object set, CommonPrefixes,
-// IsTruncated, NextStartAfter, delimiter handling, prefix matching, maxKeys
-// cap) are preserved bit-identical to the previous single-tx implementation.
+// IsTruncated, delimiter handling, prefix matching, maxKeys cap) are preserved
+// bit-identical to the previous single-tx implementation.
+//
+// NextStartAfter is the last key fully consumed by the page — that is, the last
+// key that either produced an object, produced a CommonPrefix, or was folded
+// into a CommonPrefix already emitted in this page (as well as records skipped
+// because they were corrupt or not active). It is NOT necessarily the key of the
+// last object returned. This is what makes delimiter pagination terminate:
+// startAfter is exclusive, so the next page resumes strictly after the last key
+// this page looked at, which guarantees monotonic progress even when a page ends
+// on (or consists entirely of) CommonPrefixes. Because members of an already
+// emitted CommonPrefix are consumed before the maxKeys check, a prefix group is
+// never split across pages, so no CommonPrefix can be emitted twice.
+//
+// Real S3 uses an opaque NextContinuationToken; a plain "last key seen" cursor
+// is sufficient here and keeps the token human-readable and compatible with
+// start-after.
 func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKeys int) (*ListObjectsResult, error) {
 	if maxKeys <= 0 {
 		maxKeys = 1000
@@ -247,6 +256,11 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 	// iteration it is empty and we derive the seek position from startAfter /
 	// prefix, matching the original implementation.
 	cursorKey := ""
+	// lastConsumed is the last key that this page fully accounted for. It becomes
+	// NextStartAfter (exclusive) so the next page resumes strictly after it.
+	// Unlike cursorKey it is NOT advanced past the key that triggered truncation,
+	// since that key still has to be served on the next page.
+	lastConsumed := ""
 	firstBatch := true
 	// prefixExhausted is true once we have observed a key that no longer
 	// matches prefix (or ran past the end of the bucket) — at that point no
@@ -322,9 +336,11 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 			var obj Object
 			if err := decodeObject(p.val, &obj); err != nil {
 				slog.Warn("meta: corrupt object record", "key", key, "err", err)
+				lastConsumed = key
 				continue
 			}
 			if obj.State != "active" {
+				lastConsumed = key
 				continue
 			}
 
@@ -334,6 +350,9 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 				if idx >= 0 {
 					cp := prefix + rest[:idx+len(delimiter)]
 					if prefixSet[cp] {
+						// Already rolled up into a CommonPrefix emitted by this
+						// page: consumed, but does not count against maxKeys.
+						lastConsumed = key
 						continue
 					}
 					if count >= maxKeys {
@@ -344,6 +363,7 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 					prefixSet[cp] = true
 					result.CommonPrefixes = append(result.CommonPrefixes, cp)
 					count++
+					lastConsumed = key
 					continue
 				}
 			}
@@ -356,8 +376,8 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 
 			// Object is a value type; safe to retain after the tx closes.
 			result.Objects = append(result.Objects, obj)
-			result.NextStartAfter = key
 			count++
+			lastConsumed = key
 		}
 
 		if done {
@@ -368,6 +388,7 @@ func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKey
 		// will terminate.
 	}
 
+	result.NextStartAfter = lastConsumed
 	return result, nil
 }
 

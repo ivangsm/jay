@@ -21,7 +21,8 @@ var (
 )
 
 // bucketStatsEntry is the 16-byte layout of a maintained counter:
-//   big-endian int64 count || big-endian int64 total_size
+//
+//	big-endian int64 count || big-endian int64 total_size
 const bucketStatsEntrySize = 16
 
 func encodeBucketStatsEntry(count, totalSize int64) []byte {
@@ -321,7 +322,10 @@ func (db *DB) RebuildBucketStats(bucketID string) error {
 		if objBk != nil {
 			if err := objBk.ForEach(func(k, v []byte) error {
 				var obj Object
-				if err := json.Unmarshal(v, &obj); err != nil {
+				// decodeObject understands both the current binary (gob)
+				// envelope and legacy JSON records. Using json.Unmarshal here
+				// silently skipped every gob record and rebuilt stats as (0,0).
+				if err := decodeObject(v, &obj); err != nil {
 					return nil // skip corrupt entries
 				}
 				if obj.State != "active" {
