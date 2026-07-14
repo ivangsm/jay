@@ -23,9 +23,46 @@ func newRateLimiter(cfg RateLimiterConfig) *ratelimit.Limiter {
 	return ratelimit.New(ratelimit.Config{Rate: cfg.Rate, Burst: cfg.Burst})
 }
 
-// withRateLimit is the HTTP rate-limiting middleware. Must run after auth so
-// that the token ID is available in context. For anonymous requests the limit
-// key falls back to the client IP.
+// withIPRateLimit is the PRE-authentication rate-limiting middleware, keyed by
+// client IP.
+//
+// It exists because authentication is expensive: a Bearer credential costs one
+// bcrypt comparison (~60-100ms of CPU) and SigV4 costs a bbolt read plus HMAC
+// derivation. With the limiter running only *after* auth, a caller with no
+// valid credentials at all could burn the whole CPU budget — every request paid
+// for bcrypt before the limiter ever saw it. This middleware is therefore the
+// outermost gate: nothing is authenticated until the source IP has a token in
+// its bucket.
+//
+// Accounting (deliberate, documented): every request consumes one token from
+// the "ip:<addr>" bucket. Authenticated requests additionally consume one token
+// from their "<token_id>" bucket in withRateLimit. There is no double counting
+// inside a single bucket — anonymous requests are limited by IP only (the
+// post-auth middleware skips them), authenticated ones by IP *and* token.
+//
+// Both buckets use the same configured Rate/Burst, which gives one statable
+// invariant: a single source IP can never exceed JAY_RATE_LIMIT req/s, no
+// matter how many tokens it holds. Deployments that front jay with a proxy or
+// NAT many clients behind one address must size JAY_RATE_LIMIT accordingly (and
+// set JAY_TRUST_PROXY_HEADERS so the real client IP is used as the key).
+func (h *Handler) withIPRateLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.ipRateLimiter.Enabled() {
+			next(w, r)
+			return
+		}
+		if !h.ipRateLimiter.Allow("ip:" + clientIP(r, h.trustProxyHeaders)) {
+			writeRateLimited(w, r, h.ipRateLimiter.RetryAfterSeconds())
+			return
+		}
+		next(w, r)
+	}
+}
+
+// withRateLimit is the POST-authentication rate-limiting middleware, keyed by
+// token ID. Anonymous requests are skipped here — they were already accounted
+// for by withIPRateLimit, which is the only limiter that can see them before
+// any CPU is spent.
 func (h *Handler) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !h.rateLimiter.Enabled() {
@@ -33,21 +70,23 @@ func (h *Handler) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		var key string
-		if token := tokenFromContext(r.Context()); token != nil {
-			key = token.TokenID
-		} else {
-			key = "ip:" + clientIP(r, h.trustProxyHeaders)
+		token := tokenFromContext(r.Context())
+		if token == nil {
+			next(w, r)
+			return
 		}
 
-		if !h.rateLimiter.Allow(key) {
-			retry := h.rateLimiter.RetryAfterSeconds()
-			w.Header().Set("Retry-After", strconv.Itoa(int(math.Max(float64(retry), 1))))
-			writeS3Error(w, r, http.StatusTooManyRequests, "SlowDown", "Rate limit exceeded", r.URL.Path)
+		if !h.rateLimiter.Allow(token.TokenID) {
+			writeRateLimited(w, r, h.rateLimiter.RetryAfterSeconds())
 			return
 		}
 		next(w, r)
 	}
+}
+
+func writeRateLimited(w http.ResponseWriter, r *http.Request, retryAfter int) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(math.Max(float64(retryAfter), 1))))
+	writeS3Error(w, r, http.StatusTooManyRequests, "SlowDown", "Rate limit exceeded", r.URL.Path)
 }
 
 // clientIP extracts the client IP from the request.

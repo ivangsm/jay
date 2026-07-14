@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -899,26 +900,330 @@ func TestEvaluatePolicyDeny_IPConditionNoMatch(t *testing.T) {
 	}
 }
 
-// ---- EvaluatePolicy (backward-compat wrapper) ------------------------------
+// ---- AuthorizeBucketOwnership ----------------------------------------------
 
-func TestEvaluatePolicy_BackwardCompat(t *testing.T) {
-	p := &BucketPolicy{
-		Statements: []PolicyStatement{
-			{Effect: "deny", Actions: []string{"*"}, Subjects: []string{"*"}},
-		},
-	}
-	allowed, denied := EvaluatePolicy(p, "tok", "object:get", "key", "1.2.3.4")
-	if allowed {
-		t.Error("EvaluatePolicy always returns allowed=false")
-	}
-	if !denied {
-		t.Error("EvaluatePolicy should return denied=true for matching deny")
+func TestAuthorizeBucketOwnership_Owner(t *testing.T) {
+	a := New(openTestDB(t))
+	tok := &meta.Token{TokenID: "t", AccountID: "acct-a"}
+	b := &meta.Bucket{Name: "photos", OwnerAccountID: "acct-a"}
+	if err := a.AuthorizeBucketOwnership(tok, b); err != nil {
+		t.Errorf("owner should be allowed, got %v", err)
 	}
 }
 
-func TestEvaluatePolicy_NilPolicy(t *testing.T) {
-	allowed, denied := EvaluatePolicy(nil, "tok", "object:get", "key", "1.2.3.4")
-	if allowed || denied {
-		t.Errorf("nil policy: want (false,false), got (%v,%v)", allowed, denied)
+func TestAuthorizeBucketOwnership_OtherAccountDenied(t *testing.T) {
+	a := New(openTestDB(t))
+	// Full permissions, no bucket scope — exactly the token that used to be
+	// able to delete another tenant's bucket.
+	tok := &meta.Token{TokenID: "t", AccountID: "acct-a", AllowedActions: []string{"*"}}
+	b := &meta.Bucket{Name: "photos", OwnerAccountID: "acct-b"}
+	if err := a.AuthorizeBucketOwnership(tok, b); !errors.Is(err, ErrAccessDenied) {
+		t.Errorf("want ErrAccessDenied, got %v", err)
+	}
+}
+
+func TestAuthorizeBucketOwnership_LegacyBucketWithoutOwner(t *testing.T) {
+	a := New(openTestDB(t))
+	tok := &meta.Token{TokenID: "t", AccountID: "acct-a"}
+	b := &meta.Bucket{Name: "legacy", OwnerAccountID: ""}
+	if err := a.AuthorizeBucketOwnership(tok, b); err != nil {
+		t.Errorf("ownerless bucket should be allowed, got %v", err)
+	}
+}
+
+func TestAuthorizeBucketOwnership_ExplicitBucketScopeDelegation(t *testing.T) {
+	a := New(openTestDB(t))
+	tok := &meta.Token{TokenID: "t", AccountID: "acct-a", BucketScope: []string{"shared", "photos"}}
+	b := &meta.Bucket{Name: "shared", OwnerAccountID: "acct-b"}
+	if err := a.AuthorizeBucketOwnership(tok, b); err != nil {
+		t.Errorf("explicit bucket scope should delegate access, got %v", err)
+	}
+}
+
+func TestAuthorizeBucketOwnership_ScopeForOtherBucketDenied(t *testing.T) {
+	a := New(openTestDB(t))
+	tok := &meta.Token{TokenID: "t", AccountID: "acct-a", BucketScope: []string{"other"}}
+	b := &meta.Bucket{Name: "shared", OwnerAccountID: "acct-b"}
+	if err := a.AuthorizeBucketOwnership(tok, b); !errors.Is(err, ErrAccessDenied) {
+		t.Errorf("want ErrAccessDenied, got %v", err)
+	}
+}
+
+func TestAuthorizeBucketOwnership_NilArgs(t *testing.T) {
+	a := New(openTestDB(t))
+	if err := a.AuthorizeBucketOwnership(nil, &meta.Bucket{}); !errors.Is(err, ErrAccessDenied) {
+		t.Errorf("nil token: want ErrAccessDenied, got %v", err)
+	}
+	if err := a.AuthorizeBucketOwnership(&meta.Token{}, nil); !errors.Is(err, ErrAccessDenied) {
+		t.Errorf("nil bucket: want ErrAccessDenied, got %v", err)
+	}
+}
+
+// ---- account status revalidation -------------------------------------------
+
+// A suspended account must be rejected immediately, even though the token is
+// still in the positive auth cache (which is what used to keep a suspended
+// account working for up to authCacheTTL).
+func TestValidateToken_SuspendedAccountRejectedOnCachedPath(t *testing.T) {
+	db := openTestDB(t)
+	acc, _ := seedToken(t, db, "susp-tok", "pass", []string{"*"})
+	a := New(db)
+
+	if _, err := a.AuthenticateCredentials("susp-tok", "pass"); err != nil {
+		t.Fatalf("first authenticate: %v", err)
+	}
+
+	// Suspend the account (CreateAccount is an upsert).
+	acc.Status = "suspended"
+	if err := db.CreateAccount(acc); err != nil {
+		t.Fatalf("suspend account: %v", err)
+	}
+
+	// Cache is still warm; the fast path must revalidate the account status.
+	if _, err := a.AuthenticateCredentials("susp-tok", "pass"); !errors.Is(err, ErrAccessDenied) {
+		t.Errorf("want ErrAccessDenied for suspended account, got %v", err)
+	}
+}
+
+// ---- negative auth cache ----------------------------------------------------
+
+func TestValidateToken_FailureIsCached(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "neg-tok", "goodpass", []string{"*"})
+	a := New(db)
+
+	if _, err := a.AuthenticateCredentials("neg-tok", "badpass"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("want ErrInvalidCredentials, got %v", err)
+	}
+
+	a.mu.RLock()
+	n := len(a.failCache)
+	a.mu.RUnlock()
+	if n != 1 {
+		t.Fatalf("expected 1 negative cache entry, got %d", n)
+	}
+
+	// Replay: must still fail, now without touching bcrypt.
+	if _, err := a.AuthenticateCredentials("neg-tok", "badpass"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Errorf("cached failure: want ErrInvalidCredentials, got %v", err)
+	}
+
+	// The correct secret must never be blocked by the negative cache.
+	if _, err := a.AuthenticateCredentials("neg-tok", "goodpass"); err != nil {
+		t.Errorf("valid credentials must still authenticate: %v", err)
+	}
+}
+
+func TestValidateToken_FailureCacheExpires(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "exp-tok", "goodpass", []string{"*"})
+	a := New(db)
+
+	if _, err := a.AuthenticateCredentials("exp-tok", "nope"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("want ErrInvalidCredentials, got %v", err)
+	}
+
+	// Force the entry to be stale and confirm the slow path runs again.
+	key := cacheKey("exp-tok", "nope")
+	a.mu.Lock()
+	a.failCache[key] = authFailEntry{err: ErrInvalidCredentials, deadline: time.Now().Add(-time.Second)}
+	a.mu.Unlock()
+
+	if _, err := a.AuthenticateCredentials("exp-tok", "nope"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Errorf("want ErrInvalidCredentials after expiry, got %v", err)
+	}
+	a.mu.RLock()
+	e, ok := a.failCache[key]
+	a.mu.RUnlock()
+	if !ok || !time.Now().Before(e.deadline) {
+		t.Error("expired entry should have been refreshed by the slow path")
+	}
+}
+
+func TestInvalidateToken_ClearsNegativeCache(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "inv-neg", "goodpass", []string{"*"})
+	a := New(db)
+
+	if _, err := a.AuthenticateCredentials("inv-neg", "badpass"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("want ErrInvalidCredentials, got %v", err)
+	}
+
+	a.InvalidateToken("inv-neg")
+
+	a.mu.RLock()
+	n := len(a.failCache)
+	a.mu.RUnlock()
+	if n != 0 {
+		t.Errorf("negative cache should be empty after invalidation, got %d entries", n)
+	}
+}
+
+// ---- canonicalQueryString ---------------------------------------------------
+
+func TestCanonicalQueryString_SortsAndEncodes(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{"", ""},
+		{"prefix=foo", "prefix=foo"},
+		{"b=2&a=1", "a=1&b=2"},
+		{"a=2&a=1", "a=1&a=2"},
+		{"uploads", "uploads="},
+		{"key=a+b", "key=a%20b"},
+		{"key=a/b", "key=a%2Fb"},
+		{"marker=caf%C3%A9", "marker=caf%C3%A9"},
+		{"list-type=2&prefix=x&delimiter=/", "delimiter=%2F&list-type=2&prefix=x"},
+	}
+	for _, c := range cases {
+		if got := canonicalQueryString(c.raw); got != c.want {
+			t.Errorf("canonicalQueryString(%q) = %q, want %q", c.raw, got, c.want)
+		}
+	}
+}
+
+func TestRFC3986Escape_UnreservedUntouched(t *testing.T) {
+	const unreserved = "abcXYZ019-_.~"
+	if got := rfc3986Escape(unreserved); got != unreserved {
+		t.Errorf("unreserved chars must not be escaped: got %q", got)
+	}
+	if got := rfc3986Escape("a b"); got != "a%20b" {
+		t.Errorf("space must encode as %%20, got %q", got)
+	}
+}
+
+// ---- payload hash verification ---------------------------------------------
+
+// signRequestWithPayload signs r declaring payloadHash in x-amz-content-sha256.
+func signRequestWithPayload(r *http.Request, tokenID, secretKey, region, dateStr, amzDate, payloadHash string) {
+	r.Header.Set("x-amz-date", amzDate)
+	r.Header.Set("host", r.Host)
+	r.Header.Set("x-amz-content-sha256", payloadHash)
+
+	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
+	canonicalRequest := buildCanonicalRequest(r, signedHeaders)
+	signingKey := deriveSigningKey(secretKey, dateStr, region, "s3")
+	stringToSign := buildStringToSign(dateStr, amzDate, region, canonicalRequest)
+	h := hmac.New(sha256.New, signingKey)
+	h.Write([]byte(stringToSign))
+	sig := hex.EncodeToString(h.Sum(nil))
+
+	r.Header.Set("Authorization", fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s/%s/s3/aws4_request, SignedHeaders=%s, Signature=%s",
+		tokenID, dateStr, region, signedHeaders, sig,
+	))
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func TestAuthenticateSigV4_PayloadHashMatches(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-ok", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	now := time.Now().UTC()
+	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
+
+	body := "hello world"
+	r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader(body))
+	r.Host = "s3.example.com"
+	signRequestWithPayload(r, "pay-ok", "sigv4-secret-key", "us-east-1", dateStr, amzDate, sha256Hex(body))
+
+	if _, err := a.AuthenticateSigV4(r); err != nil {
+		t.Fatalf("AuthenticateSigV4: %v", err)
+	}
+
+	// The body must still be readable by the handler chain.
+	got, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(got) != body {
+		t.Errorf("body not restored: got %q, want %q", got, body)
+	}
+	if r.ContentLength != int64(len(body)) {
+		t.Errorf("ContentLength = %d, want %d", r.ContentLength, len(body))
+	}
+}
+
+// A tampered body must be rejected even though the signature is intact — this
+// is the MITM case the payload hash exists to prevent.
+func TestAuthenticateSigV4_PayloadHashMismatch(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-bad", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	now := time.Now().UTC()
+	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
+
+	r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("tampered"))
+	r.Host = "s3.example.com"
+	// Sign declaring the hash of the ORIGINAL body while sending another one.
+	signRequestWithPayload(r, "pay-bad", "sigv4-secret-key", "us-east-1", dateStr, amzDate, sha256Hex("hello world"))
+
+	if _, err := a.AuthenticateSigV4(r); !errors.Is(err, ErrInvalidCredentials) {
+		t.Errorf("want ErrInvalidCredentials for payload hash mismatch, got %v", err)
+	}
+}
+
+func TestAuthenticateSigV4_UnsignedPayloadSkipsVerification(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-unsigned", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	now := time.Now().UTC()
+	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
+
+	r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("anything at all"))
+	r.Host = "s3.example.com"
+	signRequestWithPayload(r, "pay-unsigned", "sigv4-secret-key", "us-east-1", dateStr, amzDate, "UNSIGNED-PAYLOAD")
+
+	if _, err := a.AuthenticateSigV4(r); err != nil {
+		t.Fatalf("UNSIGNED-PAYLOAD must not be verified: %v", err)
+	}
+}
+
+func TestAuthenticateSigV4_StreamingPayloadSkipsVerification(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-stream", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	now := time.Now().UTC()
+	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
+
+	r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("chunk data"))
+	r.Host = "s3.example.com"
+	signRequestWithPayload(r, "pay-stream", "sigv4-secret-key", "us-east-1", dateStr, amzDate,
+		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+
+	if _, err := a.AuthenticateSigV4(r); err != nil {
+		t.Fatalf("STREAMING payload must not be verified: %v", err)
+	}
+}
+
+// A signed payload larger than maxSignedPayloadSize is rejected, not buffered.
+func TestAuthenticateSigV4_SignedPayloadTooLarge(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-huge", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	now := time.Now().UTC()
+	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
+
+	r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("small body, big claim"))
+	r.Host = "s3.example.com"
+	signRequestWithPayload(r, "pay-huge", "sigv4-secret-key", "us-east-1", dateStr, amzDate, sha256Hex("x"))
+	r.ContentLength = maxSignedPayloadSize + 1
+
+	if _, err := a.AuthenticateSigV4(r); !errors.Is(err, ErrInvalidCredentials) {
+		t.Errorf("want ErrInvalidCredentials for oversized signed payload, got %v", err)
+	}
+}
+
+func TestVerifyPayloadHash_EmptyBody(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := verifyPayloadHash(r, sha256Hex("")); err != nil {
+		t.Errorf("empty body must hash to the empty sha256: %v", err)
 	}
 }

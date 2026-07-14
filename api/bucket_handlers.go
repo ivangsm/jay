@@ -66,7 +66,7 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 
 // handleDeleteBucket handles DELETE /<bucket>
 func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, bucketName string) {
-	_, ok := h.requireAuth(r, w, meta.ActionBucketWriteMeta, bucketName, "")
+	token, ok := h.requireAuth(r, w, meta.ActionBucketWriteMeta, bucketName, "")
 	if !ok {
 		return
 	}
@@ -81,6 +81,17 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		h.log.Error("get bucket", "err", err)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 			"Internal error", "/"+bucketName)
+		return
+	}
+
+	// Tenant isolation: "bucket:write-meta" says *what* the token may do, not
+	// *whose* buckets it may do it to. Deleting an existing bucket owned by
+	// another account requires ownership (or explicit BucketScope delegation).
+	if err := h.auth.AuthorizeBucketOwnership(token, bucket); err != nil {
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", r.URL.Path)
 		return
 	}
 
@@ -110,18 +121,27 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 
 // handleHeadBucket handles HEAD /<bucket>
 func (h *Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucketName string) {
-	_, ok := h.requireAuth(r, w, meta.ActionBucketReadMeta, bucketName, "")
+	token, ok := h.requireAuth(r, w, meta.ActionBucketReadMeta, bucketName, "")
 	if !ok {
 		return
 	}
 
-	_, err := h.db.GetBucket(bucketName)
+	bucket, err := h.db.GetBucket(bucketName)
 	if err != nil {
 		if errors.Is(err, meta.ErrBucketNotFound) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// Reading another account's bucket metadata is still cross-tenant access.
+	if err := h.auth.AuthorizeBucketOwnership(token, bucket); err != nil {
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
+		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 

@@ -13,16 +13,16 @@ type BucketPolicy struct {
 
 // PolicyStatement is a single allow/deny rule within a bucket policy.
 type PolicyStatement struct {
-	Effect     string            `json:"effect"`               // "allow" or "deny"
-	Actions    []string          `json:"actions"`              // e.g. ["object:get", "object:list"] or ["*"]
-	Prefixes   []string          `json:"prefixes"`             // e.g. ["public/", "shared/"], empty = all
-	Subjects   []string          `json:"subjects"`             // token IDs or "*" for any authenticated
+	Effect     string            `json:"effect"`   // "allow" or "deny"
+	Actions    []string          `json:"actions"`  // e.g. ["object:get", "object:list"] or ["*"]
+	Prefixes   []string          `json:"prefixes"` // e.g. ["public/", "shared/"], empty = all
+	Subjects   []string          `json:"subjects"` // token IDs or "*" for any authenticated
 	Conditions *PolicyConditions `json:"conditions,omitempty"`
 }
 
 // PolicyConditions holds optional conditions for a policy statement.
 type PolicyConditions struct {
-	IPWhitelist []string    `json:"ip_whitelist,omitempty"` // CIDR notation
+	IPWhitelist []string     `json:"ip_whitelist,omitempty"` // CIDR notation
 	parsedCIDRs []*net.IPNet // pre-parsed from IPWhitelist by Compile()
 }
 
@@ -75,16 +75,6 @@ func EvaluatePolicyDeny(policy *BucketPolicy, tokenID, action, objectKey, client
 		return true
 	}
 	return false
-}
-
-// EvaluatePolicy is a backward-compatible wrapper around EvaluatePolicyDeny.
-// Deprecated: Use EvaluatePolicyDeny instead. The allowed return value is
-// always false — policies in jay are deny-overlays on token-level permissions.
-func EvaluatePolicy(policy *BucketPolicy, tokenID, action, objectKey, clientIP string) (allowed, denied bool) {
-	if policy != nil {
-		policy.Compile()
-	}
-	return false, EvaluatePolicyDeny(policy, tokenID, action, objectKey, clientIP)
 }
 
 func matchesSubject(subjects []string, tokenID string) bool {
