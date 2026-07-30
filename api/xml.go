@@ -20,6 +20,7 @@ const (
 	S3ErrNoSuchKey            = "NoSuchKey"
 	S3ErrMethodNotAllowed     = "MethodNotAllowed"
 	S3ErrMissingContentLength = "MissingContentLength"
+	S3ErrNotImplemented       = "NotImplemented"
 )
 
 // S3Error represents an S3 XML error response.

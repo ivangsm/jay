@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/ivangsm/jay/auth"
@@ -13,6 +14,126 @@ import (
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
 )
+
+// S3 sub-resource handling.
+//
+// dispatch routes on method, so a sub-resource it does not recognise used to
+// fall through to the handler for that method and do something entirely
+// different from what was asked: `PUT /bucket/key?tagging` reached
+// handlePutObject and overwrote the object with the `<Tagging>` XML, answering
+// 200 and a fresh ETag; `DELETE /bucket/key?tagging` deleted the object and
+// answered 204. The hourly bbolt backup only holds metadata, so the bytes were
+// gone for good.
+//
+// The rule below is deliberately asymmetric, and the asymmetry is the whole
+// point:
+//
+//   - On PUT/POST/DELETE the cost of guessing wrong is a destroyed object, so
+//     anything not positively recognised is refused (allowlist). A sub-resource
+//     S3 adds tomorrow fails on its own.
+//   - On GET/HEAD the cost of guessing wrong is answering with object bytes
+//     instead of an XML document — wrong, but nothing is lost. There a denylist
+//     of the sub-resources S3 defines and jay does not implement is enough, and
+//     it keeps an innocuous `?v=<hash>` cache-buster from turning into a 501.
+
+// unimplementedObjectSubresources are object-level S3 sub-resources jay does not
+// implement. Only consulted for reads; writes use the allowlist instead.
+var unimplementedObjectSubresources = map[string]struct{}{
+	"acl":        {},
+	"attributes": {}, // GetObjectAttributes
+	"legal-hold": {},
+	"restore":    {},
+	"retention":  {},
+	"select":     {}, // SelectObjectContent
+	"tagging":    {},
+	"torrent":    {},
+	"versionId":  {}, // jay has no versioning: a version-scoped read is not the same read
+	"versions":   {},
+}
+
+// unimplementedBucketSubresources are bucket-level S3 sub-resources jay does not
+// implement. Same read/write split as the object-level list above.
+var unimplementedBucketSubresources = map[string]struct{}{
+	"accelerate":          {},
+	"acl":                 {},
+	"analytics":           {},
+	"cors":                {},
+	"delete":              {}, // DeleteObjects (batch)
+	"encryption":          {},
+	"intelligent-tiering": {},
+	"inventory":           {},
+	"lifecycle":           {},
+	"location":            {},
+	"logging":             {},
+	"metrics":             {},
+	"notification":        {},
+	"object-lock":         {},
+	"ownershipControls":   {},
+	"policy":              {},
+	"policyStatus":        {},
+	"publicAccessBlock":   {},
+	"replication":         {},
+	"requestPayment":      {},
+	"tagging":             {},
+	"uploads":             {}, // ListMultipartUploads
+	"versioning":          {},
+	"versions":            {},
+	"website":             {},
+}
+
+// neutralQueryParam reports whether a param does not select an operation.
+// `X-Jay-*` and `X-Amz-*` authenticate a presigned URL and `response-*` overrides
+// response headers on GET; none of them changes which operation is being asked
+// for, so they are safe to ignore on any method.
+func neutralQueryParam(key string) bool {
+	switch key {
+	case "X-Jay-Token", "X-Jay-Expires", "X-Jay-Signature":
+		return true
+	}
+	lower := strings.ToLower(key)
+	return strings.HasPrefix(lower, "x-amz-") || strings.HasPrefix(lower, "response-")
+}
+
+// mutatingMethod reports whether the handler reached by this method can
+// overwrite or delete. These are the ones held to the allowlist.
+func mutatingMethod(method string) bool {
+	switch method {
+	case http.MethodPut, http.MethodPost, http.MethodDelete:
+		return true
+	}
+	return false
+}
+
+// unsupportedSubresource returns the first query param that must fail the
+// request, or "" if it can be dispatched.
+//
+// Callers must have already handled every operation the params can legitimately
+// select (multipart, listing): by the time this runs, a supported sub-resource
+// arriving on a mutating method is a method/sub-resource mismatch, not a valid
+// request — `PUT /bucket/key?uploads` is not CreateMultipartUpload, it is a PUT
+// that would overwrite the object.
+func unsupportedSubresource(q url.Values, method string, unimplemented map[string]struct{}) string {
+	mutating := mutatingMethod(method)
+	for key := range q {
+		if neutralQueryParam(key) {
+			continue
+		}
+		if mutating {
+			return key
+		}
+		if _, ok := unimplemented[key]; ok {
+			return key
+		}
+	}
+	return ""
+}
+
+// writeUnsupportedSubresource answers the honest status: the operation exists in
+// S3 and jay does not implement it.
+func writeUnsupportedSubresource(w http.ResponseWriter, r *http.Request, sub, resource string) {
+	writeS3Error(w, r, http.StatusNotImplemented, S3ErrNotImplemented,
+		"The '"+sub+"' sub-resource is not implemented", resource)
+}
 
 // Handler is the S3-compatible HTTP handler.
 type Handler struct {
@@ -138,6 +259,15 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	bucketName, objectKey, _ := strings.Cut(path, "/")
 
 	if objectKey == "" {
+		// Same reasoning as at object level (see unsupportedSubresource): an
+		// unimplemented sub-resource must not reach the switch. `DELETE
+		// /bucket?tagging` used to reach handleDeleteBucket and delete the
+		// bucket itself.
+		if sub := unsupportedSubresource(r.URL.Query(), r.Method, unimplementedBucketSubresources); sub != "" {
+			writeUnsupportedSubresource(w, r, sub, "/"+bucketName)
+			return
+		}
+
 		// Bucket-level operation
 		switch r.Method {
 		case http.MethodPut:
@@ -181,6 +311,15 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeS3Error(w, r, http.StatusMethodNotAllowed, S3ErrMethodNotAllowed, "Method not allowed", "/"+bucketName+"/"+objectKey)
 		}
+		return
+	}
+
+	// Every legitimate multipart operation has returned by now, so a sub-resource
+	// reaching this point must not fall through to the switch below. See
+	// unsupportedSubresource for why writes are held to an allowlist and reads
+	// only to a denylist.
+	if sub := unsupportedSubresource(q, r.Method, unimplementedObjectSubresources); sub != "" {
+		writeUnsupportedSubresource(w, r, sub, "/"+bucketName+"/"+objectKey)
 		return
 	}
 
