@@ -27,6 +27,11 @@ type GC struct {
 	quit     chan struct{}
 	running  atomic.Bool
 
+	// passes cuenta las pasadas completadas. Es el único observable que
+	// distingue "el loop corrió y no encontró nada" de "el loop no corrió",
+	// que es exactamente lo que hay que poder afirmar al probar el agendado.
+	passes atomic.Int64
+
 	// deleted is signalled (non-blocking send) by NotifyDeletion whenever an
 	// object is deleted. The GC loop listens on this to run an immediate pass
 	// instead of waiting the full interval.
@@ -63,6 +68,9 @@ func (gc *GC) Stop() {
 	}
 }
 
+// Passes returns how many GC passes have completed since the process started.
+func (gc *GC) Passes() int64 { return gc.passes.Load() }
+
 // NotifyDeletion signals the GC that an object has been deleted. The GC loop
 // is woken and performs an immediate pass. Non-blocking: if a prior signal is
 // still pending, the new signal is coalesced into it.
@@ -86,13 +94,10 @@ func (gc *GC) loop() {
 			gc.RunOnce()
 			timer.Reset(gc.interval)
 		case <-gc.deleted:
-			// Drain the timer before resetting to avoid a spurious firing.
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			// Desde Go 1.23 el canal de un Timer no tiene buffer: Stop() ya
+			// garantiza que no quede un valor viejo esperando, así que el
+			// drenado manual que había acá era un no-op.
+			timer.Stop()
 			gc.RunOnce()
 			timer.Reset(gc.interval)
 		}
@@ -106,6 +111,7 @@ func (gc *GC) loop() {
 // 3. Orphaned multipart part directories with no bbolt record
 // 4. Empty bucket object directories
 func (gc *GC) RunOnce() {
+	defer gc.passes.Add(1)
 	gc.cleanOldTempFiles()
 	gc.cleanupExpiredUploads()
 	gc.sweepOrphanMultipartDirs()

@@ -1,7 +1,6 @@
 package maintenance
 
 import (
-	"encoding/json"
 	"sync/atomic"
 	"time"
 )
@@ -25,6 +24,12 @@ type Metrics struct {
 
 	ObjectsQuarantined atomic.Int64
 
+	// MetadataDecodeFailures cuenta los registros de bbolt que no
+	// deserializaron y por eso se omitieron de un listado. Un jay.db que se
+	// degrada tiene que ser visible: sin este contador la única señal era una
+	// lista a la que le faltaban filas, sin nada que lo dijera.
+	MetadataDecodeFailures atomic.Int64
+
 	BytesUploaded   atomic.Int64
 	BytesDownloaded atomic.Int64
 }
@@ -43,6 +48,16 @@ func (m *Metrics) RecordFsyncFailure() {
 	m.FsyncFailures.Add(1)
 }
 
+// RecordMetadataDecodeFailure incrementa el contador de registros de metadata
+// ilegibles. Nil-safe: se engancha a meta.DB.SetDecodeFailureHook, que puede
+// estar activo en fixtures sin métricas.
+func (m *Metrics) RecordMetadataDecodeFailure() {
+	if m == nil {
+		return
+	}
+	m.MetadataDecodeFailures.Add(1)
+}
+
 // Snapshot returns a JSON-serializable snapshot of all metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
@@ -58,8 +73,10 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		ChecksumFailures:   m.ChecksumFailures.Load(),
 		FsyncFailures:      m.FsyncFailures.Load(),
 		ObjectsQuarantined: m.ObjectsQuarantined.Load(),
-		BytesUploaded:      m.BytesUploaded.Load(),
-		BytesDownloaded:    m.BytesDownloaded.Load(),
+
+		MetadataDecodeFailures: m.MetadataDecodeFailures.Load(),
+		BytesUploaded:          m.BytesUploaded.Load(),
+		BytesDownloaded:        m.BytesDownloaded.Load(),
 	}
 }
 
@@ -77,12 +94,8 @@ type MetricsSnapshot struct {
 	ChecksumFailures   int64 `json:"checksum_failures"`
 	FsyncFailures      int64 `json:"fsync_failures"`
 	ObjectsQuarantined int64 `json:"objects_quarantined"`
-	BytesUploaded      int64 `json:"bytes_uploaded"`
-	BytesDownloaded    int64 `json:"bytes_downloaded"`
-}
 
-// MarshalJSON implements json.Marshaler.
-func (s MetricsSnapshot) MarshalJSON() ([]byte, error) {
-	type Alias MetricsSnapshot
-	return json.Marshal((Alias)(s))
+	MetadataDecodeFailures int64 `json:"metadata_decode_failures"`
+	BytesUploaded          int64 `json:"bytes_uploaded"`
+	BytesDownloaded        int64 `json:"bytes_downloaded"`
 }
