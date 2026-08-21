@@ -17,6 +17,7 @@ import (
 	"github.com/ivangsm/jay/admin"
 	"github.com/ivangsm/jay/api"
 	"github.com/ivangsm/jay/auth"
+	"github.com/ivangsm/jay/internal/version"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	jayproto "github.com/ivangsm/jay/proto"
@@ -97,7 +98,12 @@ func main() {
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
+	// version/commit vienen de -ldflags (ver Dockerfile). Sin este log el
+	// paquete internal/version no lo importaba nadie, así que la inyección era
+	// letra muerta y no había forma de saber qué binario estaba corriendo.
 	log.Info("jay: starting",
+		"version", version.Version,
+		"commit", version.Commit,
 		"data_dir", cfg.DataDir,
 		"listen", cfg.ListenAddr,
 		"admin", cfg.AdminAddr,
@@ -139,6 +145,13 @@ func main() {
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
 
+	// meta no puede importar maintenance (sería un ciclo), así que el contador
+	// de registros ilegibles se engancha desde acá. Sin esto, un jay.db que se
+	// degrada solo se vería en los logs.
+	db.SetDecodeFailureHook(func(bucket, key string) {
+		metrics.RecordMetadataDecodeFailure()
+	})
+
 	// Admin API handler (on separate port)
 	adminMux := http.NewServeMux()
 	tlsEnabled := cfg.TLSCert != "" && cfg.TLSKey != ""
@@ -155,6 +168,8 @@ func main() {
 	})
 	defer func() { _ = adminHandler.Close() }()
 	adminMux.Handle("/_jay/", adminHandler)
+
+	mountPprof(adminMux, adminHandler.RequireAdmin)
 
 	adminMux.HandleFunc("/health", hc.ReadinessHandler)
 	adminMux.HandleFunc("/health/live", hc.LivenessHandler)
@@ -209,9 +224,7 @@ func main() {
 	backupMgr := maintenance.NewBackupManager(db, cfg.BackupDir, log)
 	backupDone := make(chan struct{})
 	var backupWG sync.WaitGroup
-	backupWG.Add(1)
-	go func() {
-		defer backupWG.Done()
+	backupWG.Go(func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for {
@@ -227,7 +240,7 @@ func main() {
 				}
 			}
 		}
-	}()
+	})
 
 	// S3 API handler
 	var rlCfg *api.RateLimiterConfig

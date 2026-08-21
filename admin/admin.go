@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"log/slog"
 	"net"
@@ -12,9 +12,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/auth"
+	"github.com/ivangsm/jay/internal/jsonx"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
@@ -68,6 +69,12 @@ type AdminConfig struct {
 
 // NewHandler creates a new admin API handler.
 func NewHandler(cfg AdminConfig) *Handler {
+	// Sin logger, el primer request no autorizado hacía nil-deref en
+	// authenticateAdmin: o sea, el handler reventaba justo en la ruta de fallo,
+	// que es la única que nadie ejercita antes de producción.
+	if cfg.Log == nil {
+		cfg.Log = slog.Default()
+	}
 	h := &Handler{
 		db:            cfg.DB,
 		store:         cfg.Store,
@@ -152,7 +159,7 @@ func (h *Handler) evictOldestAuthFailures(n int) {
 	}
 	// Partial sort: find n oldest. Simple full sort is fine for N=100.
 	// Selection-sort-ish: pick smallest n times.
-	for i := 0; i < n; i++ {
+	for i := range n {
 		minIdx := i
 		for j := i + 1; j < len(entries); j++ {
 			if entries[j].lastFail.Before(entries[minIdx].lastFail) {
@@ -266,7 +273,7 @@ type createAccountRequest struct {
 
 func (h *Handler) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	var req createAccountRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := jsonv2.UnmarshalRead(r.Body, &req, jsonx.Strict); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
@@ -285,7 +292,7 @@ func (h *Handler) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(account); err != nil {
+	if err := jsonv2.MarshalWrite(w, account); err != nil {
 		h.log.Error("encode create-account response", "err", err)
 	}
 }
@@ -306,7 +313,7 @@ type createTokenResponse struct {
 
 func (h *Handler) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	var req createTokenRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := jsonv2.UnmarshalRead(r.Body, &req, jsonx.Strict); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
@@ -365,7 +372,7 @@ func (h *Handler) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(createTokenResponse{
+	if err := jsonv2.MarshalWrite(w, createTokenResponse{
 		TokenID: token.TokenID,
 		Secret:  secret,
 	}); err != nil {
@@ -383,7 +390,7 @@ func (h *Handler) handleListTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(tokens); err != nil {
+	if err := jsonv2.MarshalWrite(w, tokens); err != nil {
 		h.log.Error("encode list-tokens response", "err", err)
 	}
 }
@@ -406,7 +413,7 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(h.metrics.Snapshot()); err != nil {
+	if err := jsonv2.MarshalWrite(w, h.metrics.Snapshot()); err != nil {
 		h.log.Error("encode metrics response", "err", err)
 	}
 }
@@ -430,7 +437,7 @@ func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req presignRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := jsonv2.UnmarshalRead(r.Body, &req, jsonx.Strict); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
@@ -463,7 +470,7 @@ func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(presignResponse{URL: presignedURL}); err != nil {
+	if err := jsonv2.MarshalWrite(w, presignResponse{URL: presignedURL}); err != nil {
 		h.log.Error("encode presign response", "err", err)
 	}
 }
@@ -479,7 +486,7 @@ func (h *Handler) handleListQuarantined(w http.ResponseWriter, _ *http.Request) 
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(objects); err != nil {
+	if err := jsonv2.MarshalWrite(w, objects); err != nil {
 		h.log.Error("encode quarantined list", "err", err)
 	}
 }
@@ -491,7 +498,7 @@ type quarantineRequest struct {
 
 func (h *Handler) handleRevalidate(w http.ResponseWriter, r *http.Request) {
 	var req quarantineRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := jsonv2.UnmarshalRead(r.Body, &req, jsonx.Strict); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
@@ -503,7 +510,7 @@ func (h *Handler) handleRevalidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]bool{"restored": restored}); err != nil {
+	if err := jsonv2.MarshalWrite(w, map[string]bool{"restored": restored}); err != nil {
 		h.log.Error("encode revalidate response", "err", err)
 	}
 }
@@ -516,7 +523,7 @@ func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
 		BucketID string `json:"bucket_id"`
 		Key      string `json:"key"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := jsonv2.UnmarshalRead(r.Body, &body, jsonx.Strict); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
@@ -539,11 +546,28 @@ func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]int{"purged": count}); err != nil {
+		if err := jsonv2.MarshalWrite(w, map[string]int{"purged": count}); err != nil {
 			h.log.Error("encode purge response", "err", err)
 		}
 		return
 	}
 
 	http.Error(w, `{"error":"specify bucket_id+key for single purge, or mode=all for purge all"}`, http.StatusBadRequest)
+}
+
+// RequireAdmin envuelve un handler con la misma autenticación que usa el
+// admin API (Bearer JAY_ADMIN_TOKEN, con el mismo backoff por IP ante fallos).
+//
+// Existe para montar `net/http/pprof` en el listener admin sin exponerlo: los
+// perfiles de pprof filtran nombres de funciones, argumentos en los stacks y
+// el layout de memoria del proceso, y `/debug/pprof/profile` además consume
+// CPU a pedido. Nunca los pongas detrás de nada más laxo que esto.
+func (h *Handler) RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !h.authenticateAdmin(r) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
