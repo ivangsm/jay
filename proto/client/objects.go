@@ -90,14 +90,12 @@ func (c *Client) GetObject(bucket, key string) (*GetResult, error) {
 	}
 
 	result := &GetResult{
-		ObjectInfo: ObjectInfo{
-			ContentType:    contentType,
-			Size:           size,
-			ETag:           etag,
-			ChecksumSHA256: checksum,
-			LastModified:   lastModified,
-			Metadata:       metadata,
-		},
+		ContentType:    contentType,
+		Size:           size,
+		ETag:           etag,
+		ChecksumSHA256: checksum,
+		LastModified:   lastModified,
+		Metadata:       metadata,
 	}
 	if dataReader != nil {
 		result.Body = dataReader
