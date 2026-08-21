@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -59,14 +60,14 @@ func parseIOValidate(args []string) (input, output string, err error) {
 		}
 	}
 	if input == "" {
-		return "", "", fmt.Errorf("--input is required")
+		return "", "", errors.New("--input is required")
 	}
 	return input, "", nil
 }
 
 func validateDocument(root *yaml.Node, path string) (errs []string, warns []string) {
 	if root.Kind == 0 || len(root.Content) == 0 {
-		errs = append(errs, fmt.Sprintf("%s: empty document", path))
+		errs = append(errs, path+": empty document")
 		return
 	}
 	top := root.Content[0]
@@ -253,7 +254,7 @@ func validateSeedToken(path string, fields map[string]*yaml.Node, top *yaml.Node
 		return
 	}
 	if st.Kind != yaml.MappingNode {
-		*errs = append(*errs, fmt.Sprintf("%s: seed_token must be a mapping", locLabel(path, st)))
+		*errs = append(*errs, locLabel(path, st)+": seed_token must be a mapping")
 		return
 	}
 	present := map[string]bool{}
@@ -280,7 +281,7 @@ func validateScrub(path string, fields map[string]*yaml.Node, errs *[]string, wa
 		return
 	}
 	if scrub.Kind != yaml.MappingNode {
-		*errs = append(*errs, fmt.Sprintf("%s: scrub must be a mapping", locLabel(path, scrub)))
+		*errs = append(*errs, locLabel(path, scrub)+": scrub must be a mapping")
 		return
 	}
 
@@ -293,17 +294,17 @@ func validateScrub(path string, fields map[string]*yaml.Node, errs *[]string, wa
 
 	if n := findChild(scrub, "interval_hours"); n != nil && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
 		if i, ok := parseInt(n.Value); ok && i <= 0 {
-			*errs = append(*errs, fmt.Sprintf("%s: scrub.interval_hours must be > 0", locLabel(path, n)))
+			*errs = append(*errs, locLabel(path, n)+": scrub.interval_hours must be > 0")
 		}
 	}
 	if n := findChild(scrub, "max_per_run"); n != nil && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
 		if i, ok := parseInt(n.Value); ok && i <= 0 {
-			*errs = append(*errs, fmt.Sprintf("%s: scrub.max_per_run must be > 0", locLabel(path, n)))
+			*errs = append(*errs, locLabel(path, n)+": scrub.max_per_run must be > 0")
 		}
 	}
 	if n := findChild(scrub, "bytes_per_sec"); n != nil && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
 		if i, ok := parseInt(n.Value); ok && i < 0 {
-			*errs = append(*errs, fmt.Sprintf("%s: scrub.bytes_per_sec must be >= 0", locLabel(path, n)))
+			*errs = append(*errs, locLabel(path, n)+": scrub.bytes_per_sec must be >= 0")
 		}
 	}
 }
@@ -311,12 +312,12 @@ func validateScrub(path string, fields map[string]*yaml.Node, errs *[]string, wa
 func validateRate(path string, fields map[string]*yaml.Node, errs *[]string) {
 	if n, ok := fields["rate_limit"]; ok && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
 		if f, ok := parseFloat(n.Value); ok && f < 0 {
-			*errs = append(*errs, fmt.Sprintf("%s: rate_limit must be >= 0", locLabel(path, n)))
+			*errs = append(*errs, locLabel(path, n)+": rate_limit must be >= 0")
 		}
 	}
 	if n, ok := fields["rate_burst"]; ok && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
 		if i, ok := parseInt(n.Value); ok && i < 0 {
-			*errs = append(*errs, fmt.Sprintf("%s: rate_burst must be >= 0", locLabel(path, n)))
+			*errs = append(*errs, locLabel(path, n)+": rate_burst must be >= 0")
 		}
 	}
 }

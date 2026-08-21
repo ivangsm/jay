@@ -2,6 +2,7 @@ package proto
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -9,7 +10,7 @@ import (
 // WriteHeader writes the 17-byte frame header to w.
 func WriteHeader(w io.Writer, opOrStatus byte, streamID uint32, metaLen uint32, dataLen int64) error {
 	if dataLen < 0 {
-		return fmt.Errorf("invalid negative data length")
+		return errors.New("invalid negative data length")
 	}
 	var buf [HeaderSize]byte
 	buf[0] = opOrStatus
@@ -31,7 +32,7 @@ func ReadHeader(r io.Reader) (opOrStatus byte, streamID uint32, metaLen uint32, 
 	metaLen = binary.BigEndian.Uint32(buf[5:9])
 	dataLen = int64(binary.BigEndian.Uint64(buf[9:17]))
 	if dataLen < 0 {
-		return 0, 0, 0, 0, fmt.Errorf("invalid negative data length")
+		return 0, 0, 0, 0, errors.New("invalid negative data length")
 	}
 	return
 }
@@ -68,7 +69,7 @@ func ReadHandshake(r io.Reader) (credentials string, err error) {
 	}
 	authLen := binary.BigEndian.Uint16(buf[6:8])
 	if authLen == 0 {
-		return "", fmt.Errorf("empty credentials")
+		return "", errors.New("empty credentials")
 	}
 	authBuf := make([]byte, authLen)
 	if _, err = io.ReadFull(r, authBuf); err != nil {

@@ -286,7 +286,7 @@ func (s *Server) handleConn(nc net.Conn) {
 		}
 
 		if err := h.handleOneRequest(); err != nil {
-			if err != io.EOF && !isConnClosed(err) {
+			if !errors.Is(err, io.EOF) && !isConnClosed(err) {
 				s.log.Debug("connection error", "err", err, "remote", nc.RemoteAddr())
 			}
 			return
@@ -380,10 +380,7 @@ func (h *connHandler) handleOneRequest() error {
 	// Data reader (for PutObject / UploadPart).
 	var dataReader io.Reader
 	if dataLen > 0 {
-		timeout := time.Duration(dataLen/dataReadBytesPerSec+1) * time.Second
-		if timeout < minDataReadTimeout {
-			timeout = minDataReadTimeout
-		}
+		timeout := max(time.Duration(dataLen/dataReadBytesPerSec+1)*time.Second, minDataReadTimeout)
 		if err := h.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 			return fmt.Errorf("set data read deadline: %w", err)
 		}
@@ -430,10 +427,7 @@ type request struct {
 // response writer must call it before touching the connection; the deadline
 // is cleared after the final flush in handleOneRequest.
 func (h *connHandler) armWriteDeadline(payloadLen int64) error {
-	timeout := time.Duration(payloadLen/dataWriteBytesPerSec+1) * time.Second
-	if timeout < minDataWriteTimeout {
-		timeout = minDataWriteTimeout
-	}
+	timeout := max(time.Duration(payloadLen/dataWriteBytesPerSec+1)*time.Second, minDataWriteTimeout)
 	return h.conn.SetWriteDeadline(time.Now().Add(timeout))
 }
 
@@ -451,8 +445,7 @@ func isConnClosed(err error) bool {
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
 		return true
 	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
 		return errors.Is(opErr.Err, syscall.ECONNRESET) || errors.Is(opErr.Err, syscall.EPIPE)
 	}
 	return false

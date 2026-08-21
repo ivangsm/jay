@@ -6,8 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 func openObjectsTestDB(t *testing.T) *DB {
@@ -117,7 +116,7 @@ func TestGetBucketAndObject_ObjectQuarantined(t *testing.T) {
 func seedListObjectsBucket(t *testing.T, db *DB, bucketID, prefix string, n int) []string {
 	t.Helper()
 	keys := make([]string, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		key := fmt.Sprintf("%s%06d", prefix, i)
 		keys = append(keys, key)
 		obj := &Object{

@@ -5,8 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 func openExtraTestDB(t *testing.T) *DB {
@@ -568,7 +567,7 @@ func TestForEachObjectFrom_ResumesPagination(t *testing.T) {
 	if err := db.CreateBucket(b); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		key := string(rune('a'+i)) + ".bin"
 		obj := &Object{BucketID: b.ID, Key: key, ObjectID: uuid.New().String(), SizeBytes: 1, State: "active"}
 		if _, err := db.PutObjectMeta(obj); err != nil {
@@ -731,7 +730,7 @@ func TestListTokens_FilteredByAccount(t *testing.T) {
 
 func TestListTokens_AllTokens(t *testing.T) {
 	db := openExtraTestDB(t)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tok := &Token{
 			TokenID:   uuid.New().String(),
 			AccountID: uuid.New().String(),

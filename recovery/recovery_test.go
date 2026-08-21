@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
@@ -246,7 +246,7 @@ func TestRun_ManyMissingObjects(t *testing.T) {
 
 	const n = 50
 	keys := make([]string, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		objectID := uuid.New().String()
 		key := "missing-" + objectID
 		keys = append(keys, key)

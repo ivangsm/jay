@@ -8,8 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 )
@@ -83,7 +83,7 @@ func TestCreateBucket_InvalidName(t *testing.T) {
 func TestCreateBucket_Duplicate(t *testing.T) {
 	h, _, tok, secret := setupTestHandler(t)
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		req := httptest.NewRequest(http.MethodPut, "/dup-bucket", nil)
 		req.Header.Set("Authorization", authHeader(tok, secret))
 		w := httptest.NewRecorder()

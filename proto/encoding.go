@@ -699,7 +699,7 @@ var frameBufPool = sync.Pool{
 func WriteFrameCombined(w io.Writer, opOrStatus byte, streamID uint32, meta []byte) error {
 	metaLen := len(meta)
 	if metaLen > math.MaxUint32 {
-		return fmt.Errorf("meta too large")
+		return errors.New("meta too large")
 	}
 	total := HeaderSize + metaLen
 

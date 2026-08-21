@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
 )
@@ -67,8 +67,8 @@ func sha256Hex(b []byte) string {
 // It returns (bucketID, key).
 func createTestBucketAndObject(t *testing.T, db *meta.DB, content []byte) (bucketID, key string) {
 	t.Helper()
-	bucketID = uuid.NewString()
-	key = "testkey-" + uuid.NewString()
+	bucketID = uuid.New().String()
+	key = "testkey-" + uuid.New().String()
 
 	b := &meta.Bucket{
 		ID:   bucketID,
@@ -81,11 +81,11 @@ func createTestBucketAndObject(t *testing.T, db *meta.DB, content []byte) (bucke
 	obj := &meta.Object{
 		BucketID:       bucketID,
 		Key:            key,
-		ObjectID:       uuid.NewString(),
+		ObjectID:       uuid.New().String(),
 		State:          "active",
 		SizeBytes:      int64(len(content)),
 		ChecksumSHA256: sha256Hex(content),
-		LocationRef:    "buckets/" + bucketID + "/objects/ab/cd/" + uuid.NewString(),
+		LocationRef:    "buckets/" + bucketID + "/objects/ab/cd/" + uuid.New().String(),
 	}
 	if _, err := db.PutObjectMeta(obj); err != nil {
 		t.Fatalf("PutObjectMeta: %v", err)
@@ -200,7 +200,7 @@ func TestMetrics_MarshalJSON(t *testing.T) {
 	}
 
 	// Verify required fields are present in the JSON output.
-	var raw map[string]interface{}
+	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestGC_NotifyDeletion_NonBlocking(t *testing.T) {
 	gc := testGC(t, dir, 1*time.Hour)
 
 	// Call many times without starting the loop — should never block.
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		gc.NotifyDeletion()
 	}
 }
@@ -427,7 +427,7 @@ func TestGC_FilesCollected_Counter(t *testing.T) {
 
 	// Create 3 old files and 1 recent file.
 	oldTime := time.Now().Add(-2 * time.Hour)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		name := filepath.Join(tmpDir, "old-file-"+string(rune('a'+i))+".tmp")
 		f, err := os.Create(name)
 		if err != nil {
@@ -690,7 +690,7 @@ func TestBackup_Prune_RemovesOldFiles(t *testing.T) {
 
 	// Create 5 fake backup files with old mtimes.
 	oldTime := time.Now().Add(-48 * time.Hour)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		name := filepath.Join(backupDir, "jay-old-backup-"+string(rune('a'+i))+".db")
 		f, err := os.Create(name)
 		if err != nil {
@@ -731,7 +731,7 @@ func TestBackup_Prune_RespectsMinKeep(t *testing.T) {
 
 	// Create 3 old files but minKeep=5 — should remove nothing.
 	oldTime := time.Now().Add(-48 * time.Hour)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		name := filepath.Join(backupDir, "jay-backup-"+string(rune('a'+i))+".db")
 		f, err := os.Create(name)
 		if err != nil {
@@ -759,7 +759,7 @@ func TestBackup_Prune_RecentFilesKept(t *testing.T) {
 
 	// Create 4 recent backup files (1 hour old — within 24h retention).
 	recentTime := time.Now().Add(-1 * time.Hour)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		name := filepath.Join(backupDir, "jay-recent-"+string(rune('a'+i))+".db")
 		f, err := os.Create(name)
 		if err != nil {
@@ -787,8 +787,8 @@ func TestBackup_Prune_RecentFilesKept(t *testing.T) {
 // content checksum unless overrideChecksum is non-empty.
 func createActiveObject(t *testing.T, db *meta.DB, st *store.Store, content []byte, overrideChecksum string) (bucketID, key string) {
 	t.Helper()
-	bucketID = uuid.NewString()
-	key = "scrub-key-" + uuid.NewString()
+	bucketID = uuid.New().String()
+	key = "scrub-key-" + uuid.New().String()
 
 	b := &meta.Bucket{
 		ID:   bucketID,
@@ -798,7 +798,7 @@ func createActiveObject(t *testing.T, db *meta.DB, st *store.Store, content []by
 		t.Fatalf("CreateBucket: %v", err)
 	}
 
-	objectID := uuid.NewString()
+	objectID := uuid.New().String()
 	checksum, size, locationRef, err := st.WriteObject(bucketID, objectID, bytes.NewReader(content))
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
@@ -958,13 +958,13 @@ func TestScrubber_RunIncremental_CursorAdvancesAcrossRuns(t *testing.T) {
 
 	// One bucket with 3 objects; maxPerRun=1 so each run checks exactly one
 	// and the lastKey cursor must resume where the previous run stopped.
-	bucketID := uuid.NewString()
+	bucketID := uuid.New().String()
 	b := &meta.Bucket{ID: bucketID, Name: "cursor-bucket-" + bucketID}
 	if err := db.CreateBucket(b); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	for i := 0; i < 3; i++ {
-		objectID := uuid.NewString()
+	for range 3 {
+		objectID := uuid.New().String()
 		content := []byte("cursor content " + objectID)
 		checksum, size, locationRef, err := st.WriteObject(bucketID, objectID, bytes.NewReader(content))
 		if err != nil {
@@ -987,7 +987,7 @@ func TestScrubber_RunIncremental_CursorAdvancesAcrossRuns(t *testing.T) {
 	s := NewScrubber(db, st, discardLogger(), time.Hour, 0, 1)
 
 	total := 0
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		r := s.RunIncremental(1)
 		total += r.Checked
 		if r.Checked != 1 {
@@ -1260,7 +1260,7 @@ func TestQuarantine_PurgeAll(t *testing.T) {
 
 	// Create 3 quarantined objects.
 	content := []byte("purge all test")
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		createTestBucketAndObject(t, db, content)
 	}
 

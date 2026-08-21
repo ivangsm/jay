@@ -5,8 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 func openMultipartTestDB(t *testing.T) *DB {

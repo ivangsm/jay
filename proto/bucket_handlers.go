@@ -3,8 +3,8 @@ package proto
 import (
 	"errors"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/meta"
 )
 

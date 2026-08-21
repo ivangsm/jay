@@ -112,7 +112,7 @@ func clientIP(r *http.Request, trustProxyHeaders bool) string {
 	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" && isTrustedProxy(host) {
 		// Leftmost non-empty token is the original client IP.
-		for _, part := range strings.Split(xff, ",") {
+		for part := range strings.SplitSeq(xff, ",") {
 			ip := strings.TrimSpace(part)
 			if ip != "" {
 				return ip

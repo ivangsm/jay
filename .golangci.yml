@@ -1,0 +1,89 @@
+# Config de golangci-lint para jay.
+#
+# Antes no existía: el job de lint del CI corría solo con los linters por
+# omisión (errcheck, govet, ineffassign, staticcheck, unused), que es
+# básicamente "compila y no hay variables sin usar".
+#
+# Los agregados apuntan a las clases de bug que este servicio puede pagar caro:
+# es un object store, así que un body de HTTP sin cerrar, un error comparado con
+# == en vez de errors.Is, o un fallo de escritura ignorado son pérdida de datos
+# o fugas de descriptores, no detalles de estilo.
+version: "2"
+
+linters:
+  # misspell queda FUERA a propósito: los comentarios de este repo van en
+  # español (regla del monorepo) y el linter los corrige contra un diccionario
+  # inglés — con --fix llegó a reescribir "corrupto"→"corruption" y
+  # "recorre"→"recorder" dentro de la documentación de meta/record.go.
+  enable:
+    - bodyclose      # un response body sin cerrar filtra la conexión
+    - errorlint      # == y type-assert sobre errores envueltos: fallan en silencio
+    - copyloopvar    # detecta las copias de variable de loop que ya no hacen falta
+    - nolintlint     # sin //nolint pelados: si se silencia algo, hay que decir por qué
+    - perfsprint
+    - revive
+    - unconvert
+    - usestdlibvars
+    - wastedassign
+    - whitespace
+
+  settings:
+    errcheck:
+      # check-type-assertions apagado: las únicas aserciones de tipo del repo
+      # son sobre valores de un sync.Map que escribe el mismo archivo
+      # (authFailures, buckets del limiter, el pool de md5). Ahí un tipo
+      # distinto es un error de programación, y un panic ruidoso es mejor que
+      # una rama de fallback muerta que nadie va a ejercitar nunca.
+      # Los errores devueltos por funciones sí se chequean todos.
+      check-type-assertions: false
+      check-blank: false
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+        - name: waitgroup-by-value
+
+  exclusions:
+    rules:
+      # En los tests se aceptan comparaciones y patrones más laxos: lo que se
+      # está probando muchas veces es justamente el valor concreto del error.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - errorlint
+
+      # syscall.Statfs_t.Bavail/Bsize tienen anchos distintos en darwin y en
+      # linux (uint64/uint32 vs int64/int64). unconvert analiza una sola
+      # plataforma a la vez y marca la conversión como redundante; quitarla
+      # rompe la compilación en el otro sistema, que además es el de despliegue.
+      - path: health\.go
+        linters:
+          - unconvert
+
+formatters:
+  enable:
+    - gofmt

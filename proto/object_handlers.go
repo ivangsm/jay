@@ -3,7 +3,6 @@ package proto
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"time"
@@ -216,7 +215,7 @@ func (h *connHandler) handleDeleteObject(req *request) error {
 
 // errDataTooLarge is returned by drainData when the remaining data exceeds
 // MaxDrainSize, indicating the connection must be closed.
-var errDataTooLarge = fmt.Errorf("data too large to drain, closing connection")
+var errDataTooLarge = errors.New("data too large to drain, closing connection")
 
 func drainData(req *request) error {
 	if req.data == nil || req.dataLen == 0 {

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/meta"
 )
 

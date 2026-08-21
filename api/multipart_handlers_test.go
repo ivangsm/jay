@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"

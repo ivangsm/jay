@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,7 +20,7 @@ import (
 
 // errInvalidLocationRef is returned when a location ref contains path traversal
 // sequences, null bytes, or resolves outside the data directory.
-var errInvalidLocationRef = fmt.Errorf("store: invalid location ref")
+var errInvalidLocationRef = errors.New("store: invalid location ref")
 
 // validateLocationRef checks that locationRef is safe to use as a sub-path
 // under s.dataDir. It rejects null bytes, ".." components, and any path that

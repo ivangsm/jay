@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,10 +34,7 @@ const (
 // opTimeout returns the deadline duration for an operation that transfers
 // dataLen payload bytes, plus a fixed slack for the round-trip.
 func opTimeout(dataLen int64) time.Duration {
-	t := time.Duration(dataLen/opBytesPerSec)*time.Second + opTimeoutSlack
-	if t < minOpTimeout {
-		t = minOpTimeout
-	}
+	t := max(time.Duration(dataLen/opBytesPerSec)*time.Second+opTimeoutSlack, minOpTimeout)
 	return t
 }
 
@@ -105,7 +103,7 @@ func (c *Client) getConn() (cn *conn, pooled bool, err error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil, false, fmt.Errorf("jay client: client is closed")
+		return nil, false, errors.New("jay client: client is closed")
 	}
 	c.mu.Unlock()
 
@@ -114,7 +112,7 @@ func (c *Client) getConn() (cn *conn, pooled bool, err error) {
 		case cn := <-c.pool:
 			if cn == nil {
 				// Pool channel was closed by Close.
-				return nil, false, fmt.Errorf("jay client: client is closed")
+				return nil, false, errors.New("jay client: client is closed")
 			}
 			if time.Since(cn.lastUsed) > maxConnIdle {
 				_ = cn.nc.Close()
@@ -189,9 +187,9 @@ func (c *Client) newConn() (*conn, error) {
 		_ = nc.Close()
 		switch status {
 		case proto.HandshakeAuthFailed:
-			return nil, fmt.Errorf("jay client: authentication failed")
+			return nil, errors.New("jay client: authentication failed")
 		case proto.HandshakeVersionMismatch:
-			return nil, fmt.Errorf("jay client: protocol version mismatch")
+			return nil, errors.New("jay client: protocol version mismatch")
 		default:
 			return nil, fmt.Errorf("jay client: handshake failed with status %d", status)
 		}
@@ -427,7 +425,7 @@ func (e *Error) Error() string {
 	if e.Code != "" {
 		return fmt.Sprintf("jay: %s (%s)", e.Message, e.Code)
 	}
-	return fmt.Sprintf("jay: %s", e.Message)
+	return "jay: " + e.Message
 }
 
 func checkError(status byte, meta []byte) error {

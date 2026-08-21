@@ -11,6 +11,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -85,7 +86,7 @@ func parseIO(args []string) (input, output string, err error) {
 		}
 	}
 	if input == "" {
-		return "", "", fmt.Errorf("--input is required")
+		return "", "", errors.New("--input is required")
 	}
 	return input, output, nil
 }

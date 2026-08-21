@@ -34,13 +34,13 @@ func runEnvToYAML(args []string, stdout, stderr io.Writer) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		eq := strings.Index(line, "=")
-		if eq < 0 {
+		before, after, ok := strings.Cut(line, "=")
+		if !ok {
 			warnings = append(warnings, fmt.Sprintf("line %d: missing '=', skipping", lineNum))
 			continue
 		}
-		key := strings.TrimSpace(line[:eq])
-		value := line[eq+1:]
+		key := strings.TrimSpace(before)
+		value := after
 		value = stripEnvQuotes(value)
 
 		spec, ok := specByEnvKey(key)

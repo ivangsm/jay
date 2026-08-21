@@ -9,8 +9,8 @@ import (
 	"log/slog"
 	"path/filepath"
 	"testing"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/internal/objops"
 	"github.com/ivangsm/jay/meta"

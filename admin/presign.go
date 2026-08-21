@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -15,13 +16,13 @@ const maxPresignExpiry = 7 * 24 * time.Hour
 
 func generateAdminPresignedURL(signingSecret, host, tokenID, method, path string, expires time.Duration, tlsEnabled bool) (string, error) {
 	if signingSecret == "" {
-		return "", fmt.Errorf("signing secret not configured")
+		return "", errors.New("signing secret not configured")
 	}
 	if tokenID == "" {
-		return "", fmt.Errorf("token_id is required")
+		return "", errors.New("token_id is required")
 	}
 	if path == "" || path[0] != '/' {
-		return "", fmt.Errorf("path must start with /")
+		return "", errors.New("path must start with /")
 	}
 	if expires > maxPresignExpiry {
 		return "", fmt.Errorf("expiration exceeds maximum of %d seconds", int(maxPresignExpiry.Seconds()))

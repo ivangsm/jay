@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -40,7 +41,7 @@ func runSeed(cfg Config, db *meta.DB, log *slog.Logger) error {
 		return nil
 	}
 	if emptyCount != 0 {
-		return fmt.Errorf("seed: JAY_SEED_TOKEN_ACCOUNT, JAY_SEED_TOKEN_ID and JAY_SEED_TOKEN_SECRET must all be set or all empty")
+		return errors.New("seed: JAY_SEED_TOKEN_ACCOUNT, JAY_SEED_TOKEN_ID and JAY_SEED_TOKEN_SECRET must all be set or all empty")
 	}
 
 	account, created, err := db.CreateAccountIfNotExists(acc)

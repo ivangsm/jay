@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	bolt "go.etcd.io/bbolt"
 )
 

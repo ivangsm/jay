@@ -4,7 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/url"
 	"sort"
@@ -63,50 +63,50 @@ func validatePresignedRequest(r *http.Request, signingSecret string, db *meta.DB
 	signature := q.Get("X-Jay-Signature")
 
 	if tokenID == "" || expiresStr == "" || signature == "" {
-		return nil, fmt.Errorf("missing presigned URL parameters")
+		return nil, errors.New("missing presigned URL parameters")
 	}
 
 	// Check expiry
 	expiresUnix, err := strconv.ParseInt(expiresStr, 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("invalid expires value")
+		return nil, errors.New("invalid expires value")
 	}
 	if time.Now().Unix() > expiresUnix {
-		return nil, fmt.Errorf("presigned URL has expired")
+		return nil, errors.New("presigned URL has expired")
 	}
 	maxExpiry := time.Now().Unix() + int64((7 * 24 * time.Hour).Seconds())
 	if expiresUnix > maxExpiry {
-		return nil, fmt.Errorf("presigned URL expiry exceeds maximum of 7 days")
+		return nil, errors.New("presigned URL expiry exceeds maximum of 7 days")
 	}
 
 	// Verify HMAC — include canonical query (excluding meta params) in signature
 	cq := canonicalQuery(q)
 	expected := computeSignature(signingSecret, tokenID, r.Method, r.URL.Path, cq, expiresStr)
 	if !hmac.Equal([]byte(signature), []byte(expected)) {
-		return nil, fmt.Errorf("invalid signature")
+		return nil, errors.New("invalid signature")
 	}
 
 	// Load token from db
 	token, err := db.GetToken(tokenID)
 	if err != nil {
-		return nil, fmt.Errorf("token not found")
+		return nil, errors.New("token not found")
 	}
 	if token.Status != "active" {
-		return nil, fmt.Errorf("token is not active")
+		return nil, errors.New("token is not active")
 	}
 
 	// Check token expiry
 	if token.ExpiresAt != nil && time.Now().After(*token.ExpiresAt) {
-		return nil, fmt.Errorf("token has expired")
+		return nil, errors.New("token has expired")
 	}
 
 	// Check account status
 	account, err := db.GetAccount(token.AccountID)
 	if err != nil {
-		return nil, fmt.Errorf("account not found")
+		return nil, errors.New("account not found")
 	}
 	if account.Status != "active" {
-		return nil, fmt.Errorf("account is not active")
+		return nil, errors.New("account is not active")
 	}
 
 	return token, nil
