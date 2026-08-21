@@ -2,11 +2,13 @@ package meta
 
 import (
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/ivangsm/jay/internal/jsonx"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -18,6 +20,7 @@ var (
 	ErrBucketNotFound      = errors.New("bucket not found")
 	ErrBucketNotEmpty      = errors.New("bucket is not empty")
 	ErrBucketLimitExceeded = errors.New("account bucket limit exceeded")
+	ErrInvalidBucketPolicy = errors.New("bucket policy is not valid JSON")
 )
 
 // bucketStatsEntry is the 16-byte layout of a maintained counter:
@@ -47,11 +50,11 @@ func decodeBucketStatsEntry(b []byte) (count, totalSize int64, ok bool) {
 func addBucketStat(tx *bolt.Tx, bucketID string, dCount, dSize int64) error {
 	sys := tx.Bucket(bucketSys)
 	if sys == nil {
-		return fmt.Errorf("meta: sys bucket missing")
+		return errors.New("meta: sys bucket missing")
 	}
 	stats := sys.Bucket(sysBucketStats)
 	if stats == nil {
-		return fmt.Errorf("meta: sys/bucket_stats bucket missing")
+		return errors.New("meta: sys/bucket_stats bucket missing")
 	}
 	key := []byte(bucketID)
 	var count, totalSize int64
@@ -98,11 +101,11 @@ func accountBucketCountGet(tx *bolt.Tx, accountID string) int64 {
 func accountBucketCountAdd(tx *bolt.Tx, accountID string, delta int64) error {
 	sys := tx.Bucket(bucketSys)
 	if sys == nil {
-		return fmt.Errorf("meta: sys bucket missing")
+		return errors.New("meta: sys bucket missing")
 	}
 	bk := sys.Bucket(sysAccountBucketCount)
 	if bk == nil {
-		return fmt.Errorf("meta: sys/account_bucket_count bucket missing")
+		return errors.New("meta: sys/account_bucket_count bucket missing")
 	}
 	key := []byte(accountID)
 	var current int64
@@ -133,11 +136,6 @@ func (db *DB) CreateBucket(b *Bucket) error {
 		b.Visibility = "private"
 	}
 
-	data, err := json.Marshal(b)
-	if err != nil {
-		return fmt.Errorf("meta: marshal bucket: %w", err)
-	}
-
 	return db.bolt.Update(func(tx *bolt.Tx) error {
 		bk := tx.Bucket(bucketBuckets)
 		if bk.Get([]byte(b.Name)) != nil {
@@ -152,7 +150,7 @@ func (db *DB) CreateBucket(b *Bucket) error {
 			}
 		}
 
-		if err := bk.Put([]byte(b.Name), data); err != nil {
+		if err := putRecordTx(tx, bucketBuckets, []byte(b.Name), b); err != nil {
 			return err
 		}
 		// Reverse index
@@ -184,38 +182,37 @@ func (db *DB) CreateBucket(b *Bucket) error {
 
 // GetBucket retrieves a bucket by name.
 func (db *DB) GetBucket(name string) (*Bucket, error) {
-	var b Bucket
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		data := tx.Bucket(bucketBuckets).Get([]byte(name))
-		if data == nil {
-			return ErrBucketNotFound
-		}
-		return json.Unmarshal(data, &b)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &b, nil
+	return db.getRecord[Bucket](bucketBuckets, name, ErrBucketNotFound)
 }
 
 // GetBucketByID retrieves a bucket by its ID.
+//
+// Wrapper fino sobre getRecordTx: lo propio es el salto por el índice inverso
+// id→nombre, y las dos lecturas tienen que ir en la MISMA transacción (con dos
+// transacciones separadas, un DeleteBucket concurrente entre ambas dejaría el
+// índice y el registro en desacuerdo).
 func (db *DB) GetBucketByID(id string) (*Bucket, error) {
-	var b Bucket
+	var out *Bucket
 	err := db.bolt.View(func(tx *bolt.Tx) error {
-		name := tx.Bucket(bucketBucketsID).Get([]byte(id))
+		idx := tx.Bucket(bucketBucketsID)
+		if idx == nil {
+			return ErrBucketNotFound
+		}
+		name := idx.Get([]byte(id))
 		if name == nil {
 			return ErrBucketNotFound
 		}
-		data := tx.Bucket(bucketBuckets).Get(name)
-		if data == nil {
-			return ErrBucketNotFound
+		b, err := getRecordTx[Bucket](tx, bucketBuckets, name, ErrBucketNotFound)
+		if err != nil {
+			return err
 		}
-		return json.Unmarshal(data, &b)
+		out = b
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &b, nil
+	return out, nil
 }
 
 // DeleteBucket removes a bucket by name. Fails if objects exist in it.
@@ -226,8 +223,8 @@ func (db *DB) DeleteBucket(name string) error {
 		if data == nil {
 			return ErrBucketNotFound
 		}
-		var b Bucket
-		if err := json.Unmarshal(data, &b); err != nil {
+		b, err := getRecordTx[Bucket](tx, bucketBuckets, []byte(name), ErrBucketNotFound)
+		if err != nil {
 			return err
 		}
 
@@ -270,20 +267,9 @@ func (db *DB) DeleteBucket(name string) error {
 
 // ListBuckets returns all buckets, optionally filtered by owner account.
 func (db *DB) ListBuckets(ownerAccountID string) ([]Bucket, error) {
-	var buckets []Bucket
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketBuckets).ForEach(func(k, v []byte) error {
-			var b Bucket
-			if err := json.Unmarshal(v, &b); err != nil {
-				return err
-			}
-			if ownerAccountID == "" || b.OwnerAccountID == ownerAccountID {
-				buckets = append(buckets, b)
-			}
-			return nil
-		})
+	return db.listRecords(bucketBuckets, func(b *Bucket) bool {
+		return ownerAccountID == "" || b.OwnerAccountID == ownerAccountID
 	})
-	return buckets, err
 }
 
 // BucketStats returns the count and total size of active objects in a bucket
@@ -340,7 +326,7 @@ func (db *DB) RebuildBucketStats(bucketID string) error {
 		}
 		stats := tx.Bucket(bucketSys).Bucket(sysBucketStats)
 		if stats == nil {
-			return fmt.Errorf("meta: sys/bucket_stats bucket missing")
+			return errors.New("meta: sys/bucket_stats bucket missing")
 		}
 		if err := stats.Put([]byte(bucketID), encodeBucketStatsEntry(count, totalSize)); err != nil {
 			return fmt.Errorf("meta: write bucket_stats: %w", err)
@@ -361,11 +347,12 @@ func (db *DB) RebuildAllBucketStatsIfMissing() error {
 		}
 		stats := tx.Bucket(bucketSys).Bucket(sysBucketStats)
 		if stats == nil {
-			return fmt.Errorf("meta: sys/bucket_stats bucket missing")
+			return errors.New("meta: sys/bucket_stats bucket missing")
 		}
 		return bk.ForEach(func(k, v []byte) error {
 			var b Bucket
-			if err := json.Unmarshal(v, &b); err != nil {
+			if err := jsonv2.Unmarshal(v, &b, jsonx.Wire); err != nil {
+				db.reportDecodeFailure(bucketBuckets, string(k), err)
 				return nil
 			}
 			if stats.Get([]byte(b.ID)) == nil {
@@ -386,22 +373,17 @@ func (db *DB) RebuildAllBucketStatsIfMissing() error {
 }
 
 // UpdateBucketPolicy updates the policy JSON for a bucket.
-func (db *DB) UpdateBucketPolicy(name string, policy json.RawMessage) error {
-	return db.bolt.Update(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketBuckets)
-		data := bk.Get([]byte(name))
-		if data == nil {
-			return ErrBucketNotFound
-		}
-		var b Bucket
-		if err := json.Unmarshal(data, &b); err != nil {
-			return err
-		}
+//
+// Una política no-nil tiene que ser JSON sintácticamente válido. Antes, un
+// policy vacío-no-nil se persistía en silencio como "sin política" y la
+// llamada devolvía éxito; ahora se rechaza en la frontera, que es donde el
+// error es atribuible a quien lo mandó.
+func (db *DB) UpdateBucketPolicy(name string, policy jsontext.Value) error {
+	if policy != nil && !policy.IsValid() {
+		return fmt.Errorf("meta: %w", ErrInvalidBucketPolicy)
+	}
+	return db.updateRecord(bucketBuckets, name, ErrBucketNotFound, func(b *Bucket) error {
 		b.PolicyJSON = policy
-		updated, err := json.Marshal(&b)
-		if err != nil {
-			return err
-		}
-		return bk.Put([]byte(name), updated)
+		return nil
 	})
 }

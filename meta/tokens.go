@@ -1,13 +1,11 @@
 package meta
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
-	bolt "go.etcd.io/bbolt"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -24,29 +22,12 @@ func (db *DB) CreateAccount(a *Account) error {
 	if a.Status == "" {
 		a.Status = "active"
 	}
-	data, err := json.Marshal(a)
-	if err != nil {
-		return fmt.Errorf("meta: marshal account: %w", err)
-	}
-	return db.bolt.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketAccounts).Put([]byte(a.AccountID), data)
-	})
+	return db.putRecord(bucketAccounts, a.AccountID, a)
 }
 
 // GetAccount retrieves an account by ID.
 func (db *DB) GetAccount(id string) (*Account, error) {
-	var a Account
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		data := tx.Bucket(bucketAccounts).Get([]byte(id))
-		if data == nil {
-			return ErrAccountNotFound
-		}
-		return json.Unmarshal(data, &a)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &a, nil
+	return db.getRecord[Account](bucketAccounts, id, ErrAccountNotFound)
 }
 
 // CreateToken stores a new token in bbolt. The caller passes a Token with
@@ -65,25 +46,13 @@ func (db *DB) CreateToken(t *Token) error {
 	// Store encrypted version on disk, leave caller's struct untouched.
 	stored := *t
 	stored.SecretKey = enc
-	data, err := json.Marshal(&stored)
-	if err != nil {
-		return fmt.Errorf("meta: marshal token: %w", err)
-	}
-	return db.bolt.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTokens).Put([]byte(t.TokenID), data)
-	})
+	return db.putRecord(bucketTokens, t.TokenID, &stored)
 }
 
 // GetToken retrieves a token by ID and transparently decrypts SecretKey.
+// Wrapper fino sobre getRecord: lo único propio es el descifrado del secreto.
 func (db *DB) GetToken(tokenID string) (*Token, error) {
-	var t Token
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		data := tx.Bucket(bucketTokens).Get([]byte(tokenID))
-		if data == nil {
-			return ErrTokenNotFound
-		}
-		return json.Unmarshal(data, &t)
-	})
+	t, err := db.getRecord[Token](bucketTokens, tokenID, ErrTokenNotFound)
 	if err != nil {
 		return nil, err
 	}
@@ -92,28 +61,24 @@ func (db *DB) GetToken(tokenID string) (*Token, error) {
 		return nil, fmt.Errorf("meta: decrypt token %s: %w", tokenID, err)
 	}
 	t.SecretKey = plain
-	return &t, nil
+	return t, nil
 }
 
 // ListTokens returns all tokens, optionally filtered by account.
 // SecretHash and SecretKey are zeroed in the response.
 func (db *DB) ListTokens(accountID string) ([]Token, error) {
-	var tokens []Token
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
-			var t Token
-			if err := json.Unmarshal(v, &t); err != nil {
-				return nil
-			}
-			if accountID == "" || t.AccountID == accountID {
-				t.SecretHash = ""
-				t.SecretKey = ""
-				tokens = append(tokens, t)
-			}
-			return nil
-		})
+	tokens, err := db.listRecords(bucketTokens, func(t *Token) bool {
+		return accountID == "" || t.AccountID == accountID
 	})
-	return tokens, err
+	if err != nil {
+		return nil, err
+	}
+	// El cerado de secretos es lo único que este listado agrega sobre el núcleo.
+	for i := range tokens {
+		tokens[i].SecretHash = ""
+		tokens[i].SecretKey = ""
+	}
+	return tokens, nil
 }
 
 // TokenSeedStatus describes the outcome of CreateTokenIfNotExists.
@@ -128,25 +93,16 @@ const (
 // CreateAccountIfNotExists looks up an account by Name. If found, returns it
 // with created=false. If not found, creates a new one with a uuid ID.
 func (db *DB) CreateAccountIfNotExists(name string) (*Account, bool, error) {
-	var found *Account
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketAccounts).ForEach(func(k, v []byte) error {
-			var a Account
-			if err := json.Unmarshal(v, &a); err != nil {
-				return nil
-			}
-			if a.Name == name {
-				copy := a
-				found = &copy
-			}
-			return nil
-		})
+	matches, err := db.listRecords(bucketAccounts, func(a *Account) bool {
+		return a.Name == name
 	})
 	if err != nil {
 		return nil, false, err
 	}
-	if found != nil {
-		return found, false, nil
+	if len(matches) > 0 {
+		// Mismo criterio que antes: si hay varias con el mismo nombre, gana la
+		// última que devuelve el recorrido de bbolt (orden por clave).
+		return &matches[len(matches)-1], false, nil
 	}
 
 	acc := &Account{
@@ -222,22 +178,9 @@ func (db *DB) fireTokenInvalidate(tokenID string) {
 
 // RevokeToken marks a token as revoked.
 func (db *DB) RevokeToken(tokenID string) error {
-	err := db.bolt.Update(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketTokens)
-		data := bk.Get([]byte(tokenID))
-		if data == nil {
-			return ErrTokenNotFound
-		}
-		var t Token
-		if err := json.Unmarshal(data, &t); err != nil {
-			return err
-		}
+	err := db.updateRecord(bucketTokens, tokenID, ErrTokenNotFound, func(t *Token) error {
 		t.Status = "revoked"
-		updated, err := json.Marshal(&t)
-		if err != nil {
-			return err
-		}
-		return bk.Put([]byte(tokenID), updated)
+		return nil
 	})
 	if err != nil {
 		return err

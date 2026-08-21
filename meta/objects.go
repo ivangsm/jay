@@ -2,13 +2,14 @@ package meta
 
 import (
 	"bytes"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/ivangsm/jay/internal/jsonx"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -119,7 +120,7 @@ func (db *DB) GetBucketAndObject(bucketName, key string) (*Bucket, *Object, erro
 		if data == nil {
 			return ErrBucketNotFound
 		}
-		if err := json.Unmarshal(data, &bucket); err != nil {
+		if err := jsonv2.Unmarshal(data, &bucket, jsonx.Wire); err != nil {
 			return err
 		}
 		bk := tx.Bucket(objectsBucketName(bucket.ID))

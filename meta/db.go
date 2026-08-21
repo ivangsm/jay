@@ -39,6 +39,7 @@ type DB struct {
 	hookMu              sync.RWMutex
 	tokenInvalidateHook func(tokenID string)
 	deletionHook        func()
+	decodeFailureHook   func(bucket, key string)
 }
 
 // Open opens or creates the bbolt database at the given path.

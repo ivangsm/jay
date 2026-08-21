@@ -1,13 +1,14 @@
 package meta
 
 import (
-	"encoding/json"
+	"cmp"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"log/slog"
-	"sort"
+	"slices"
 	"time"
 
+	"github.com/ivangsm/jay/internal/jsonx"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -34,44 +35,21 @@ func (db *DB) CreateMultipartUpload(upload *MultipartUpload) error {
 		upload.State = "initiated"
 	}
 
-	data, err := json.Marshal(upload)
-	if err != nil {
-		return fmt.Errorf("meta: marshal upload: %w", err)
-	}
-
 	return db.bolt.Update(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketMultipart)
-		if bk == nil {
-			// Defensive: bootstrap() creates this bucket, but a DB handle built
-			// outside Open() (e.g. a hand-rolled test fixture) may not have it.
-			var err error
-			bk, err = tx.CreateBucketIfNotExists(bucketMultipart)
-			if err != nil {
+		// Defensive: bootstrap() creates this bucket, but a DB handle built
+		// outside Open() (e.g. a hand-rolled test fixture) may not have it.
+		if tx.Bucket(bucketMultipart) == nil {
+			if _, err := tx.CreateBucketIfNotExists(bucketMultipart); err != nil {
 				return fmt.Errorf("meta: create multipart bucket: %w", err)
 			}
 		}
-		return bk.Put([]byte(upload.UploadID), data)
+		return putRecordTx(tx, bucketMultipart, []byte(upload.UploadID), upload)
 	})
 }
 
 // GetMultipartUpload retrieves a multipart upload by ID.
 func (db *DB) GetMultipartUpload(uploadID string) (*MultipartUpload, error) {
-	var upload MultipartUpload
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketMultipart)
-		if bk == nil {
-			return ErrUploadNotFound
-		}
-		data := bk.Get([]byte(uploadID))
-		if data == nil {
-			return ErrUploadNotFound
-		}
-		return json.Unmarshal(data, &upload)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &upload, nil
+	return db.getRecord[MultipartUpload](bucketMultipart, uploadID, ErrUploadNotFound)
 }
 
 // AddMultipartPart adds or replaces a part in a multipart upload.
@@ -80,33 +58,17 @@ func (db *DB) AddMultipartPart(uploadID string, part MultipartPart) error {
 		return ErrInvalidPartNumber
 	}
 
-	return db.bolt.Update(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketMultipart)
-		if bk == nil {
-			return ErrUploadNotFound
-		}
-		data := bk.Get([]byte(uploadID))
-		if data == nil {
-			return ErrUploadNotFound
-		}
-		var upload MultipartUpload
-		if err := json.Unmarshal(data, &upload); err != nil {
-			return err
-		}
+	return db.updateRecord(bucketMultipart, uploadID, ErrUploadNotFound, func(upload *MultipartUpload) error {
 		if upload.State != "initiated" {
 			return ErrUploadNotActive
 		}
 
 		// Replace existing part with same number, or append
-		found := false
-		for i, p := range upload.Parts {
-			if p.PartNumber == part.PartNumber {
-				upload.Parts[i] = part
-				found = true
-				break
-			}
-		}
-		if !found {
+		if i := slices.IndexFunc(upload.Parts, func(p MultipartPart) bool {
+			return p.PartNumber == part.PartNumber
+		}); i >= 0 {
+			upload.Parts[i] = part
+		} else {
 			if len(upload.Parts) >= MaxMultipartParts {
 				return ErrTooManyParts
 			}
@@ -114,15 +76,10 @@ func (db *DB) AddMultipartPart(uploadID string, part MultipartPart) error {
 		}
 
 		// Keep parts sorted
-		sort.Slice(upload.Parts, func(i, j int) bool {
-			return upload.Parts[i].PartNumber < upload.Parts[j].PartNumber
+		slices.SortFunc(upload.Parts, func(a, b MultipartPart) int {
+			return cmp.Compare(a.PartNumber, b.PartNumber)
 		})
-
-		updated, err := json.Marshal(&upload)
-		if err != nil {
-			return err
-		}
-		return bk.Put([]byte(uploadID), updated)
+		return nil
 	})
 }
 
@@ -131,90 +88,58 @@ func (db *DB) AddMultipartPart(uploadID string, part MultipartPart) error {
 // final object before marking/deleting the upload, so failed assembly remains
 // retryable.
 func (db *DB) CompleteMultipartUpload(uploadID string, partNumbers []int) (*MultipartUpload, error) {
-	var upload MultipartUpload
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketMultipart)
-		if bk == nil {
-			return ErrUploadNotFound
-		}
-		data := bk.Get([]byte(uploadID))
-		if data == nil {
-			return ErrUploadNotFound
-		}
-		if err := json.Unmarshal(data, &upload); err != nil {
-			return err
-		}
-		if upload.State != "initiated" {
-			return ErrUploadNotActive
-		}
-
-		// Validate part numbers are in valid range
-		for _, pn := range partNumbers {
-			if pn < 1 || pn > MaxMultipartParts {
-				return fmt.Errorf("invalid part number %d", pn)
-			}
-		}
-
-		// Validate all requested parts exist
-		partMap := make(map[int]bool)
-		for _, p := range upload.Parts {
-			partMap[p.PartNumber] = true
-		}
-		for _, pn := range partNumbers {
-			if !partMap[pn] {
-				return fmt.Errorf("part %d not found", pn)
-			}
-		}
-
-		// Filter to only requested parts, sorted
-		var finalParts []MultipartPart
-		requestedSet := make(map[int]bool)
-		for _, pn := range partNumbers {
-			requestedSet[pn] = true
-		}
-		for _, p := range upload.Parts {
-			if requestedSet[p.PartNumber] {
-				finalParts = append(finalParts, p)
-			}
-		}
-		sort.Slice(finalParts, func(i, j int) bool {
-			return finalParts[i].PartNumber < finalParts[j].PartNumber
-		})
-
-		upload.Parts = finalParts
-		return nil
-	})
+	upload, err := db.getRecord[MultipartUpload](bucketMultipart, uploadID, ErrUploadNotFound)
 	if err != nil {
 		return nil, err
 	}
-	return &upload, nil
+	if upload.State != "initiated" {
+		return nil, ErrUploadNotActive
+	}
+
+	// Validate part numbers are in valid range
+	for _, pn := range partNumbers {
+		if pn < 1 || pn > MaxMultipartParts {
+			return nil, fmt.Errorf("invalid part number %d", pn)
+		}
+	}
+
+	// Validate all requested parts exist
+	stored := make(map[int]bool, len(upload.Parts))
+	for _, p := range upload.Parts {
+		stored[p.PartNumber] = true
+	}
+	requested := make(map[int]bool, len(partNumbers))
+	for _, pn := range partNumbers {
+		if !stored[pn] {
+			return nil, fmt.Errorf("part %d not found", pn)
+		}
+		requested[pn] = true
+	}
+
+	// Filter to only requested parts, sorted
+	var finalParts []MultipartPart
+	for _, p := range upload.Parts {
+		if requested[p.PartNumber] {
+			finalParts = append(finalParts, p)
+		}
+	}
+	slices.SortFunc(finalParts, func(a, b MultipartPart) int {
+		return cmp.Compare(a.PartNumber, b.PartNumber)
+	})
+
+	upload.Parts = finalParts
+	return upload, nil
 }
 
 // MarkMultipartUploadCompleted marks a still-active multipart upload as
 // completed after the final object has been durably committed.
 func (db *DB) MarkMultipartUploadCompleted(uploadID string) error {
-	return db.bolt.Update(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketMultipart)
-		if bk == nil {
-			return ErrUploadNotFound
-		}
-		data := bk.Get([]byte(uploadID))
-		if data == nil {
-			return ErrUploadNotFound
-		}
-		var upload MultipartUpload
-		if err := json.Unmarshal(data, &upload); err != nil {
-			return err
-		}
+	return db.updateRecord(bucketMultipart, uploadID, ErrUploadNotFound, func(upload *MultipartUpload) error {
 		if upload.State != "initiated" {
 			return ErrUploadNotActive
 		}
 		upload.State = "completed"
-		updated, err := json.Marshal(&upload)
-		if err != nil {
-			return err
-		}
-		return bk.Put([]byte(uploadID), updated)
+		return nil
 	})
 }
 
@@ -226,57 +151,26 @@ func (db *DB) MarkMultipartUploadCompleted(uploadID string) error {
 // committed; it now returns ErrUploadNotActive, which transports map to the
 // S3 NoSuchUpload semantics (the upload no longer exists as an active one).
 func (db *DB) AbortMultipartUpload(uploadID string) (*MultipartUpload, error) {
-	var upload MultipartUpload
-	err := db.bolt.Update(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketMultipart)
-		if bk == nil {
-			return ErrUploadNotFound
-		}
-		data := bk.Get([]byte(uploadID))
-		if data == nil {
-			return ErrUploadNotFound
-		}
-		if err := json.Unmarshal(data, &upload); err != nil {
-			return err
-		}
+	var aborted *MultipartUpload
+	err := db.updateRecord(bucketMultipart, uploadID, ErrUploadNotFound, func(upload *MultipartUpload) error {
 		if upload.State != "initiated" {
 			return ErrUploadNotActive
 		}
-
 		upload.State = "aborted"
-		updated, err := json.Marshal(&upload)
-		if err != nil {
-			return err
-		}
-		return bk.Put([]byte(uploadID), updated)
+		aborted = upload
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &upload, nil
+	return aborted, nil
 }
 
 // ListMultipartUploads returns active uploads for a bucket.
 func (db *DB) ListMultipartUploads(bucketID string) ([]MultipartUpload, error) {
-	var uploads []MultipartUpload
-	err := db.bolt.View(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketMultipart)
-		if bk == nil {
-			return nil
-		}
-		return bk.ForEach(func(k, v []byte) error {
-			var u MultipartUpload
-			if err := json.Unmarshal(v, &u); err != nil {
-				slog.Warn("meta: corrupt multipart upload record", "key", string(k), "err", err)
-				return nil
-			}
-			if u.BucketID == bucketID && u.State == "initiated" {
-				uploads = append(uploads, u)
-			}
-			return nil
-		})
+	return db.listRecords(bucketMultipart, func(u *MultipartUpload) bool {
+		return u.BucketID == bucketID && u.State == "initiated"
 	})
-	return uploads, err
 }
 
 // CleanupExpiredUploads removes uploads older than maxAge.
@@ -292,8 +186,8 @@ func (db *DB) CleanupExpiredUploads(maxAge time.Duration) ([]MultipartUpload, er
 		var toDelete [][]byte
 		if err := bk.ForEach(func(k, v []byte) error {
 			var u MultipartUpload
-			if err := json.Unmarshal(v, &u); err != nil {
-				slog.Warn("meta: corrupt multipart upload record", "key", string(k), "err", err)
+			if err := jsonv2.Unmarshal(v, &u, jsonx.Wire); err != nil {
+				db.reportDecodeFailure(bucketMultipart, string(k), err)
 				return nil
 			}
 			if u.State == "initiated" && u.CreatedAt.Before(cutoff) {

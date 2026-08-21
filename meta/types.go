@@ -1,7 +1,7 @@
 package meta
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"time"
 )
 
@@ -13,13 +13,19 @@ type Account struct {
 }
 
 type Bucket struct {
-	ID             string          `json:"id"`
-	Name           string          `json:"name"`
-	OwnerAccountID string          `json:"owner_account_id"`
-	CreatedAt      time.Time       `json:"created_at"`
-	Visibility     string          `json:"visibility"` // "private", "public-read"
-	PolicyJSON     json.RawMessage `json:"policy_json,omitempty"`
-	Status         string          `json:"status"` // "active", "deleting"
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	OwnerAccountID string    `json:"owner_account_id"`
+	CreatedAt      time.Time `json:"created_at"`
+	Visibility     string    `json:"visibility"` // "private", "public-read"
+	// omitzero, no omitempty: en un campo de JSON crudo las dos opciones
+	// divergen. v1 con omitempty omite el slice vacío pero escribe el literal
+	// `null`; v2 con omitempty omite el `null` — o sea, cambiaría los bytes en
+	// disco. Con omitzero los dos coinciden en los cuatro estados posibles
+	// (nil → omitido, `null` → escrito, valor → escrito, vacío-no-nil → error).
+	// Lo cubre TestJSONWireCompatV1V2.
+	PolicyJSON jsontext.Value `json:"policy_json,omitzero"`
+	Status     string         `json:"status"` // "active", "deleting"
 }
 
 type Object struct {

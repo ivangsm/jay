@@ -6,13 +6,15 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"strings"
 
 	"golang.org/x/crypto/hkdf"
 	"io"
 
+	"github.com/ivangsm/jay/internal/jsonx"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -80,7 +82,7 @@ func aesGCMDecrypt(kek [32]byte, stored string) (string, error) {
 	}
 	nonceSize := gcm.NonceSize()
 	if len(raw) < nonceSize {
-		return "", fmt.Errorf("meta: encrypted secret too short")
+		return "", errors.New("meta: encrypted secret too short")
 	}
 	nonce, ciphertext := raw[:nonceSize], raw[nonceSize:]
 	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
@@ -94,7 +96,7 @@ func (db *DB) encryptSecret(plain string) (string, error) {
 	db.kekMu.RLock()
 	defer db.kekMu.RUnlock()
 	if !db.kekSet {
-		return "", fmt.Errorf("meta: signing secret not set — cannot encrypt token.SecretKey")
+		return "", errors.New("meta: signing secret not set — cannot encrypt token.SecretKey")
 	}
 	return aesGCMEncrypt(db.kek, plain)
 }
@@ -103,7 +105,7 @@ func (db *DB) decryptSecret(stored string) (string, error) {
 	db.kekMu.RLock()
 	defer db.kekMu.RUnlock()
 	if !db.kekSet {
-		return "", fmt.Errorf("meta: signing secret not set — cannot decrypt token.SecretKey")
+		return "", errors.New("meta: signing secret not set — cannot decrypt token.SecretKey")
 	}
 	return aesGCMDecrypt(db.kek, stored)
 }
@@ -116,6 +118,53 @@ func (db *DB) RekeyTokens(oldSecret, newSecret string) (int, error) {
 	oldKEK := DeriveKEK(oldSecret)
 	newKEK := DeriveKEK(newSecret)
 
+	n, err := db.resecretTokens(func(t *Token) (bool, error) {
+		if !strings.HasPrefix(t.SecretKey, encryptedPrefix) {
+			return false, nil // plaintext legacy entry — MigrateTokenSecrets handles these
+		}
+		plain, err := aesGCMDecrypt(oldKEK, t.SecretKey)
+		if err != nil {
+			return false, fmt.Errorf("rekey: decrypt token %s: %w", t.TokenID, err)
+		}
+		enc, err := aesGCMEncrypt(newKEK, plain)
+		if err != nil {
+			return false, fmt.Errorf("rekey: encrypt token %s: %w", t.TokenID, err)
+		}
+		t.SecretKey = enc
+		return true, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// MigrateTokenSecrets scans the tokens bucket and re-encrypts any token where
+// SecretKey is stored as plaintext (no "enc:v1:" prefix). Returns the number
+// of tokens migrated. Idempotent — already-encrypted entries are skipped.
+func (db *DB) MigrateTokenSecrets() (migrated int, err error) {
+	return db.resecretTokens(func(t *Token) (bool, error) {
+		if t.SecretKey == "" || strings.HasPrefix(t.SecretKey, encryptedPrefix) {
+			return false, nil
+		}
+		enc, err := db.encryptSecret(t.SecretKey)
+		if err != nil {
+			return false, err
+		}
+		t.SecretKey = enc
+		return true, nil
+	})
+}
+
+// resecretTokens es el núcleo compartido de RekeyTokens y MigrateTokenSecrets:
+// escanea el bucket de tokens en una transacción de lectura, deja que rewrite
+// decida cuáles tocar y cómo, y escribe todos los afectados en UNA sola
+// transacción de escritura (todo o nada).
+//
+// El escaneo va en su propia transacción a propósito: re-cifrar es trabajo de
+// CPU (AES-GCM por token) y no queremos tener tomada la escritura mientras
+// tanto.
+func (db *DB) resecretTokens(rewrite func(*Token) (bool, error)) (int, error) {
 	type pending struct {
 		id   string
 		data []byte
@@ -123,41 +172,43 @@ func (db *DB) RekeyTokens(oldSecret, newSecret string) (int, error) {
 	var toUpdate []pending
 
 	err := db.bolt.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
+		bk := tx.Bucket(bucketTokens)
+		if bk == nil {
+			return nil
+		}
+		return bk.ForEach(func(k, v []byte) error {
 			var t Token
-			if err := json.Unmarshal(v, &t); err != nil {
+			if err := jsonv2.Unmarshal(v, &t, jsonx.Wire); err != nil {
+				db.reportDecodeFailure(bucketTokens, string(k), err)
 				return nil
 			}
-			if !strings.HasPrefix(t.SecretKey, encryptedPrefix) {
-				return nil // plaintext legacy entry — MigrateTokenSecrets handles these
-			}
-			plain, err := aesGCMDecrypt(oldKEK, t.SecretKey)
-			if err != nil {
-				return fmt.Errorf("rekey: decrypt token %s: %w", t.TokenID, err)
-			}
-			enc, err := aesGCMEncrypt(newKEK, plain)
-			if err != nil {
-				return fmt.Errorf("rekey: encrypt token %s: %w", t.TokenID, err)
-			}
-			t.SecretKey = enc
-			updated, err := json.Marshal(&t)
+			changed, err := rewrite(&t)
 			if err != nil {
 				return err
 			}
-			toUpdate = append(toUpdate, pending{id: t.TokenID, data: updated})
+			if !changed {
+				return nil
+			}
+			data, err := jsonv2.Marshal(&t, jsonx.Wire)
+			if err != nil {
+				return fmt.Errorf("meta: encode token %s: %w", t.TokenID, err)
+			}
+			toUpdate = append(toUpdate, pending{id: t.TokenID, data: data})
 			return nil
 		})
 	})
 	if err != nil {
 		return 0, err
 	}
-
 	if len(toUpdate) == 0 {
 		return 0, nil
 	}
 
 	err = db.bolt.Update(func(tx *bolt.Tx) error {
 		bk := tx.Bucket(bucketTokens)
+		if bk == nil {
+			return fmt.Errorf("meta: bbolt bucket %s missing", bucketTokens)
+		}
 		for _, p := range toUpdate {
 			if err := bk.Put([]byte(p.id), p.data); err != nil {
 				return err
@@ -166,62 +217,7 @@ func (db *DB) RekeyTokens(oldSecret, newSecret string) (int, error) {
 		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("meta: write rekeyed tokens: %w", err)
-	}
-	return len(toUpdate), nil
-}
-
-// MigrateTokenSecrets scans the tokens bucket and re-encrypts any token where
-// SecretKey is stored as plaintext (no "enc:v1:" prefix). Returns the number
-// of tokens migrated. Idempotent — already-encrypted entries are skipped.
-func (db *DB) MigrateTokenSecrets() (migrated int, err error) {
-	type pending struct {
-		id   string
-		data []byte
-	}
-	var toUpdate []pending
-
-	err = db.bolt.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
-			var t Token
-			if err := json.Unmarshal(v, &t); err != nil {
-				return nil
-			}
-			if t.SecretKey == "" || strings.HasPrefix(t.SecretKey, encryptedPrefix) {
-				return nil
-			}
-			enc, err := db.encryptSecret(t.SecretKey)
-			if err != nil {
-				return err
-			}
-			t.SecretKey = enc
-			updated, err := json.Marshal(&t)
-			if err != nil {
-				return err
-			}
-			toUpdate = append(toUpdate, pending{id: t.TokenID, data: updated})
-			return nil
-		})
-	})
-	if err != nil {
-		return 0, fmt.Errorf("meta: scan tokens for migration: %w", err)
-	}
-
-	if len(toUpdate) == 0 {
-		return 0, nil
-	}
-
-	err = db.bolt.Update(func(tx *bolt.Tx) error {
-		bk := tx.Bucket(bucketTokens)
-		for _, p := range toUpdate {
-			if err := bk.Put([]byte(p.id), p.data); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, fmt.Errorf("meta: write migrated tokens: %w", err)
+		return 0, fmt.Errorf("meta: write re-encrypted tokens: %w", err)
 	}
 	return len(toUpdate), nil
 }

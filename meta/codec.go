@@ -3,9 +3,11 @@ package meta
 import (
 	"bytes"
 	"encoding/gob"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+
+	"github.com/ivangsm/jay/internal/jsonx"
 )
 
 // formatGob is the leading byte of binary-encoded Object records. Any other
@@ -62,7 +64,7 @@ func decodeObject(data []byte, o *Object) error {
 		}
 		return nil
 	case '{':
-		if err := json.Unmarshal(data, o); err != nil {
+		if err := jsonv2.Unmarshal(data, o, jsonx.Wire); err != nil {
 			return fmt.Errorf("meta: json decode legacy object: %w", err)
 		}
 		return nil
