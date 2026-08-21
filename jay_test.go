@@ -64,15 +64,13 @@ func setup(t *testing.T) *testEnv {
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
 	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "", nil)
-	s3Srv := httptest.NewServer(s3Handler)
-	t.Cleanup(s3Srv.Close)
+	s3Srv := newTestServer(t, s3Handler)
 
 	adminHandler := admin.NewHandler(admin.AdminConfig{
 		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
 		Log: log, Metrics: metrics,
 	})
-	adminSrv := httptest.NewServer(adminHandler)
-	t.Cleanup(adminSrv.Close)
+	adminSrv := newTestServer(t, adminHandler)
 
 	// Create account and token
 	account := createTestAccount(t, adminSrv.URL)
@@ -90,10 +88,27 @@ func setup(t *testing.T) *testEnv {
 	}
 }
 
+// newTestServer levanta un servidor de prueba con httptest.NewTestServer (Go
+// 1.27): registra el cierre solo y hace fallar el test si el handler panickea,
+// dos cosas que httptest.NewServer no da.
+//
+// El Start() explícito NO es opcional. Sin él, NewTestServer usa la red en
+// memoria, y ahí TODOS los servidores comparten la misma URL base
+// ("http://example.com") y cada cliente manda todo a su propio servidor sin
+// mirar el host. El harness de jay levanta DOS servidores a la vez (S3 y admin)
+// y los distingue por URL, así que la red en memoria no aplica acá: con Start()
+// cada uno queda en su puerto de loopback y vuelve a haber URLs distinguibles.
+func newTestServer(t testing.TB, h http.Handler) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTestServer(t, h)
+	srv.Start()
+	return srv
+}
+
 func createTestAccount(t *testing.T, adminURL string) string {
 	t.Helper()
 	body := `{"name":"testaccount"}`
-	req, _ := http.NewRequest("POST", adminURL+"/_jay/accounts", strings.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, adminURL+"/_jay/accounts", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-admin")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -113,7 +128,7 @@ func createTestAccount(t *testing.T, adminURL string) string {
 func createTestToken(t *testing.T, adminURL, accountID string) (string, string) {
 	t.Helper()
 	body := `{"account_id":"` + accountID + `","name":"test","allowed_actions":["bucket:list","bucket:read-meta","bucket:write-meta","object:get","object:put","object:delete","object:list","multipart:create","multipart:upload-part","multipart:complete","multipart:abort"]}`
-	req, _ := http.NewRequest("POST", adminURL+"/_jay/tokens", strings.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, adminURL+"/_jay/tokens", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-admin")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -147,35 +162,35 @@ func TestBucketLifecycle(t *testing.T) {
 
 	// Create bucket
 	resp := env.s3Request(t, "PUT", "/test-bucket", nil)
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("create bucket: got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
 	// Head bucket
 	resp = env.s3Request(t, "HEAD", "/test-bucket", nil)
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("head bucket: got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
 	// Create duplicate bucket
 	resp = env.s3Request(t, "PUT", "/test-bucket", nil)
-	if resp.StatusCode != 409 {
+	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("duplicate bucket: expected 409, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
 	// Delete bucket
 	resp = env.s3Request(t, "DELETE", "/test-bucket", nil)
-	if resp.StatusCode != 204 {
+	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete bucket: got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
 	// Head deleted bucket
 	resp = env.s3Request(t, "HEAD", "/test-bucket", nil)
-	if resp.StatusCode != 404 {
+	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("head deleted bucket: expected 404, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
@@ -192,7 +207,7 @@ func TestObjectLifecycle(t *testing.T) {
 	content := "hello, jay!"
 	resp = env.s3Request(t, "PUT", "/mybucket/greeting.txt",
 		strings.NewReader(content))
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("put object: got %d", resp.StatusCode)
 	}
 	etag := resp.Header.Get("ETag")
@@ -203,7 +218,7 @@ func TestObjectLifecycle(t *testing.T) {
 
 	// Get object
 	resp = env.s3Request(t, "GET", "/mybucket/greeting.txt", nil)
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("get object: got %d", resp.StatusCode)
 	}
 	got, _ := io.ReadAll(resp.Body)
@@ -214,7 +229,7 @@ func TestObjectLifecycle(t *testing.T) {
 
 	// Head object
 	resp = env.s3Request(t, "HEAD", "/mybucket/greeting.txt", nil)
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("head object: got %d", resp.StatusCode)
 	}
 	if resp.Header.Get("Content-Length") != "11" {
@@ -224,21 +239,21 @@ func TestObjectLifecycle(t *testing.T) {
 
 	// Delete object
 	resp = env.s3Request(t, "DELETE", "/mybucket/greeting.txt", nil)
-	if resp.StatusCode != 204 {
+	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete object: got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
 	// Get deleted object
 	resp = env.s3Request(t, "GET", "/mybucket/greeting.txt", nil)
-	if resp.StatusCode != 404 {
+	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("get deleted: expected 404, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
 	// Delete non-existent returns 204 (S3 behavior)
 	resp = env.s3Request(t, "DELETE", "/mybucket/nonexistent.txt", nil)
-	if resp.StatusCode != 204 {
+	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete non-existent: expected 204, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
@@ -330,7 +345,7 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 	_ = resp.Body.Close()
 
 	resp = env.s3Request(t, "DELETE", "/notempty", nil)
-	if resp.StatusCode != 409 {
+	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("delete non-empty bucket: expected 409, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
@@ -340,24 +355,24 @@ func TestUnauthorized(t *testing.T) {
 	env := setup(t)
 
 	// Request without auth
-	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/anybucket", nil)
+	req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+"/anybucket", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 403 {
+	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("no auth: expected 403, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
 	// Request with bad token
-	req, _ = http.NewRequest("PUT", env.s3Server.URL+"/anybucket", nil)
+	req, _ = http.NewRequest(http.MethodPut, env.s3Server.URL+"/anybucket", nil)
 	req.Header.Set("Authorization", "Bearer bad:creds")
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 403 {
+	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("bad auth: expected 403, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
@@ -392,7 +407,7 @@ func TestUserMetadata(t *testing.T) {
 	_ = resp.Body.Close()
 
 	// Put with custom metadata
-	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/metabucket/file.txt",
+	req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+"/metabucket/file.txt",
 		strings.NewReader("data"))
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-meta-custom", "myvalue")
@@ -491,16 +506,14 @@ func setupWithSigning(t *testing.T) *testEnv {
 	metrics := maintenance.NewMetrics()
 	signingSecret := "test-signing-secret"
 	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, signingSecret, nil)
-	s3Srv := httptest.NewServer(s3Handler)
-	t.Cleanup(s3Srv.Close)
+	s3Srv := newTestServer(t, s3Handler)
 
 	adminHandler := admin.NewHandler(admin.AdminConfig{
 		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
 		Log: log, Metrics: metrics, SigningSecret: signingSecret,
 		ListenAddr: s3Srv.Listener.Addr().String(),
 	})
-	adminSrv := httptest.NewServer(adminHandler)
-	t.Cleanup(adminSrv.Close)
+	adminSrv := newTestServer(t, adminHandler)
 
 	account := createTestAccount(t, adminSrv.URL)
 	tokenID, secret := createTestToken(t, adminSrv.URL, account)
@@ -546,14 +559,14 @@ func TestPresignedURLGet(t *testing.T) {
 		env.s3Server.URL, path, env.tokenID, expiresStr, sig)
 
 	// GET without auth header — presigned URL provides auth
-	req, _ := http.NewRequest("GET", url, nil)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("presigned GET: expected 200, got %d: %s", resp.StatusCode, body)
 	}
@@ -581,14 +594,14 @@ func TestPresignedURLExpired(t *testing.T) {
 	url := fmt.Sprintf("%s%s?X-Jay-Token=%s&X-Jay-Expires=%s&X-Jay-Signature=%s",
 		env.s3Server.URL, path, env.tokenID, expiresStr, sig)
 
-	req, _ := http.NewRequest("GET", url, nil)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("expired presigned request failed: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 403 {
+	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expired presigned: expected 403, got %d", resp.StatusCode)
 	}
 }
@@ -608,14 +621,14 @@ func TestPresignedURLBadSignature(t *testing.T) {
 	url := fmt.Sprintf("%s%s?X-Jay-Token=%s&X-Jay-Expires=%s&X-Jay-Signature=%s",
 		env.s3Server.URL, path, env.tokenID, expiresStr, "badsignature")
 
-	req, _ := http.NewRequest("GET", url, nil)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("bad signature request failed: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 403 {
+	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("bad signature: expected 403, got %d", resp.StatusCode)
 	}
 }
@@ -632,7 +645,7 @@ func TestCopyObject(t *testing.T) {
 	_ = resp.Body.Close()
 
 	content := "copy me!"
-	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/src-bucket/original.txt",
+	req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+"/src-bucket/original.txt",
 		strings.NewReader(content))
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-meta-author", "test")
@@ -640,7 +653,7 @@ func TestCopyObject(t *testing.T) {
 	_ = resp.Body.Close()
 
 	// Copy to different bucket
-	req, _ = http.NewRequest("PUT", env.s3Server.URL+"/dst-bucket/copied.txt", nil)
+	req, _ = http.NewRequest(http.MethodPut, env.s3Server.URL+"/dst-bucket/copied.txt", nil)
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-copy-source", "/src-bucket/original.txt")
 	resp, err := http.DefaultClient.Do(req)
@@ -650,7 +663,7 @@ func TestCopyObject(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("copy object: expected 200, got %d: %s", resp.StatusCode, body)
 	}
 
@@ -687,13 +700,13 @@ func TestCopyObjectSameBucket(t *testing.T) {
 	resp = env.s3Request(t, "PUT", "/copybucket/a.txt", strings.NewReader("hello"))
 	_ = resp.Body.Close()
 
-	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/copybucket/b.txt", nil)
+	req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+"/copybucket/b.txt", nil)
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-copy-source", "/copybucket/a.txt")
 	resp, _ = http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("copy same bucket: expected 200, got %d", resp.StatusCode)
 	}
 
@@ -711,13 +724,13 @@ func TestCopyObjectNonExistentSource(t *testing.T) {
 	resp := env.s3Request(t, "PUT", "/copybucket2", nil)
 	_ = resp.Body.Close()
 
-	req, _ := http.NewRequest("PUT", env.s3Server.URL+"/copybucket2/dest.txt", nil)
+	req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+"/copybucket2/dest.txt", nil)
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("x-amz-copy-source", "/copybucket2/nonexistent.txt")
 	resp, _ = http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != 404 {
+	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("copy non-existent: expected 404, got %d", resp.StatusCode)
 	}
 }
@@ -751,7 +764,7 @@ func TestRangeRequests(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req, _ := http.NewRequest("GET", env.s3Server.URL+"/rangebucket/data.txt", nil)
+			req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+"/rangebucket/data.txt", nil)
 			req.Header.Set("Authorization", env.auth)
 			req.Header.Set("Range", tt.rangeHdr)
 			resp, err := http.DefaultClient.Do(req)
@@ -785,13 +798,13 @@ func TestRangeRequestInvalid(t *testing.T) {
 	_ = resp.Body.Close()
 
 	// Range beyond file size
-	req, _ := http.NewRequest("GET", env.s3Server.URL+"/rangebucket2/small.txt", nil)
+	req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+"/rangebucket2/small.txt", nil)
 	req.Header.Set("Authorization", env.auth)
 	req.Header.Set("Range", "bytes=100-200")
 	resp, _ = http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != 416 {
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("invalid range: expected 416, got %d", resp.StatusCode)
 	}
 }
@@ -836,7 +849,7 @@ func TestMultipartUploadComplete(t *testing.T) {
 
 	// List parts
 	resp = env.s3Request(t, "GET",
-		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s", uploadID), nil)
+		"/mpbucket/bigfile.bin?uploadId="+uploadID, nil)
 	body, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
@@ -855,9 +868,9 @@ func TestMultipartUploadComplete(t *testing.T) {
 	</CompleteMultipartUpload>`, etag1, etag2)
 
 	resp = env.s3Request(t, "POST",
-		fmt.Sprintf("/mpbucket/bigfile.bin?uploadId=%s", uploadID),
+		"/mpbucket/bigfile.bin?uploadId="+uploadID,
 		strings.NewReader(completeXML))
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("complete: expected 200, got %d: %s", resp.StatusCode, body)
 	}
@@ -898,15 +911,15 @@ func TestMultipartUploadAbort(t *testing.T) {
 
 	// Abort
 	resp = env.s3Request(t, "DELETE",
-		fmt.Sprintf("/mpabortbucket/file.bin?uploadId=%s", uploadID), nil)
-	if resp.StatusCode != 204 {
+		"/mpabortbucket/file.bin?uploadId="+uploadID, nil)
+	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("abort: expected 204, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
 	// Object should not exist
 	resp = env.s3Request(t, "GET", "/mpabortbucket/file.bin", nil)
-	if resp.StatusCode != 404 {
+	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("after abort: expected 404, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
@@ -1054,27 +1067,25 @@ func TestQuarantineListAndPurge(t *testing.T) {
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
 	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "", nil)
-	s3Srv := httptest.NewServer(s3Handler)
-	defer s3Srv.Close()
+	s3Srv := newTestServer(t, s3Handler)
 
 	adminHandler := admin.NewHandler(admin.AdminConfig{
 		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
 		Log: log, Metrics: metrics,
 	})
-	adminSrv := httptest.NewServer(adminHandler)
-	defer adminSrv.Close()
+	adminSrv := newTestServer(t, adminHandler)
 
 	account := createTestAccount(t, adminSrv.URL)
 	tokenID, secret := createTestToken(t, adminSrv.URL, account)
 	authHdr := "Bearer " + tokenID + ":" + secret
 
 	// Create bucket and object
-	req, _ := http.NewRequest("PUT", s3Srv.URL+"/qbucket", nil)
+	req, _ := http.NewRequest(http.MethodPut, s3Srv.URL+"/qbucket", nil)
 	req.Header.Set("Authorization", authHdr)
 	resp, _ := http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
 
-	req, _ = http.NewRequest("PUT", s3Srv.URL+"/qbucket/file.txt", strings.NewReader("quarantine test"))
+	req, _ = http.NewRequest(http.MethodPut, s3Srv.URL+"/qbucket/file.txt", strings.NewReader("quarantine test"))
 	req.Header.Set("Authorization", authHdr)
 	resp, _ = http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
@@ -1122,7 +1133,7 @@ func TestQuarantineListAndPurge(t *testing.T) {
 	}
 
 	// Should be accessible again
-	req, _ = http.NewRequest("GET", s3Srv.URL+"/qbucket/file.txt", nil)
+	req, _ = http.NewRequest(http.MethodGet, s3Srv.URL+"/qbucket/file.txt", nil)
 	req.Header.Set("Authorization", authHdr)
 	resp, _ = http.DefaultClient.Do(req)
 	got, _ := io.ReadAll(resp.Body)
@@ -1178,22 +1189,20 @@ func TestRateLimiting(t *testing.T) {
 	// Very low rate limit: 2 req/sec, burst 3
 	rlCfg := &jayapi.RateLimiterConfig{Rate: 2, Burst: 3}
 	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "", rlCfg)
-	s3Srv := httptest.NewServer(s3Handler)
-	defer s3Srv.Close()
+	s3Srv := newTestServer(t, s3Handler)
 
 	adminHandler := admin.NewHandler(admin.AdminConfig{
 		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
 		Log: log, Metrics: metrics,
 	})
-	adminSrv := httptest.NewServer(adminHandler)
-	defer adminSrv.Close()
+	adminSrv := newTestServer(t, adminHandler)
 
 	account := createTestAccount(t, adminSrv.URL)
 	tokenID, secret := createTestToken(t, adminSrv.URL, account)
 	authHdr := "Bearer " + tokenID + ":" + secret
 
 	// Create bucket
-	req, _ := http.NewRequest("PUT", s3Srv.URL+"/rl-bucket", nil)
+	req, _ := http.NewRequest(http.MethodPut, s3Srv.URL+"/rl-bucket", nil)
 	req.Header.Set("Authorization", authHdr)
 	resp, _ := http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
@@ -1201,14 +1210,14 @@ func TestRateLimiting(t *testing.T) {
 	// Exhaust burst (3 requests should pass, then fail)
 	var got429 bool
 	for range 10 {
-		req, _ := http.NewRequest("HEAD", s3Srv.URL+"/rl-bucket", nil)
+		req, _ := http.NewRequest(http.MethodHead, s3Srv.URL+"/rl-bucket", nil)
 		req.Header.Set("Authorization", authHdr)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = resp.Body.Close()
-		if resp.StatusCode == 429 {
+		if resp.StatusCode == http.StatusTooManyRequests {
 			got429 = true
 			if resp.Header.Get("Retry-After") == "" {
 				t.Fatal("429 response missing Retry-After header")

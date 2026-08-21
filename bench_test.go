@@ -82,19 +82,17 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
 	s3Handler := jayapi.NewHandler(db, st, au, log, metrics, "", nil)
-	s3Srv := httptest.NewServer(s3Handler)
-	b.Cleanup(s3Srv.Close)
+	s3Srv := newTestServer(b, s3Handler)
 
 	adminHandler := admin.NewHandler(admin.AdminConfig{
 		DB: db, Store: st, Auth: au, AdminToken: "test-admin",
 		Log: log, Metrics: metrics,
 	})
-	adminSrv := httptest.NewServer(adminHandler)
-	b.Cleanup(adminSrv.Close)
+	adminSrv := newTestServer(b, adminHandler)
 
 	// Create account via admin API
 	acctBody := `{"name":"benchaccount"}`
-	req, _ := http.NewRequest("POST", adminSrv.URL+"/_jay/accounts", strings.NewReader(acctBody))
+	req, _ := http.NewRequest(http.MethodPost, adminSrv.URL+"/_jay/accounts", strings.NewReader(acctBody))
 	req.Header.Set("Authorization", "Bearer test-admin")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -112,7 +110,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 
 	// Create token via admin API (with all actions)
 	tokenBody := `{"account_id":"` + acctResult.AccountID + `","name":"bench","allowed_actions":["bucket:list","bucket:read-meta","bucket:write-meta","object:get","object:put","object:delete","object:list","multipart:create","multipart:upload-part","multipart:complete","multipart:abort"]}`
-	req, _ = http.NewRequest("POST", adminSrv.URL+"/_jay/tokens", strings.NewReader(tokenBody))
+	req, _ = http.NewRequest(http.MethodPost, adminSrv.URL+"/_jay/tokens", strings.NewReader(tokenBody))
 	req.Header.Set("Authorization", "Bearer test-admin")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err = http.DefaultClient.Do(req)
@@ -132,7 +130,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	authHeader := "Bearer " + tokenResult.TokenID + ":" + tokenResult.Secret
 
 	// Create benchmark bucket
-	req, _ = http.NewRequest("PUT", s3Srv.URL+"/benchbucket", nil)
+	req, _ = http.NewRequest(http.MethodPut, s3Srv.URL+"/benchbucket", nil)
 	req.Header.Set("Authorization", authHeader)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -244,14 +242,14 @@ func BenchmarkS3PutObject(b *testing.B) {
 			i := 0
 			for b.Loop() {
 				key := fmt.Sprintf("/benchbucket/obj-put-%d", i)
-				req, _ := http.NewRequest("PUT", env.s3Server.URL+key, bytes.NewReader(data))
+				req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 				req.Header.Set("Authorization", env.auth)
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
 					b.Fatal(err)
 				}
 				_ = resp.Body.Close()
-				if resp.StatusCode != 200 {
+				if resp.StatusCode != http.StatusOK {
 					b.Fatalf("put: status %d", resp.StatusCode)
 				}
 				i++
@@ -265,8 +263,8 @@ func BenchmarkS3GetObject(b *testing.B) {
 
 	for _, sz := range objectSizes {
 		data := makeData(sz.size)
-		key := fmt.Sprintf("/benchbucket/obj-get-%s", sz.name)
-		req, _ := http.NewRequest("PUT", env.s3Server.URL+key, bytes.NewReader(data))
+		key := "/benchbucket/obj-get-" + sz.name
+		req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 		req.Header.Set("Authorization", env.auth)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -278,7 +276,7 @@ func BenchmarkS3GetObject(b *testing.B) {
 			b.SetBytes(sz.size)
 			b.ResetTimer()
 			for b.Loop() {
-				req, _ := http.NewRequest("GET", env.s3Server.URL+key, nil)
+				req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+key, nil)
 				req.Header.Set("Authorization", env.auth)
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
@@ -286,7 +284,7 @@ func BenchmarkS3GetObject(b *testing.B) {
 				}
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
-				if resp.StatusCode != 200 {
+				if resp.StatusCode != http.StatusOK {
 					b.Fatalf("get: status %d", resp.StatusCode)
 				}
 			}
@@ -299,7 +297,7 @@ func BenchmarkS3HeadObject(b *testing.B) {
 
 	data := makeData(1 << 10)
 	key := "/benchbucket/obj-head"
-	req, _ := http.NewRequest("PUT", env.s3Server.URL+key, bytes.NewReader(data))
+	req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 	req.Header.Set("Authorization", env.auth)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -309,14 +307,14 @@ func BenchmarkS3HeadObject(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		req, _ := http.NewRequest("HEAD", env.s3Server.URL+key, nil)
+		req, _ := http.NewRequest(http.MethodHead, env.s3Server.URL+key, nil)
 		req.Header.Set("Authorization", env.auth)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
 		_ = resp.Body.Close()
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != http.StatusOK {
 			b.Fatalf("head: status %d", resp.StatusCode)
 		}
 	}
@@ -332,7 +330,7 @@ func BenchmarkS3DeleteObject(b *testing.B) {
 	for b.Loop() {
 		b.StopTimer()
 		key := fmt.Sprintf("/benchbucket/obj-del-%d", i)
-		req, _ := http.NewRequest("PUT", env.s3Server.URL+key, bytes.NewReader(data))
+		req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 		req.Header.Set("Authorization", env.auth)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -341,7 +339,7 @@ func BenchmarkS3DeleteObject(b *testing.B) {
 		_ = resp.Body.Close()
 		b.StartTimer()
 
-		req, _ = http.NewRequest("DELETE", env.s3Server.URL+key, nil)
+		req, _ = http.NewRequest(http.MethodDelete, env.s3Server.URL+key, nil)
 		req.Header.Set("Authorization", env.auth)
 		resp, err = http.DefaultClient.Do(req)
 		if err != nil {
@@ -357,7 +355,7 @@ func BenchmarkS3ListObjects(b *testing.B) {
 
 	for i := range 100 {
 		key := fmt.Sprintf("/benchbucket/list-obj-%03d", i)
-		req, _ := http.NewRequest("PUT", env.s3Server.URL+key, strings.NewReader("x"))
+		req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, strings.NewReader("x"))
 		req.Header.Set("Authorization", env.auth)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -368,7 +366,7 @@ func BenchmarkS3ListObjects(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		req, _ := http.NewRequest("GET", env.s3Server.URL+"/benchbucket?list-type=2", nil)
+		req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+"/benchbucket?list-type=2", nil)
 		req.Header.Set("Authorization", env.auth)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -376,7 +374,7 @@ func BenchmarkS3ListObjects(b *testing.B) {
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != http.StatusOK {
 			b.Fatalf("list: status %d", resp.StatusCode)
 		}
 	}
@@ -399,7 +397,7 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 		key := fmt.Sprintf("/benchbucket/mp-obj-%d", i)
 
 		// Initiate
-		req, _ := http.NewRequest("POST", env.s3Server.URL+key+"?uploads", nil)
+		req, _ := http.NewRequest(http.MethodPost, env.s3Server.URL+key+"?uploads", nil)
 		req.Header.Set("Authorization", env.auth)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -417,7 +415,7 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 		etags := make([]string, numParts)
 		for p := range numParts {
 			url := fmt.Sprintf("%s%s?partNumber=%d&uploadId=%s", env.s3Server.URL, key, p+1, uploadID)
-			req, _ := http.NewRequest("PUT", url, bytes.NewReader(parts[p]))
+			req, _ := http.NewRequest(http.MethodPut, url, bytes.NewReader(parts[p]))
 			req.Header.Set("Authorization", env.auth)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -435,14 +433,14 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 		}
 		xmlParts.WriteString("</CompleteMultipartUpload>")
 
-		req, _ = http.NewRequest("POST", fmt.Sprintf("%s%s?uploadId=%s", env.s3Server.URL, key, uploadID), strings.NewReader(xmlParts.String()))
+		req, _ = http.NewRequest(http.MethodPost, fmt.Sprintf("%s%s?uploadId=%s", env.s3Server.URL, key, uploadID), strings.NewReader(xmlParts.String()))
 		req.Header.Set("Authorization", env.auth)
 		resp, err = http.DefaultClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
 		_ = resp.Body.Close()
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != http.StatusOK {
 			b.Fatalf("complete: status %d", resp.StatusCode)
 		}
 		i++
@@ -468,7 +466,7 @@ func BenchmarkS3PutObjectConcurrent(b *testing.B) {
 					for pb.Next() {
 						n := counter.Add(1)
 						key := fmt.Sprintf("/benchbucket/conc-put-%d", n)
-						req, _ := http.NewRequest("PUT", env.s3Server.URL+key, bytes.NewReader(data))
+						req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 						req.Header.Set("Authorization", env.auth)
 						resp, err := http.DefaultClient.Do(req)
 						if err != nil {
@@ -490,7 +488,7 @@ func BenchmarkS3GetObjectConcurrent(b *testing.B) {
 		// Seed objects for concurrent reads
 		for j := range 16 {
 			key := fmt.Sprintf("/benchbucket/conc-get-%s-%d", sz.name, j)
-			req, _ := http.NewRequest("PUT", env.s3Server.URL+key, bytes.NewReader(data))
+			req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 			req.Header.Set("Authorization", env.auth)
 			resp, _ := http.DefaultClient.Do(req)
 			_ = resp.Body.Close()
@@ -506,7 +504,7 @@ func BenchmarkS3GetObjectConcurrent(b *testing.B) {
 					for pb.Next() {
 						n := counter.Add(1)
 						key := fmt.Sprintf("/benchbucket/conc-get-%s-%d", sz.name, n%16)
-						req, _ := http.NewRequest("GET", env.s3Server.URL+key, nil)
+						req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+key, nil)
 						req.Header.Set("Authorization", env.auth)
 						resp, err := http.DefaultClient.Do(req)
 						if err != nil {
@@ -552,7 +550,7 @@ func BenchmarkNativeGetObject(b *testing.B) {
 
 	for _, sz := range objectSizes {
 		data := makeData(sz.size)
-		key := fmt.Sprintf("obj-get-%s", sz.name)
+		key := "obj-get-" + sz.name
 		_, err := env.client.PutObject("benchbucket", key,
 			bytes.NewReader(data), sz.size, nil)
 		if err != nil {
@@ -708,7 +706,6 @@ func BenchmarkNativePutObjectConcurrent(b *testing.B) {
 				b.ResetTimer()
 
 				var wg sync.WaitGroup
-				wg.Add(conc)
 				// Manually launch goroutines to control client assignment
 				iterCh := make(chan struct{}, b.N)
 				for range b.N {
@@ -717,8 +714,8 @@ func BenchmarkNativePutObjectConcurrent(b *testing.B) {
 				close(iterCh)
 
 				for g := range conc {
-					go func(c *client.Client) {
-						defer wg.Done()
+					c := clients[g]
+					wg.Go(func() {
 						for range iterCh {
 							n := counter.Add(1)
 							key := fmt.Sprintf("conc-put-%d", n)
@@ -729,7 +726,7 @@ func BenchmarkNativePutObjectConcurrent(b *testing.B) {
 								return
 							}
 						}
-					}(clients[g])
+					})
 				}
 				wg.Wait()
 				_ = clientIdx.Load() // suppress unused
@@ -773,7 +770,6 @@ func BenchmarkNativeGetObjectConcurrent(b *testing.B) {
 				b.ResetTimer()
 
 				var wg sync.WaitGroup
-				wg.Add(conc)
 				iterCh := make(chan struct{}, b.N)
 				for range b.N {
 					iterCh <- struct{}{}
@@ -781,8 +777,8 @@ func BenchmarkNativeGetObjectConcurrent(b *testing.B) {
 				close(iterCh)
 
 				for g := range conc {
-					go func(c *client.Client) {
-						defer wg.Done()
+					c := clients[g]
+					wg.Go(func() {
 						for range iterCh {
 							n := counter.Add(1)
 							key := fmt.Sprintf("conc-get-%s-%d", sz.name, n%16)
@@ -794,7 +790,7 @@ func BenchmarkNativeGetObjectConcurrent(b *testing.B) {
 							_, _ = io.Copy(io.Discard, result.Body)
 							_ = result.Body.Close()
 						}
-					}(clients[g])
+					})
 				}
 				wg.Wait()
 			})
