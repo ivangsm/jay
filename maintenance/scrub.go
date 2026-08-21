@@ -2,6 +2,7 @@ package maintenance
 
 import (
 	"log/slog"
+	"maps"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -68,10 +69,7 @@ func NewScrubber(db *meta.DB, st *store.Store, log *slog.Logger, interval time.D
 	var limiter *rate.Limiter
 	if scrubBytesPerSec > 0 {
 		// Burst of 50 MiB gives headroom for a single large object read.
-		burst := int64(50 << 20)
-		if scrubBytesPerSec > burst {
-			burst = scrubBytesPerSec
-		}
+		burst := max(scrubBytesPerSec, int64(50<<20))
 		limiter = rate.NewLimiter(rate.Limit(scrubBytesPerSec), int(burst))
 	}
 	return &Scrubber{
@@ -179,26 +177,25 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 	// doesn't serialize on s.mu.
 	s.mu.Lock()
 	startKeys := make(map[string]string, len(s.lastKey))
-	for k, v := range s.lastKey {
-		startKeys[k] = v
-	}
+	maps.Copy(startKeys, s.lastKey)
 	s.mu.Unlock()
 
+dispatch:
 	for i, bucket := range buckets {
 		// Check for shutdown before launching a new goroutine.
 		select {
 		case <-s.quit:
-			goto wait
+			break dispatch
 		default:
 		}
 
-		startKey := startKeys[bucket.ID]
+		idx, b, start := i, bucket, startKeys[bucket.ID]
 
-		wg.Add(1)
+		// El semáforo se toma en el padre, no en la goroutine: así el for se
+		// bloquea acá y nunca hay más de NumCPU() buckets en vuelo.
 		sem <- struct{}{} // acquire semaphore slot
 
-		go func(idx int, b meta.Bucket, start string) {
-			defer wg.Done()
+		wg.Go(func() {
 			defer func() { <-sem }() // release semaphore slot
 
 			br := bucketResult{bucketID: b.ID}
@@ -347,10 +344,9 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 			}
 
 			results[idx] = br
-		}(i, bucket, startKey)
+		})
 	}
 
-wait:
 	wg.Wait()
 
 	// Aggregate results and update shared state under the lock.
