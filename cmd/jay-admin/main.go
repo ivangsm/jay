@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/ivangsm/jay/internal/jsonx"
 )
 
 func main() {
@@ -113,7 +117,13 @@ func envOr(key, fallback string) string {
 func doRequest(method, url, token string, body any) ([]byte, int, error) {
 	var bodyReader io.Reader
 	if body != nil {
-		data, _ := json.Marshal(body)
+		// El error del marshal no se puede tragar: mandar un body vacío haría
+		// que el admin API respondiera 400 y el usuario vería un error que no
+		// tiene nada que ver con la causa real.
+		data, err := jsonv2.Marshal(body, jsonx.Wire)
+		if err != nil {
+			return nil, 0, fmt.Errorf("codificar request body: %w", err)
+		}
 		bodyReader = bytes.NewReader(data)
 	}
 
@@ -137,12 +147,15 @@ func doRequest(method, url, token string, body any) ([]byte, int, error) {
 }
 
 func prettyJSON(data []byte) {
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, data, "", "  "); err != nil {
+	// PreserveRawStrings deja los literales tal cual llegaron, que es lo que
+	// hacía json.Indent de v1: esto es un pretty-print, no una recodificación.
+	pretty, err := jsontext.AppendFormat(nil, data,
+		jsontext.WithIndent("  "), jsontext.PreserveRawStrings(true))
+	if err != nil {
 		fmt.Println(string(data))
 		return
 	}
-	fmt.Println(buf.String())
+	fmt.Println(string(pretty))
 }
 
 func parseFlag(args []string, name string) string {
@@ -157,7 +170,7 @@ func parseFlag(args []string, name string) string {
 func createAccount(addr, token string, args []string) error {
 	name := parseFlag(args, "-name")
 	if name == "" {
-		return fmt.Errorf("usage: create-account -name <name>")
+		return errors.New("usage: create-account -name <name>")
 	}
 
 	data, status, err := doRequest("POST", addr+"/_jay/accounts", token, map[string]string{"name": name})
@@ -175,7 +188,7 @@ func createToken(addr, token string, args []string) error {
 	accountID := parseFlag(args, "-account")
 	name := parseFlag(args, "-name")
 	if accountID == "" {
-		return fmt.Errorf("usage: create-token -account <id> -name <name>")
+		return errors.New("usage: create-token -account <id> -name <name>")
 	}
 
 	body := map[string]string{
@@ -209,7 +222,7 @@ func listTokens(addr, token string) error {
 func revokeToken(addr, token string, args []string) error {
 	id := parseFlag(args, "-id")
 	if id == "" {
-		return fmt.Errorf("usage: revoke-token -id <token-id>")
+		return errors.New("usage: revoke-token -id <token-id>")
 	}
 
 	_, status, err := doRequest("DELETE", addr+"/_jay/tokens/"+id, token, nil)
@@ -242,7 +255,7 @@ func presign(addr, token string, args []string) error {
 	expires := parseFlag(args, "-expires")
 
 	if bucket == "" {
-		return fmt.Errorf("usage: presign -bucket <b> -key <k> [-method GET] [-expires 3600]")
+		return errors.New("usage: presign -bucket <b> -key <k> [-method GET] [-expires 3600]")
 	}
 	if method == "" {
 		method = "GET"
@@ -254,7 +267,7 @@ func presign(addr, token string, args []string) error {
 	// We also need a token_id for presigning — use the first token from list or require it
 	tokenID := parseFlag(args, "-token-id")
 	if tokenID == "" {
-		return fmt.Errorf("usage: presign -bucket <b> -key <k> -token-id <id> [-method GET] [-expires 3600]")
+		return errors.New("usage: presign -bucket <b> -key <k> -token-id <id> [-method GET] [-expires 3600]")
 	}
 
 	body := map[string]any{
@@ -292,7 +305,7 @@ func quarantineRevalidate(addr, token string, args []string) error {
 	bucketID := parseFlag(args, "-bucket-id")
 	key := parseFlag(args, "-key")
 	if bucketID == "" || key == "" {
-		return fmt.Errorf("usage: quarantine-revalidate -bucket-id <id> -key <key>")
+		return errors.New("usage: quarantine-revalidate -bucket-id <id> -key <key>")
 	}
 
 	body := map[string]string{

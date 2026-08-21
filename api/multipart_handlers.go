@@ -3,7 +3,7 @@ package api
 import (
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,9 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/auth"
+	"github.com/ivangsm/jay/internal/jsonx"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -34,8 +35,13 @@ func (h *Handler) denyMultipartPolicy(w http.ResponseWriter, r *http.Request, bu
 		return false
 	}
 
+	// Lenient, no los defaults de v2: la política la escribe un humano y v1
+	// hacía matching de nombres case-insensitive. Con los defaults de v2 (case
+	// sensitive) una política escrita al estilo AWS ("Effect"/"Statements")
+	// dejaría de parsearse y el statement Deny desaparecería en silencio —
+	// abriendo acceso donde antes se negaba. Lenient conserva el matching de v1.
 	var policy auth.BucketPolicy
-	if err := json.Unmarshal(bucket.PolicyJSON, &policy); err != nil {
+	if err := jsonv2.Unmarshal(bucket.PolicyJSON, &policy, jsonx.Lenient); err != nil {
 		h.log.Warn("multipart: malformed bucket policy, failing closed", "bucket", bucket.Name, "err", err)
 		if h.metrics != nil {
 			h.metrics.AuthFailures.Add(1)

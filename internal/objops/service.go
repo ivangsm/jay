@@ -15,18 +15,21 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"hash"
 	"io"
 	"log/slog"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ivangsm/jay/auth"
+	"github.com/ivangsm/jay/internal/jsonx"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
 )
@@ -127,8 +130,13 @@ func (s *Service) authorize(
 		return nil
 	}
 
+	// Lenient, no los defaults de v2: la política la escribe un humano y v1
+	// hacía matching de nombres case-insensitive. Con los defaults de v2 (case
+	// sensitive) una política escrita al estilo AWS ("Effect"/"Statements")
+	// dejaría de parsearse y el statement Deny desaparecería en silencio —
+	// abriendo acceso donde antes se negaba. Lenient conserva el matching de v1.
 	var policy auth.BucketPolicy
-	if err := json.Unmarshal(bucket.PolicyJSON, &policy); err != nil {
+	if err := jsonv2.Unmarshal(bucket.PolicyJSON, &policy, jsonx.Lenient); err != nil {
 		s.log.Warn("malformed bucket policy — failing closed",
 			"bucket", bucket.Name, "err", err)
 		return ErrPolicyDenied
@@ -146,38 +154,20 @@ func (s *Service) authorize(
 // because this function needs to run before policy evaluation to preserve
 // deny-overlay semantics regardless.
 func checkTokenAction(token *meta.Token, action, bucketName, objectKey string) error {
-	if !containsStr(token.AllowedActions, action) && !containsStr(token.AllowedActions, "*") {
+	if !slices.Contains(token.AllowedActions, action) && !slices.Contains(token.AllowedActions, "*") {
 		return ErrAccessDenied
 	}
-	if len(token.BucketScope) > 0 && !containsStr(token.BucketScope, bucketName) {
+	if len(token.BucketScope) > 0 && !slices.Contains(token.BucketScope, bucketName) {
 		return ErrAccessDenied
 	}
 	if len(token.PrefixScope) > 0 && objectKey != "" {
-		matched := false
-		for _, p := range token.PrefixScope {
-			if hasPrefix(objectKey, p) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
+		if !slices.ContainsFunc(token.PrefixScope, func(p string) bool {
+			return strings.HasPrefix(objectKey, p)
+		}) {
 			return ErrAccessDenied
 		}
 	}
 	return nil
-}
-
-func containsStr(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
-}
-
-func hasPrefix(s, p string) bool {
-	return len(s) >= len(p) && s[:len(p)] == p
 }
 
 // resolveBucket loads the bucket by name, mapping not-found → ErrBucketNotFound.

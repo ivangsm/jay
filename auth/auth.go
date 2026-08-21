@@ -2,7 +2,8 @@ package auth
 
 import (
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"net/http"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ivangsm/jay/internal/jsonx"
 	"github.com/ivangsm/jay/meta"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -329,7 +331,7 @@ func contains(slice []string, item string) bool {
 // AuthorizeWithPolicy performs all existing Authorize checks and additionally
 // evaluates a bucket policy (if provided) against the request context.
 // Deny in the policy always takes precedence.
-func (a *Auth) AuthorizeWithPolicy(token *meta.Token, action, bucketName, objectKey, clientIP string, policyJSON json.RawMessage) error {
+func (a *Auth) AuthorizeWithPolicy(token *meta.Token, action, bucketName, objectKey, clientIP string, policyJSON jsontext.Value) error {
 	// Run existing token-level authorization first.
 	if err := a.Authorize(token, action, bucketName, objectKey); err != nil {
 		return err
@@ -340,8 +342,13 @@ func (a *Auth) AuthorizeWithPolicy(token *meta.Token, action, bucketName, object
 		return nil
 	}
 
+	// Lenient, no los defaults de v2: la política la escribe un humano y v1
+	// hacía matching de nombres case-insensitive. Con los defaults de v2 (case
+	// sensitive) una política escrita al estilo AWS ("Effect"/"Statements")
+	// dejaría de parsearse y el statement Deny desaparecería en silencio —
+	// abriendo acceso donde antes se negaba. Lenient conserva el matching de v1.
 	var policy BucketPolicy
-	if err := json.Unmarshal(policyJSON, &policy); err != nil {
+	if err := jsonv2.Unmarshal(policyJSON, &policy, jsonx.Lenient); err != nil {
 		// Malformed policy should not silently grant access.
 		return ErrAccessDenied
 	}

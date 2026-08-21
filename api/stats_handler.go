@@ -1,7 +1,7 @@
 package api
 
 import (
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"net/http"
 
@@ -45,9 +45,11 @@ func (h *Handler) handleBucketStats(w http.ResponseWriter, r *http.Request, buck
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(BucketStatsResponse{
+	if err := jsonv2.MarshalWrite(w, BucketStatsResponse{
 		Bucket:         bucketName,
 		ObjectCount:    count,
 		TotalSizeBytes: total,
-	})
+	}); err != nil {
+		h.log.Error("stats: encode response", "err", err)
+	}
 }

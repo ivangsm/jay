@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"net/http"
 	"sync/atomic"
@@ -43,7 +43,9 @@ func (hc *HealthChecker) SetReady(v bool) {
 func (hc *HealthChecker) LivenessHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+	// Un fallo al escribir la respuesta ya no es accionable: las cabeceras
+	// salieron y el probe se dará por caído solo. Y aquí no hay logger.
+	_ = jsonv2.MarshalWrite(w, map[string]string{"status": "alive"})
 }
 
 // ReadinessHandler returns 200 if ready, 503 with a specific reason if not.
@@ -54,11 +56,11 @@ func (hc *HealthChecker) ReadinessHandler(w http.ResponseWriter, _ *http.Request
 	w.Header().Set("Content-Type", "application/json")
 	if reason := hc.readinessProblem(); reason != "" {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not_ready", "reason": reason})
+		_ = jsonv2.MarshalWrite(w, map[string]string{"status": "not_ready", "reason": reason})
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+	_ = jsonv2.MarshalWrite(w, map[string]string{"status": "ready"})
 }
 
 // readinessProblem returns "" when the service is ready to accept traffic, or
@@ -105,7 +107,7 @@ func (hc *HealthChecker) checkFreeSpace() error {
 	}
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(hc.dataDir, &st); err != nil {
-		return fmt.Errorf("statfs %s: %v", hc.dataDir, err)
+		return fmt.Errorf("statfs %s: %w", hc.dataDir, err)
 	}
 	// Bavail/Bsize have different widths across darwin/linux; convert both.
 	free := uint64(st.Bavail) * uint64(st.Bsize)
