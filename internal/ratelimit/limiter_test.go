@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -118,24 +119,74 @@ func TestAllow_KeysDoNotInterfere(t *testing.T) {
 }
 
 func TestAllow_TokensRefillOverTime(t *testing.T) {
-	// 1000 r/s → one token per millisecond; burst=1
-	// Two consecutive calls are separated by << 1 ms so the second fails.
-	// After sleeping 5 ms the bucket holds 1 token again.
-	l := New(Config{Rate: 1000, Burst: 1})
+	// Con testing/synctest el reloj es falso y determinístico: antes esto era
+	// un time.Sleep(5 ms) real, o sea una carrera con el planificador que en
+	// una máquina cargada podía dormir de más (o de menos) y decidir el
+	// resultado. Acá el tiempo avanza exactamente lo que se pide.
+	synctest.Test(t, func(t *testing.T) {
+		// 1 r/s → un token por segundo; burst=1.
+		l := New(Config{Rate: 1, Burst: 1})
+		t.Cleanup(l.Stop)
 
-	if !l.Allow("k") {
-		t.Fatal("first allow on full bucket must be true")
-	}
-	if l.Allow("k") {
-		t.Fatal("immediate second allow must be false (bucket empty)")
-	}
+		if !l.Allow("k") {
+			t.Fatal("el primer Allow con el bucket lleno tiene que pasar")
+		}
+		if l.Allow("k") {
+			t.Fatal("el segundo Allow inmediato tiene que fallar (bucket vacío)")
+		}
 
-	time.Sleep(5 * time.Millisecond)
+		// Justo por debajo del segundo: todavía no hay token entero.
+		synctest.Sleep(900 * time.Millisecond)
+		if l.Allow("k") {
+			t.Fatal("a los 900 ms todavía no hay un token completo")
+		}
 
-	if !l.Allow("k") {
-		t.Fatal("allow after 5 ms must be true (tokens refilled)")
-	}
-	l.Stop()
+		// Pasado el segundo, el token se repuso.
+		synctest.Sleep(200 * time.Millisecond)
+		if !l.Allow("k") {
+			t.Fatal("pasado 1 s el token tiene que haberse repuesto")
+		}
+	})
+}
+
+// TestCleanupLoop_EvictsIdleBuckets cubre el loop de limpieza, que hasta ahora
+// era intesteable: corre cada 5 min y desaloja los buckets sin uso por más de
+// 1 h. Con el reloj falso de synctest se prueba en milisegundos.
+func TestCleanupLoop_EvictsIdleBuckets(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		l := New(Config{Rate: 10, Burst: 10})
+		t.Cleanup(l.Stop)
+
+		l.Allow("viejo")
+		if n := l.bucketCount(); n != 1 {
+			t.Fatalf("quiero 1 bucket, tengo %d", n)
+		}
+
+		// A los 30 min no se desaloja nada: el umbral de inactividad es 1 h.
+		synctest.Sleep(30 * time.Minute)
+		synctest.Wait()
+		if n := l.bucketCount(); n != 1 {
+			t.Fatalf("el bucket se desalojó antes de la hora: quedan %d", n)
+		}
+
+		// Pasada la hora de inactividad, el siguiente tick lo barre.
+		synctest.Sleep(35 * time.Minute)
+		synctest.Wait()
+		if n := l.bucketCount(); n != 0 {
+			t.Fatalf("el bucket inactivo no se desalojó: quedan %d", n)
+		}
+
+		// Y un bucket que se sigue usando sobrevive.
+		l.Allow("activo")
+		for range 12 {
+			synctest.Sleep(10 * time.Minute)
+			synctest.Wait()
+			l.Allow("activo")
+		}
+		if n := l.bucketCount(); n != 1 {
+			t.Fatalf("el bucket en uso se desalojó: quedan %d", n)
+		}
+	})
 }
 
 func TestAllow_NilLimiter(t *testing.T) {

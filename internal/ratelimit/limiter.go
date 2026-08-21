@@ -52,10 +52,7 @@ type bucket struct {
 // The cleanup goroutine is started automatically and stopped with Stop.
 func New(cfg Config) *Limiter {
 	if cfg.Burst <= 0 {
-		cfg.Burst = int(cfg.Rate * 2)
-		if cfg.Burst < 1 {
-			cfg.Burst = 1
-		}
+		cfg.Burst = max(int(cfg.Rate*2), 1)
 	}
 	l := &Limiter{
 		config:      cfg,
@@ -117,6 +114,17 @@ func (l *Limiter) Stop() {
 		return
 	}
 	l.stopOnce.Do(func() { close(l.stopCleanup) })
+}
+
+// bucketCount informa cuántos buckets tiene vivos el limiter. Existe para que
+// los tests del loop de limpieza puedan afirmar el desalojo.
+func (l *Limiter) bucketCount() int {
+	n := 0
+	l.buckets.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
 }
 
 func (l *Limiter) cleanupLoop() {
