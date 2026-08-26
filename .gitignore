@@ -34,3 +34,6 @@ data/
 
 # Monorepo-specific agent context (lives in the parent birdple-v2 repo, not here)
 CLAUDE.md
+
+# Serena (indexado LSP del agente)
+.serena/
