@@ -151,6 +151,35 @@ func (s *Scrubber) loop() {
 // where the last run left off. When a bucket is fully scanned the cursor
 // wraps around. Once all buckets wrap, lastFullScan is updated.
 // Buckets are processed in parallel using a bounded worker pool.
+// bucketScrubResult is what scrubbing one bucket produced, before the results
+// of all buckets are folded together under the lock.
+type bucketScrubResult struct {
+	partial     ScrubResult
+	bucketID    string
+	lastVisited string
+	wrapped     bool
+	iterErr     bool
+}
+
+// quarantineAction is an object the scrub decided to pull out of service, and
+// why: a checksum mismatch also quarantines the file on disk, a missing file has
+// no file left to quarantine.
+type quarantineAction struct {
+	key         string
+	locationRef string
+	isMismatch  bool
+}
+
+// RunIncremental scrubs up to maxPerRun objects per bucket, resuming each bucket
+// from where the previous run left off.
+//
+// Coverage is therefore `maxPerRun × buckets` per tick, not a percentage: how
+// long a full pass takes depends on the largest bucket. When every bucket has
+// wrapped around, last_full_scan is stamped.
+//
+// Buckets are scrubbed in parallel, bounded by NumCPU. The semaphore is taken by
+// the dispatching loop rather than inside each goroutine, so the loop itself
+// blocks and there are never more than NumCPU buckets in flight.
 func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 	var result ScrubResult
 
@@ -161,28 +190,19 @@ func (s *Scrubber) RunIncremental(maxPerRun int) ScrubResult {
 		return result
 	}
 
-	type bucketResult struct {
-		partial     ScrubResult
-		bucketID    string
-		lastVisited string
-		wrapped     bool
-		iterErr     bool
-	}
-
-	sem := make(chan struct{}, runtime.NumCPU())
-	var wg sync.WaitGroup
-	results := make([]bucketResult, len(buckets))
-
-	// Snapshot lastKey once under a single lock so goroutine dispatch below
-	// doesn't serialize on s.mu.
+	// Snapshot the resume cursors once under a single lock, so dispatching the
+	// goroutines below does not serialise on s.mu.
 	s.mu.Lock()
 	startKeys := make(map[string]string, len(s.lastKey))
 	maps.Copy(startKeys, s.lastKey)
 	s.mu.Unlock()
 
+	sem := make(chan struct{}, runtime.NumCPU())
+	var wg sync.WaitGroup
+	results := make([]bucketScrubResult, len(buckets))
+
 dispatch:
 	for i, bucket := range buckets {
-		// Check for shutdown before launching a new goroutine.
 		select {
 		case <-s.quit:
 			break dispatch
@@ -190,167 +210,169 @@ dispatch:
 		}
 
 		idx, b, start := i, bucket, startKeys[bucket.ID]
-
-		// El semáforo se toma en el padre, no en la goroutine: así el for se
-		// bloquea acá y nunca hay más de NumCPU() buckets en vuelo.
-		sem <- struct{}{} // acquire semaphore slot
+		sem <- struct{}{}
 
 		wg.Go(func() {
-			defer func() { <-sem }() // release semaphore slot
-
-			br := bucketResult{bucketID: b.ID}
-
-			type quarantineAction struct {
-				key         string
-				locationRef string
-				isMismatch  bool
-			}
-			var toQuarantine []quarantineAction
-			// toMigrateKeys collects keys of healthy records that may still be
-			// on the legacy JSON envelope. MigrateLegacyObject is a no-op for
-			// records already binary-encoded, so we can be generous here.
-			var toMigrateKeys []string
-
-			// Inside the View transaction we ONLY collect candidate objects.
-			// ObjectExists / VerifyChecksumRateLimited hit the disk (and the
-			// latter is deliberately rate-limited), and a long-lived bbolt
-			// read tx blocks the writer's mmap remap and pins freelist pages,
-			// stalling writes and growing the DB file for the whole scrub.
-			// The Object values passed to the callback are decoded copies, so
-			// they are safe to retain after the tx closes.
-			var candidates []meta.Object
-			lastVisited, iterErr := s.db.ForEachObjectFrom(b.ID, start, maxPerRun, func(obj meta.Object) error {
-				if obj.State != "active" {
-					return nil
-				}
-				candidates = append(candidates, obj)
-				return nil
-			})
-
-			// Disk verification happens outside the tx. Because the metadata
-			// may change while we verify (object overwritten or deleted), each
-			// mismatch/missing finding is re-checked against the current
-			// record before quarantining: only quarantine if the object is
-			// still active AND still points at the same LocationRef we
-			// verified. Otherwise we would quarantine a freshly replaced
-			// object based on stale evidence.
-			stillCurrent := func(obj *meta.Object) bool {
-				cur, err := s.db.GetObjectMetaAny(b.ID, obj.Key)
-				if err != nil {
-					return false
-				}
-				return cur.State == "active" && cur.LocationRef == obj.LocationRef
-			}
-
-			for i := range candidates {
-				obj := &candidates[i]
-				br.partial.Checked++
-
-				if !s.store.ObjectExists(obj) {
-					if !stillCurrent(obj) {
-						s.log.Info("scrub: object changed during verification, skipping",
-							"bucket", b.Name, "key", obj.Key, "location", obj.LocationRef)
-						continue
-					}
-					s.log.Warn("scrub: missing file",
-						"bucket", b.Name,
-						"key", obj.Key,
-						"location", obj.LocationRef,
-					)
-					toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: false})
-					br.partial.Missing++
-					continue
-				}
-
-				match, actual, verifyErr := s.store.VerifyChecksumRateLimited(obj.LocationRef, obj.ChecksumSHA256, s.bytesLimiter)
-				if verifyErr != nil {
-					s.log.Error("scrub: verify checksum",
-						"err", verifyErr,
-						"bucket", b.Name,
-						"key", obj.Key,
-					)
-					br.partial.Errors++
-					continue
-				}
-
-				if !match {
-					if !stillCurrent(obj) {
-						s.log.Info("scrub: object changed during verification, skipping",
-							"bucket", b.Name, "key", obj.Key, "location", obj.LocationRef)
-						continue
-					}
-					s.log.Error("scrub: checksum mismatch",
-						"bucket", b.Name,
-						"key", obj.Key,
-						"expected", obj.ChecksumSHA256,
-						"actual", actual,
-						"location", obj.LocationRef,
-					)
-					s.recordChecksumFailure()
-					toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: true})
-					br.partial.Quarantined++
-					continue
-				}
-
-				br.partial.Healthy++
-				// Record is healthy — piggyback the JSON→binary meta-envelope
-				// rewrite so legacy records migrate in-place without a
-				// dedicated batch job. No-op for records already in binary
-				// format; runs outside the View tx to avoid a read/write
-				// tx overlap on the same bucket.
-				toMigrateKeys = append(toMigrateKeys, obj.Key)
-			}
-
-			// Quarantine outside the View transaction to avoid deadlock.
-			for _, qa := range toQuarantine {
-				if qerr := s.db.QuarantineObject(b.ID, qa.key); qerr != nil {
-					s.log.Error("incremental scrub: quarantine meta", "err", qerr, "bucket", b.Name, "key", qa.key)
-				} else {
-					s.recordQuarantine()
-				}
-				if qa.isMismatch {
-					if qerr := s.store.Quarantine(qa.locationRef); qerr != nil {
-						s.log.Error("incremental scrub: quarantine file", "err", qerr, "location", qa.locationRef)
-					}
-				}
-			}
-
-			// Migrate legacy-JSON records to the binary envelope, one write
-			// tx per record. Healthy-only so we never persist re-encoded
-			// bytes for an object we just quarantined.
-			for _, k := range toMigrateKeys {
-				migrated, merr := s.db.MigrateLegacyObject(b.ID, k)
-				if merr != nil {
-					s.log.Error("incremental scrub: migrate legacy", "err", merr, "bucket", b.Name, "key", k)
-					br.partial.Errors++
-					continue
-				}
-				if migrated {
-					br.partial.Migrated++
-				}
-			}
-
-			if iterErr != nil {
-				s.log.Error("incremental scrub: iterate objects",
-					"err", iterErr,
-					"bucket", b.Name,
-				)
-				br.iterErr = true
-			}
-
-			br.lastVisited = lastVisited
-			if lastVisited == "" {
-				br.wrapped = true
-			}
-
-			results[idx] = br
+			defer func() { <-sem }()
+			results[idx] = s.scrubBucket(b, start, maxPerRun)
 		})
 	}
-
 	wg.Wait()
 
-	// Aggregate results and update shared state under the lock.
+	return s.foldResults(results, len(buckets))
+}
+
+// scrubBucket scrubs one bucket's next window of objects.
+func (s *Scrubber) scrubBucket(b meta.Bucket, start string, maxPerRun int) bucketScrubResult {
+	br := bucketScrubResult{bucketID: b.ID}
+
+	// The View transaction ONLY collects candidates. ObjectExists and
+	// VerifyChecksumRateLimited touch the disk — the latter deliberately
+	// throttled — and a long-lived bbolt read tx blocks the writer's mmap remap
+	// and pins freelist pages, stalling writes and growing the DB file for the
+	// whole scrub. The Object values handed to the callback are decoded copies,
+	// so they stay valid after the tx closes.
+	var candidates []meta.Object
+	lastVisited, iterErr := s.db.ForEachObjectFrom(b.ID, start, maxPerRun, func(obj meta.Object) error {
+		if obj.State == "active" {
+			candidates = append(candidates, obj)
+		}
+		return nil
+	})
+
+	toQuarantine, toMigrate := s.verifyCandidates(b, candidates, &br.partial)
+
+	// Both of these run OUTSIDE the View transaction: they take write
+	// transactions, and overlapping them with the read would deadlock.
+	s.applyQuarantines(b, toQuarantine)
+	s.migrateHealthy(b, toMigrate, &br.partial)
+
+	if iterErr != nil {
+		s.log.Error("incremental scrub: iterate objects", "err", iterErr, "bucket", b.Name)
+		br.iterErr = true
+	}
+
+	br.lastVisited = lastVisited
+	// An empty cursor means the bucket ran out of objects: it wrapped around.
+	br.wrapped = lastVisited == ""
+	return br
+}
+
+// verifyCandidates checks each candidate against the bytes on disk and sorts the
+// findings into what to quarantine and what is healthy enough to migrate.
+//
+// Every mismatch or missing file is re-checked against the CURRENT record before
+// being condemned: the metadata can change while the disk is being read, and
+// without that re-check a freshly overwritten object would be quarantined on the
+// strength of stale evidence.
+func (s *Scrubber) verifyCandidates(
+	b meta.Bucket, candidates []meta.Object, partial *ScrubResult,
+) (toQuarantine []quarantineAction, toMigrate []string) {
+	stillCurrent := func(obj *meta.Object) bool {
+		cur, err := s.db.GetObjectMetaAny(b.ID, obj.Key)
+		if err != nil {
+			return false
+		}
+		return cur.State == "active" && cur.LocationRef == obj.LocationRef
+	}
+
+	for i := range candidates {
+		obj := &candidates[i]
+		partial.Checked++
+
+		if !s.store.ObjectExists(obj) {
+			if !stillCurrent(obj) {
+				s.log.Info("scrub: object changed during verification, skipping",
+					"bucket", b.Name, "key", obj.Key, "location", obj.LocationRef)
+				continue
+			}
+			s.log.Warn("scrub: missing file", "bucket", b.Name, "key", obj.Key, "location", obj.LocationRef)
+			toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef})
+			partial.Missing++
+			continue
+		}
+
+		match, actual, verifyErr := s.store.VerifyChecksumRateLimited(obj.LocationRef, obj.ChecksumSHA256, s.bytesLimiter)
+		if verifyErr != nil {
+			s.log.Error("scrub: verify checksum", "err", verifyErr, "bucket", b.Name, "key", obj.Key)
+			partial.Errors++
+			continue
+		}
+
+		if !match {
+			if !stillCurrent(obj) {
+				s.log.Info("scrub: object changed during verification, skipping",
+					"bucket", b.Name, "key", obj.Key, "location", obj.LocationRef)
+				continue
+			}
+			s.log.Error("scrub: checksum mismatch",
+				"bucket", b.Name, "key", obj.Key,
+				"expected", obj.ChecksumSHA256, "actual", actual, "location", obj.LocationRef,
+			)
+			s.recordChecksumFailure()
+			toQuarantine = append(toQuarantine, quarantineAction{key: obj.Key, locationRef: obj.LocationRef, isMismatch: true})
+			partial.Quarantined++
+			continue
+		}
+
+		partial.Healthy++
+		// Healthy records get the JSON→binary envelope rewrite piggybacked on
+		// the scrub, so legacy records migrate in place without a dedicated
+		// batch job. MigrateLegacyObject is a no-op for records already in the
+		// binary format, so being generous here costs nothing.
+		toMigrate = append(toMigrate, obj.Key)
+	}
+	return toQuarantine, toMigrate
+}
+
+// applyQuarantines pulls the condemned objects out of service.
+//
+// A checksum mismatch quarantines the file on disk as well as the record: the
+// bytes are evidence, and deleting them would destroy the only copy of whatever
+// corruption happened.
+func (s *Scrubber) applyQuarantines(b meta.Bucket, actions []quarantineAction) {
+	for _, qa := range actions {
+		if err := s.db.QuarantineObject(b.ID, qa.key); err != nil {
+			s.log.Error("incremental scrub: quarantine meta", "err", err, "bucket", b.Name, "key", qa.key)
+		} else {
+			s.recordQuarantine()
+		}
+		if qa.isMismatch {
+			if err := s.store.Quarantine(qa.locationRef); err != nil {
+				s.log.Error("incremental scrub: quarantine file", "err", err, "location", qa.locationRef)
+			}
+		}
+	}
+}
+
+// migrateHealthy rewrites legacy-JSON records to the binary envelope, one write
+// transaction each.
+//
+// Healthy records only, so re-encoded bytes are never persisted for an object
+// that was just quarantined.
+func (s *Scrubber) migrateHealthy(b meta.Bucket, keys []string, partial *ScrubResult) {
+	for _, key := range keys {
+		migrated, err := s.db.MigrateLegacyObject(b.ID, key)
+		if err != nil {
+			s.log.Error("incremental scrub: migrate legacy", "err", err, "bucket", b.Name, "key", key)
+			partial.Errors++
+			continue
+		}
+		if migrated {
+			partial.Migrated++
+		}
+	}
+}
+
+// foldResults sums the per-bucket results and advances the resume cursors.
+//
+// A bucket that wrapped around has its cursor reset to the start; when EVERY
+// bucket wrapped in the same run, the full-scan timestamp is stamped — that is
+// the only moment jay can honestly claim to have verified everything it holds.
+func (s *Scrubber) foldResults(results []bucketScrubResult, bucketCount int) ScrubResult {
+	var result ScrubResult
 	allWrapped := true
+
 	s.mu.Lock()
 	for _, br := range results {
 		result.Checked += br.partial.Checked
@@ -361,30 +383,25 @@ dispatch:
 		result.Migrated += br.partial.Migrated
 		s.totalChecked += int64(br.partial.Checked)
 
-		if br.iterErr {
-			result.Errors++ // count the iteration error itself
-			continue
-		}
-
-		if br.bucketID == "" {
-			continue // unused slot (early shutdown)
-		}
-
-		if br.wrapped {
+		switch {
+		case br.iterErr:
+			result.Errors++ // the iteration failure itself
+		case br.bucketID == "":
+			// Unused slot: dispatch stopped early on shutdown.
+		case br.wrapped:
 			s.lastKey[br.bucketID] = ""
-		} else {
+		default:
 			s.lastKey[br.bucketID] = br.lastVisited
 			allWrapped = false
 		}
 	}
 	s.mu.Unlock()
 
-	if allWrapped && len(buckets) > 0 {
+	if allWrapped && bucketCount > 0 {
 		s.mu.Lock()
 		s.lastFullScan = time.Now().UTC()
 		s.mu.Unlock()
 	}
-
 	return result
 }
 
