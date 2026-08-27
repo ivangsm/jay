@@ -56,9 +56,9 @@ func uploadExists(t *testing.T, db *meta.DB, uploadID string) bool {
 	return false
 }
 
-// TestGCLoop_PrimeraPasadaAlMinuto fija el agendado del loop del GC: no corre
+// TestGCLoop_FirstPassAtOneMinute fija el agendado del loop del GC: no corre
 // nada antes del minuto, y a partir de ahí repite cada `interval`.
-func TestGCLoop_PrimeraPasadaAlMinuto(t *testing.T) {
+func TestGCLoop_FirstPassAtOneMinute(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		gc, db, _ := testGCWithStore(t, time.Hour)
 		uploadID := seedStaleUpload(t, db)
@@ -148,10 +148,10 @@ func TestGCLoop_NotifyDeletionCorreYaYReagenda(t *testing.T) {
 	})
 }
 
-// TestScrubberLoop_PrimeraPasadaALos30s fija el agendado del scrubber. El
+// TestScrubberLoop_FirstPassAt30s fija el agendado del scrubber. El
 // observable es el cursor por bucket: RunIncremental lo mueve, y hasta que el
 // loop no dispara por primera vez no se toca nada.
-func TestScrubberLoop_PrimeraPasadaALos30s(t *testing.T) {
+func TestScrubberLoop_FirstPassAt30s(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		db, st := openTestDB(t)
 		b := &meta.Bucket{ID: uuid.New().String(), Name: "scrub-loop", Status: "active"}
