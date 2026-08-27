@@ -826,7 +826,7 @@ func TestMultipartUploadComplete(t *testing.T) {
 	if err := xml.Unmarshal(body, &initResult); err != nil {
 		t.Fatalf("unmarshal multipart init: %v", err)
 	}
-	uploadID := initResult.UploadId
+	uploadID := initResult.UploadID
 	if uploadID == "" {
 		t.Fatal("missing upload ID")
 	}
@@ -901,7 +901,7 @@ func TestMultipartUploadAbort(t *testing.T) {
 	if err := xml.Unmarshal(body, &initResult); err != nil {
 		t.Fatalf("unmarshal multipart init: %v", err)
 	}
-	uploadID := initResult.UploadId
+	uploadID := initResult.UploadID
 
 	// Upload a part
 	resp = env.s3Request(t, "PUT",

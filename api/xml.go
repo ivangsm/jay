@@ -40,15 +40,18 @@ type ListAllMyBucketsResult struct {
 	Buckets S3BucketList `xml:"Buckets"`
 }
 
+// S3Owner is the owner element S3 clients expect in listing responses.
 type S3Owner struct {
 	ID          string `xml:"ID"`
 	DisplayName string `xml:"DisplayName"`
 }
 
+// S3BucketList wraps the bucket entries of a ListBuckets response.
 type S3BucketList struct {
 	Bucket []S3BucketEntry `xml:"Bucket"`
 }
 
+// S3BucketEntry is one bucket in a ListBuckets response.
 type S3BucketEntry struct {
 	Name         string `xml:"Name"`
 	CreationDate string `xml:"CreationDate"`
@@ -72,6 +75,7 @@ type ListBucketResult struct {
 	NextContinuationToken string           `xml:"NextContinuationToken,omitempty"`
 }
 
+// S3Content is one object in a ListObjects response.
 type S3Content struct {
 	Key          string `xml:"Key"`
 	LastModified string `xml:"LastModified"`
@@ -80,6 +84,7 @@ type S3Content struct {
 	StorageClass string `xml:"StorageClass"`
 }
 
+// S3CommonPrefix is a synthesised directory in a delimited listing.
 type S3CommonPrefix struct {
 	Prefix string `xml:"Prefix"`
 }
@@ -90,7 +95,7 @@ type InitiateMultipartUploadResult struct {
 	XMLNS    string   `xml:"xmlns,attr"`
 	Bucket   string   `xml:"Bucket"`
 	Key      string   `xml:"Key"`
-	UploadId string   `xml:"UploadId"`
+	UploadID string   `xml:"UploadId"`
 }
 
 // CompleteMultipartUploadInput is the XML request for CompleteMultipartUpload.
@@ -99,6 +104,8 @@ type CompleteMultipartUploadInput struct {
 	Parts   []CompletePart `xml:"Part"`
 }
 
+// CompletePart is one part a client claims to have uploaded, in the
+// CompleteMultipartUpload request.
 type CompletePart struct {
 	PartNumber int    `xml:"PartNumber"`
 	ETag       string `xml:"ETag"`
@@ -120,10 +127,11 @@ type ListPartsResult struct {
 	XMLNS    string   `xml:"xmlns,attr"`
 	Bucket   string   `xml:"Bucket"`
 	Key      string   `xml:"Key"`
-	UploadId string   `xml:"UploadId"`
+	UploadID string   `xml:"UploadId"`
 	Parts    []S3Part `xml:"Part"`
 }
 
+// S3Part is one uploaded part in a ListParts response.
 type S3Part struct {
 	PartNumber   int    `xml:"PartNumber"`
 	LastModified string `xml:"LastModified"`

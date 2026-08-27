@@ -35,11 +35,11 @@ func (h *Handler) denyMultipartPolicy(w http.ResponseWriter, r *http.Request, bu
 		return false
 	}
 
-	// Lenient, no los defaults de v2: la política la escribe un humano y v1
-	// hacía matching de nombres case-insensitive. Con los defaults de v2 (case
-	// sensitive) una política escrita al estilo AWS ("Effect"/"Statements")
-	// dejaría de parsearse y el statement Deny desaparecería en silencio —
-	// abriendo acceso donde antes se negaba. Lenient conserva el matching de v1.
+	// Lenient rather than v2's defaults: bucket policies are written by hand,
+	// and v1 matched field names case-insensitively. Under v2's case-sensitive
+	// defaults an AWS-style policy ("Effect"/"Statements") would stop parsing
+	// and its Deny statement would vanish silently — opening access where it
+	// used to be refused. Lenient preserves v1's matching.
 	var policy auth.BucketPolicy
 	if err := jsonv2.Unmarshal(bucket.PolicyJSON, &policy, jsonx.Lenient); err != nil {
 		h.log.Warn("multipart: malformed bucket policy, failing closed", "bucket", bucket.Name, "err", err)
@@ -146,7 +146,7 @@ func (h *Handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Req
 		XMLNS:    s3Namespace,
 		Bucket:   bucketName,
 		Key:      objectKey,
-		UploadId: uploadID,
+		UploadID: uploadID,
 	})
 }
 
@@ -440,7 +440,7 @@ func (h *Handler) handleListParts(w http.ResponseWriter, r *http.Request, bucket
 		XMLNS:    s3Namespace,
 		Bucket:   bucketName,
 		Key:      objectKey,
-		UploadId: uploadID,
+		UploadID: uploadID,
 	}
 
 	for _, p := range upload.Parts {
