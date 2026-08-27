@@ -67,13 +67,11 @@ func parseIOValidate(args []string) (input, output string, err error) {
 
 func validateDocument(root *yaml.Node, path string) (errs []string, warns []string) {
 	if root.Kind == 0 || len(root.Content) == 0 {
-		errs = append(errs, path+": empty document")
-		return
+		return []string{path + ": empty document"}, nil
 	}
 	top := root.Content[0]
 	if top.Kind != yaml.MappingNode {
-		errs = append(errs, locLabel(path, top)+": top-level must be a mapping")
-		return
+		return []string{locLabel(path, top) + ": top-level must be a mapping"}, nil
 	}
 
 	fields := map[string]*yaml.Node{}
@@ -93,7 +91,7 @@ func validateDocument(root *yaml.Node, path string) (errs []string, warns []stri
 	validateScrub(path, fields, &errs, &warns)
 	validateRate(path, fields, &errs)
 	validateLogLevel(path, fields, &errs)
-	return
+	return errs, warns
 }
 
 func locLabel(path string, node *yaml.Node) string {
