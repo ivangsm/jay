@@ -1,3 +1,9 @@
+// Package store owns object bytes on disk.
+//
+// Every write is atomic — temp file, fsync, rename, fsync the directory — and
+// carries a SHA-256 checksum, which is what lets the scrubber tell silent
+// corruption from a healthy object. Metadata lives in package meta and refers to
+// files here only by LocationRef.
 package store
 
 import (
@@ -72,8 +78,12 @@ func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (chec
 	return checksum, size, locationRef, nil
 }
 
-// AssembleParts concatenates parts into a final object file.
-// Returns the SHA-256 checksum, total size, and location ref of the assembled object.
+// AssembleParts concatenates parts into a final object file and returns its
+// SHA-256 checksum, total size and location ref.
+//
+// The results are named because the cleanup defer reads `err` to decide whether
+// to remove the half-written temp file: on any failure the partial assembly is
+// deleted rather than left behind for the GC to guess at.
 func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string) (checksum string, size int64, locationRef string, err error) {
 	// The .writing suffix signals to GC that this file is actively being written.
 	tmpFile, err := os.CreateTemp(filepath.Join(s.dataDir, "tmp"), "jay-assemble-*.writing")
@@ -96,18 +106,18 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 		partPath, verr := s.SafePath(loc)
 		if verr != nil {
 			err = fmt.Errorf("store: invalid part location %s: %w", loc, verr)
-			return
+			return "", 0, "", err
 		}
 		f, ferr := os.Open(partPath)
 		if ferr != nil {
 			err = fmt.Errorf("store: open part %s: %w", loc, ferr)
-			return
+			return "", 0, "", err
 		}
 		n, cerr := io.Copy(w, f)
 		_ = f.Close()
 		if cerr != nil {
 			err = fmt.Errorf("store: copy part %s: %w", loc, cerr)
-			return
+			return "", 0, "", err
 		}
 		size += n
 	}
