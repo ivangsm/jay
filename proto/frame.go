@@ -34,7 +34,7 @@ func ReadHeader(r io.Reader) (opOrStatus byte, streamID uint32, metaLen uint32, 
 	if dataLen < 0 {
 		return 0, 0, 0, 0, errors.New("invalid negative data length")
 	}
-	return
+	return opOrStatus, streamID, metaLen, dataLen, nil
 }
 
 // WriteHandshake writes the client handshake to w.
