@@ -1,3 +1,9 @@
+// Package recovery reconciles metadata against the bytes on disk at startup.
+//
+// It is what makes jay safe to restart after a crash: metadata pointing at a
+// missing file, and files no metadata points at, are both quarantined rather
+// than deleted, so an inconsistency is preserved as evidence instead of being
+// tidied away.
 package recovery
 
 import (
@@ -19,10 +25,29 @@ func Run(db *meta.DB, st *store.Store, log *slog.Logger) error {
 // case no counters are recorded. Every effective quarantine (metadata entry
 // quarantined or orphaned physical file moved aside) increments
 // ObjectsQuarantined.
+// recoveryTally counts what one reconciliation pass had to fix.
+type recoveryTally struct {
+	quarantinedMeta  int
+	quarantinedFiles int
+	orphanedFiles    int
+}
+
+// RunWithMetrics reconciles metadata against what is actually on disk, and is
+// what makes jay safe to restart after a crash.
+//
+// Two kinds of inconsistency exist and both are quarantined rather than
+// deleted:
+//
+//   - metadata pointing at a file that is not there — the record is quarantined,
+//     because serving it would 500 on every read;
+//   - a file with no metadata pointing at it — the file is quarantined, because
+//     nothing can reach it and it would otherwise occupy disk forever.
+//
+// Quarantine, never delete: an inconsistency is evidence of something that went
+// wrong, and deleting it destroys the only trace of what.
 func RunWithMetrics(db *meta.DB, st *store.Store, log *slog.Logger, m *maintenance.Metrics) error {
 	log.Info("recovery: starting reconciliation")
 
-	// 1. Clean temp directory
 	cleaned, err := st.CleanTmp()
 	if err != nil {
 		log.Error("recovery: clean tmp", "err", err)
@@ -32,99 +57,120 @@ func RunWithMetrics(db *meta.DB, st *store.Store, log *slog.Logger, m *maintenan
 		log.Warn("recovery: cleaned orphaned temp files", "count", cleaned)
 	}
 
-	// 2. Check all buckets and their objects
 	buckets, err := db.ListBuckets("")
 	if err != nil {
 		log.Error("recovery: list buckets", "err", err)
 		return err
 	}
 
-	var quarantinedMeta, quarantinedFiles, orphanedFiles int
-
+	var tally recoveryTally
 	for _, bucket := range buckets {
-		// Track known physical files for this bucket
-		physicalFiles := make(map[string]bool)
-		files, err := st.ListBucketFiles(bucket.ID)
-		if err != nil {
-			log.Warn("recovery: list bucket files", "err", err, "bucket", bucket.Name)
-			continue
-		}
-		for _, f := range files {
-			physicalFiles[f] = true
-		}
-
-		// Check each metadata entry has a matching physical file. Only
-		// collect the keys to quarantine here: QuarantineObject opens a
-		// bbolt write transaction, and committing a write while a view
-		// transaction is open on the same goroutine can deadlock if the
-		// commit needs to remap the mmap (database growth). Apply the
-		// quarantines after the view transaction has closed.
-		type quarantineTarget struct {
-			key         string
-			locationRef string
-		}
-		var toQuarantine []quarantineTarget
-		knownLocations := make(map[string]bool)
-		err = db.ForEachObject(bucket.ID, func(obj meta.Object) error {
-			if obj.State != "active" {
-				return nil
-			}
-			knownLocations[obj.LocationRef] = true
-
-			if !st.ObjectExists(&obj) {
-				toQuarantine = append(toQuarantine, quarantineTarget{
-					key:         obj.Key,
-					locationRef: obj.LocationRef,
-				})
-			}
-			return nil
-		})
-		if err != nil {
-			log.Warn("recovery: iterate objects", "err", err, "bucket", bucket.Name)
-		}
-
-		// Quarantine outside the View transaction to avoid deadlock.
-		for _, qt := range toQuarantine {
-			log.Warn("recovery: metadata without file, quarantining",
-				"bucket", bucket.Name,
-				"key", qt.key,
-				"location", qt.locationRef,
-			)
-			if err := db.QuarantineObject(bucket.ID, qt.key); err != nil {
-				log.Error("recovery: quarantine object", "err", err, "key", qt.key)
-			} else if m != nil {
-				m.ObjectsQuarantined.Add(1)
-			}
-			quarantinedMeta++
-		}
-
-		// Check for physical files without metadata
-		for f := range physicalFiles {
-			if !knownLocations[f] {
-				log.Warn("recovery: orphaned file, quarantining",
-					"bucket", bucket.Name,
-					"file", f,
-				)
-				if err := st.Quarantine(f); err != nil {
-					log.Error("recovery: quarantine file", "err", err, "file", f)
-					orphanedFiles++
-				} else {
-					quarantinedFiles++
-					if m != nil {
-						m.ObjectsQuarantined.Add(1)
-					}
-				}
-			}
-		}
+		reconcileBucket(db, st, log, m, bucket, &tally)
 	}
 
 	log.Info("recovery: reconciliation complete",
 		"buckets", len(buckets),
-		"quarantined_meta", quarantinedMeta,
-		"quarantined_files", quarantinedFiles,
-		"orphaned_files", orphanedFiles,
+		"quarantined_meta", tally.quarantinedMeta,
+		"quarantined_files", tally.quarantinedFiles,
+		"orphaned_files", tally.orphanedFiles,
 		"cleaned_tmp", cleaned,
 	)
 
 	return nil
+}
+
+// reconcileBucket reconciles one bucket in both directions.
+//
+// A bucket whose files cannot be listed is skipped rather than failing the whole
+// recovery: one unreadable bucket must not stop jay from booting with the rest.
+func reconcileBucket(
+	db *meta.DB, st *store.Store, log *slog.Logger, m *maintenance.Metrics,
+	bucket meta.Bucket, tally *recoveryTally,
+) {
+	physicalFiles, err := st.ListBucketFiles(bucket.ID)
+	if err != nil {
+		log.Warn("recovery: list bucket files", "err", err, "bucket", bucket.Name)
+		return
+	}
+
+	orphanedMeta, knownLocations := findMetadataWithoutFiles(db, st, log, bucket)
+	quarantineMetadata(db, log, m, bucket, orphanedMeta, tally)
+	quarantineOrphanedFiles(st, log, m, bucket, physicalFiles, knownLocations, tally)
+}
+
+// orphanedRecord is an active metadata record whose file is missing.
+type orphanedRecord struct {
+	key         string
+	locationRef string
+}
+
+// findMetadataWithoutFiles walks the bucket's records and reports which ones
+// have no file behind them, plus the set of locations that ARE accounted for.
+//
+// It only COLLECTS inside the View transaction. QuarantineObject opens a write
+// transaction, and committing one while a view transaction is open on the same
+// goroutine can deadlock if the commit has to remap the mmap because the
+// database grew.
+func findMetadataWithoutFiles(
+	db *meta.DB, st *store.Store, log *slog.Logger, bucket meta.Bucket,
+) (orphaned []orphanedRecord, knownLocations map[string]bool) {
+	knownLocations = make(map[string]bool)
+
+	err := db.ForEachObject(bucket.ID, func(obj meta.Object) error {
+		if obj.State != "active" {
+			return nil
+		}
+		knownLocations[obj.LocationRef] = true
+		if !st.ObjectExists(&obj) {
+			orphaned = append(orphaned, orphanedRecord{key: obj.Key, locationRef: obj.LocationRef})
+		}
+		return nil
+	})
+	if err != nil {
+		log.Warn("recovery: iterate objects", "err", err, "bucket", bucket.Name)
+	}
+	return orphaned, knownLocations
+}
+
+// quarantineMetadata quarantines records whose file is gone. Runs outside the
+// View transaction — see findMetadataWithoutFiles for why.
+func quarantineMetadata(
+	db *meta.DB, log *slog.Logger, m *maintenance.Metrics,
+	bucket meta.Bucket, orphaned []orphanedRecord, tally *recoveryTally,
+) {
+	for _, rec := range orphaned {
+		log.Warn("recovery: metadata without file, quarantining",
+			"bucket", bucket.Name, "key", rec.key, "location", rec.locationRef)
+
+		if err := db.QuarantineObject(bucket.ID, rec.key); err != nil {
+			log.Error("recovery: quarantine object", "err", err, "key", rec.key)
+		} else if m != nil {
+			m.ObjectsQuarantined.Add(1)
+		}
+		tally.quarantinedMeta++
+	}
+}
+
+// quarantineOrphanedFiles quarantines files that no metadata record points at.
+func quarantineOrphanedFiles(
+	st *store.Store, log *slog.Logger, m *maintenance.Metrics,
+	bucket meta.Bucket, physicalFiles []string, knownLocations map[string]bool, tally *recoveryTally,
+) {
+	for _, file := range physicalFiles {
+		if knownLocations[file] {
+			continue
+		}
+
+		log.Warn("recovery: orphaned file, quarantining", "bucket", bucket.Name, "file", file)
+		if err := st.Quarantine(file); err != nil {
+			log.Error("recovery: quarantine file", "err", err, "file", file)
+			tally.orphanedFiles++
+			continue
+		}
+
+		tally.quarantinedFiles++
+		if m != nil {
+			m.ObjectsQuarantined.Add(1)
+		}
+	}
 }
