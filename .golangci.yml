@@ -11,11 +11,12 @@
 version: "2"
 
 linters:
-  # misspell queda FUERA a propósito: los comentarios de este repo van en
-  # español (regla del monorepo) y el linter los corrige contra un diccionario
-  # inglés — con --fix llegó a reescribir "corrupto"→"corruption" y
-  # "recorre"→"recorder" dentro de la documentación de meta/record.go.
+  # misspell SÍ corre desde 2026-08: jay es un proyecto público y sus
+  # comentarios pasaron a inglés, así que el diccionario del linter ya aplica.
+  # Antes estaba fuera porque corregía palabras en español ("corrupto" →
+  # "corruption") dentro de la documentación de meta/record.go.
   enable:
+    - misspell
     - bodyclose      # un response body sin cerrar filtra la conexión
     - errorlint      # == y type-assert sobre errores envueltos: fallan en silencio
     - copyloopvar    # detecta las copias de variable de loop que ya no hacen falta
@@ -65,6 +66,13 @@ linters:
         - name: unreachable-code
         - name: var-declaration
         - name: waitgroup-by-value
+        # Reglas de legibilidad agregadas en la limpieza de 2026-08:
+        - name: exported            # todo símbolo exportado con godoc
+        - name: var-naming
+        - name: confusing-naming    # dos nombres que difieren sólo en mayúsculas
+        - name: flag-parameter      # booleanos que ramifican el comportamiento
+        - name: bare-return
+        - name: package-comments
 
   exclusions:
     rules:
@@ -75,6 +83,18 @@ linters:
           - bodyclose
           - errcheck
           - errorlint
+          - revive
+          # misspell fuera: los datos de prueba llevan palabras en español a
+          # propósito ("corrupto", "autor"), y el diccionario es inglés.
+          - misspell
+
+      # admin.AdminConfig "tartamudea", pero es la API pública del paquete
+      # admin y renombrarla rompería a cualquier consumidor externo. Mismo
+      # criterio que los tipos Storage* de falco.
+      - path: admin/admin\.go
+        text: "stutters"
+        linters:
+          - revive
 
       # syscall.Statfs_t.Bavail/Bsize tienen anchos distintos en darwin y en
       # linux (uint64/uint32 vs int64/int64). unconvert analiza una sola
