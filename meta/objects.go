@@ -13,9 +13,9 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-var (
-	ErrObjectNotFound = errors.New("object not found")
-)
+// ErrObjectNotFound is returned when a key has no record. Distinguishing it from
+// a read failure is what lets the API answer 404 rather than 500.
+var ErrObjectNotFound = errors.New("object not found")
 
 // SetDeletionHook registers a callback invoked after a successful
 // DeleteObjectMeta commit. It is used by the maintenance GC to wake
@@ -236,161 +236,226 @@ type ListObjectsResult struct {
 // Real S3 uses an opaque NextContinuationToken; a plain "last key seen" cursor
 // is sufficient here and keeps the token human-readable and compatible with
 // start-after.
+// defaultMaxKeys is the page size S3 uses when a client does not ask for one.
+const defaultMaxKeys = 1000
+
+// listBatchSize is how many records are pulled out of bbolt per read
+// transaction. Deliberately small: the records are processed outside the
+// transaction so writers can interleave, and a long-lived read tx blocks the
+// writer's mmap remap and pins freelist pages.
+const listBatchSize = 100
+
+// kvPair is a copy of one key/value pair taken out of a bbolt transaction, so
+// it stays valid after that transaction is released.
+type kvPair struct {
+	key []byte
+	val []byte
+}
+
+// listCursor tracks a listing's position across batches.
+//
+// The two positions differ, and the difference is the whole reason this is a
+// struct: `resumeAt` advances past EVERY key seen, including ones the page
+// skipped, so the scan always makes forward progress. `lastConsumed` only
+// advances past keys the page actually accounted for, and becomes
+// NextStartAfter — so the key that triggered truncation is served on the next
+// page instead of being silently dropped.
+type listCursor struct {
+	resumeAt     string
+	lastConsumed string
+	firstBatch   bool
+	exhausted    bool
+}
+
+// ListObjects returns one page of a bucket's objects, rolling keys up into
+// common prefixes when a delimiter is given.
+//
+// The listing is paged internally: bbolt is read in small batches and each batch
+// is processed after its transaction closes, so a large listing never holds a
+// read transaction open long enough to stall writers.
 func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKeys int) (*ListObjectsResult, error) {
 	if maxKeys <= 0 {
-		maxKeys = 1000
+		maxKeys = defaultMaxKeys
 	}
-	const batchSize = 100
 
 	result := &ListObjectsResult{}
-	prefixSet := make(map[string]bool)
+	seenPrefixes := make(map[string]bool)
+	cursor := listCursor{firstBatch: true}
 	count := 0
 
-	// kvPair holds copies of key/value bytes from a bbolt tx so we can safely
-	// process them after the tx has been released.
-	type kvPair struct {
-		key []byte
-		val []byte
-	}
-
-	// cursorKey is the last key we advanced past (inclusive-skip). On the first
-	// iteration it is empty and we derive the seek position from startAfter /
-	// prefix, matching the original implementation.
-	cursorKey := ""
-	// lastConsumed is the last key that this page fully accounted for. It becomes
-	// NextStartAfter (exclusive) so the next page resumes strictly after it.
-	// Unlike cursorKey it is NOT advanced past the key that triggered truncation,
-	// since that key still has to be served on the next page.
-	lastConsumed := ""
-	firstBatch := true
-	// prefixExhausted is true once we have observed a key that no longer
-	// matches prefix (or ran past the end of the bucket) — at that point no
-	// further batches can possibly yield matches.
-	prefixExhausted := false
-
-	for !prefixExhausted {
-		batch := make([]kvPair, 0, batchSize)
-
-		err := db.bolt.View(func(tx *bolt.Tx) error {
-			bk := tx.Bucket(objectsBucketName(bucketID))
-			if bk == nil {
-				return ErrBucketNotFound
-			}
-
-			c := bk.Cursor()
-			var k, v []byte
-			if firstBatch {
-				seekKey := max(startAfter, prefix)
-				if seekKey == "" {
-					k, v = c.First()
-				} else {
-					k, v = c.Seek([]byte(seekKey))
-					if startAfter != "" && k != nil && string(k) == startAfter {
-						k, v = c.Next()
-					}
-				}
-			} else {
-				// Resume strictly after the last key we processed in the prior
-				// batch. Seek lands on >= cursorKey; if equal, advance.
-				k, v = c.Seek([]byte(cursorKey))
-				if k != nil && string(k) == cursorKey {
-					k, v = c.Next()
-				}
-			}
-
-			for ; k != nil && len(batch) < batchSize; k, v = c.Next() {
-				if prefix != "" && !bytes.HasPrefix(k, []byte(prefix)) {
-					prefixExhausted = true
-					return nil
-				}
-				batch = append(batch, kvPair{
-					key: append([]byte(nil), k...),
-					val: append([]byte(nil), v...),
-				})
-			}
-			if k == nil {
-				// Walked off the end of the bucket — no more keys exist.
-				prefixExhausted = true
-			}
-			return nil
-		})
+	for !cursor.exhausted {
+		batch, err := db.readListBatch(bucketID, prefix, startAfter, &cursor)
 		if err != nil {
 			return nil, err
 		}
-		firstBatch = false
-
+		cursor.firstBatch = false
 		if len(batch) == 0 {
 			break
 		}
 
-		// Process the batch OUTSIDE the tx so write transactions can interleave.
-		done := false
-		for _, p := range batch {
-			key := string(p.key)
-			// Advance the resume cursor for the next batch even for records we
-			// skip (corrupt, non-active, duplicate common-prefix). This ensures
-			// forward progress and matches the original cursor semantics, where
-			// the cursor always advances regardless of whether a record
-			// contributes to the output.
-			cursorKey = key
-
-			var obj Object
-			if err := decodeObject(p.val, &obj); err != nil {
-				slog.Warn("meta: corrupt object record", "key", key, "err", err)
-				lastConsumed = key
-				continue
-			}
-			if obj.State != "active" {
-				lastConsumed = key
-				continue
-			}
-
-			if delimiter != "" {
-				rest := key[len(prefix):]
-				idx := strings.Index(rest, delimiter)
-				if idx >= 0 {
-					cp := prefix + rest[:idx+len(delimiter)]
-					if prefixSet[cp] {
-						// Already rolled up into a CommonPrefix emitted by this
-						// page: consumed, but does not count against maxKeys.
-						lastConsumed = key
-						continue
-					}
-					if count >= maxKeys {
-						result.IsTruncated = true
-						done = true
-						break
-					}
-					prefixSet[cp] = true
-					result.CommonPrefixes = append(result.CommonPrefixes, cp)
-					count++
-					lastConsumed = key
-					continue
-				}
-			}
-
-			if count >= maxKeys {
-				result.IsTruncated = true
-				done = true
-				break
-			}
-
-			// Object is a value type; safe to retain after the tx closes.
-			result.Objects = append(result.Objects, obj)
-			count++
-			lastConsumed = key
-		}
-
-		if done {
+		truncated := db.consumeListBatch(batch, listPage{
+			prefix:       prefix,
+			delimiter:    delimiter,
+			maxKeys:      maxKeys,
+			result:       result,
+			seenPrefixes: seenPrefixes,
+			cursor:       &cursor,
+			count:        &count,
+		})
+		if truncated {
 			break
 		}
-		// If the batch was short, either because we hit the end of the bucket
-		// or ran past the prefix, prefixExhausted is already set and the loop
-		// will terminate.
 	}
 
-	result.NextStartAfter = lastConsumed
+	result.NextStartAfter = cursor.lastConsumed
 	return result, nil
+}
+
+// readListBatch pulls the next batch of raw records out of bbolt.
+//
+// It marks the cursor exhausted as soon as it walks past the prefix or off the
+// end of the bucket — from that point no later batch can match.
+func (db *DB) readListBatch(bucketID, prefix, startAfter string, cursor *listCursor) ([]kvPair, error) {
+	batch := make([]kvPair, 0, listBatchSize)
+
+	err := db.bolt.View(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return ErrBucketNotFound
+		}
+
+		c := bk.Cursor()
+		var k, v []byte
+		if cursor.firstBatch {
+			// startAfter is exclusive, prefix is inclusive; seeking to the
+			// larger of the two lands on the first key either could allow.
+			seekKey := max(startAfter, prefix)
+			if seekKey == "" {
+				k, v = c.First()
+			} else {
+				k, v = c.Seek([]byte(seekKey))
+				if startAfter != "" && k != nil && string(k) == startAfter {
+					k, v = c.Next()
+				}
+			}
+		} else {
+			// Resume strictly after the last key processed. Seek lands on
+			// >= resumeAt, so an exact hit has to be stepped past.
+			k, v = c.Seek([]byte(cursor.resumeAt))
+			if k != nil && string(k) == cursor.resumeAt {
+				k, v = c.Next()
+			}
+		}
+
+		for ; k != nil && len(batch) < listBatchSize; k, v = c.Next() {
+			if prefix != "" && !bytes.HasPrefix(k, []byte(prefix)) {
+				cursor.exhausted = true
+				return nil
+			}
+			batch = append(batch, kvPair{
+				key: append([]byte(nil), k...),
+				val: append([]byte(nil), v...),
+			})
+		}
+		if k == nil {
+			cursor.exhausted = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return batch, nil
+}
+
+// listPage is the mutable state one batch contributes to.
+type listPage struct {
+	prefix       string
+	delimiter    string
+	maxKeys      int
+	result       *ListObjectsResult
+	seenPrefixes map[string]bool
+	cursor       *listCursor
+	count        *int
+}
+
+// consumeListBatch folds one batch into the page, and reports whether the page
+// filled up.
+//
+// Runs OUTSIDE the bbolt transaction so writers can interleave.
+func (db *DB) consumeListBatch(batch []kvPair, page listPage) (truncated bool) {
+	for _, p := range batch {
+		key := string(p.key)
+		// The resume cursor advances even for records this page skips —
+		// corrupt, not active, or already rolled up — so the scan cannot stall
+		// on a record it will never emit.
+		page.cursor.resumeAt = key
+
+		var obj Object
+		if err := decodeObject(p.val, &obj); err != nil {
+			// A corrupt record is logged and stepped over rather than failing
+			// the listing: one unreadable object must not make a whole bucket
+			// unlistable.
+			slog.Warn("meta: corrupt object record", "key", key, "err", err)
+			page.cursor.lastConsumed = key
+			continue
+		}
+		if obj.State != "active" {
+			page.cursor.lastConsumed = key
+			continue
+		}
+
+		if page.delimiter != "" {
+			rolled, full := page.rollUpCommonPrefix(key)
+			if full {
+				page.result.IsTruncated = true
+				return true
+			}
+			if rolled {
+				continue
+			}
+		}
+
+		if *page.count >= page.maxKeys {
+			page.result.IsTruncated = true
+			return true
+		}
+
+		// Object is a value type, so it stays valid after the tx closed.
+		page.result.Objects = append(page.result.Objects, obj)
+		*page.count++
+		page.cursor.lastConsumed = key
+	}
+	return false
+}
+
+// rollUpCommonPrefix folds a key into a CommonPrefix when the delimiter says it
+// belongs to one.
+//
+// Reports whether the key was rolled up, and whether the page is now full. A key
+// that lands in a prefix already emitted counts as consumed but does NOT count
+// against maxKeys: the prefix is the entry, not each key beneath it.
+func (p listPage) rollUpCommonPrefix(key string) (rolled, full bool) {
+	rest := key[len(p.prefix):]
+	idx := strings.Index(rest, p.delimiter)
+	if idx < 0 {
+		return false, false
+	}
+
+	commonPrefix := p.prefix + rest[:idx+len(p.delimiter)]
+	if p.seenPrefixes[commonPrefix] {
+		p.cursor.lastConsumed = key
+		return true, false
+	}
+	if *p.count >= p.maxKeys {
+		return false, true
+	}
+
+	p.seenPrefixes[commonPrefix] = true
+	p.result.CommonPrefixes = append(p.result.CommonPrefixes, commonPrefix)
+	*p.count++
+	p.cursor.lastConsumed = key
+	return true, false
 }
 
 // QuarantineObject marks an object as quarantined in metadata.
