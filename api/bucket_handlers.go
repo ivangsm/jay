@@ -1,3 +1,8 @@
+// Package api implements jay's S3-compatible HTTP surface: objects, buckets,
+// multipart uploads, presigned URLs and SigV4 authentication.
+//
+// Compatibility is the point — the AWS CLI and SDKs have to work unmodified — so
+// the XML shapes and error codes here follow S3's, not jay's preferences.
 package api
 
 import (

@@ -36,10 +36,10 @@ func tokenFromContext(ctx context.Context) *meta.Token {
 
 // generateRequestID produces a cryptographically random hex request ID.
 //
-// El error de crypto/rand.Read se descarta porque desde Go 1.24 NO existe:
-// la función está documentada como "never returns an error, and always fills
-// b entirely" — si el SO no puede dar entropía, el runtime tira el proceso.
-// La asignación a `_, _` es para el linter, no para tapar una falla posible.
+// crypto/rand.Read's error is discarded because as of Go 1.24 it cannot happen:
+// the function is documented as "never returns an error, and always fills b
+// entirely" — if the OS cannot supply entropy, the runtime kills the process.
+// The `_, _` is for the linter, not to paper over a possible failure.
 func generateRequestID() string {
 	var buf [8]byte
 	_, _ = rand.Read(buf[:])

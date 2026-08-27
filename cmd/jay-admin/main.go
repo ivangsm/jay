@@ -1,3 +1,8 @@
+// Command jay-admin is a CLI for jay's admin API: creating accounts and tokens,
+// issuing presigned URLs, reading metrics and inspecting quarantine.
+//
+// It authenticates with JAY_ADMIN_TOKEN, the same credential the admin listener
+// requires.
 package main
 
 import (
@@ -117,9 +122,9 @@ func envOr(key, fallback string) string {
 func doRequest(method, url, token string, body any) ([]byte, int, error) {
 	var bodyReader io.Reader
 	if body != nil {
-		// El error del marshal no se puede tragar: mandar un body vacío haría
-		// que el admin API respondiera 400 y el usuario vería un error que no
-		// tiene nada que ver con la causa real.
+		// The marshal error cannot be swallowed: sending an empty body would
+		// make the admin API answer 400, and the user would see an error with
+		// nothing to do with the real cause.
 		data, err := jsonv2.Marshal(body, jsonx.Wire)
 		if err != nil {
 			return nil, 0, fmt.Errorf("codificar request body: %w", err)
@@ -147,8 +152,8 @@ func doRequest(method, url, token string, body any) ([]byte, int, error) {
 }
 
 func prettyJSON(data []byte) {
-	// PreserveRawStrings deja los literales tal cual llegaron, que es lo que
-	// hacía json.Indent de v1: esto es un pretty-print, no una recodificación.
+	// PreserveRawStrings leaves literals exactly as they arrived, which is what
+	// v1's json.Indent did: this is a pretty-print, not a re-encode.
 	pretty, err := jsontext.AppendFormat(nil, data,
 		jsontext.WithIndent("  "), jsontext.PreserveRawStrings(true))
 	if err != nil {

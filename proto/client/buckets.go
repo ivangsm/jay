@@ -1,3 +1,8 @@
+// Package client is the Go client for jay's native binary protocol.
+//
+// It is what falco talks to. Connections are pooled and long-lived: the point of
+// the native protocol is to avoid paying HTTP's framing and header cost on every
+// object read.
 package client
 
 import (

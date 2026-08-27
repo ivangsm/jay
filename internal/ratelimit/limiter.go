@@ -116,8 +116,8 @@ func (l *Limiter) Stop() {
 	l.stopOnce.Do(func() { close(l.stopCleanup) })
 }
 
-// bucketCount informa cuántos buckets tiene vivos el limiter. Existe para que
-// los tests del loop de limpieza puedan afirmar el desalojo.
+// bucketCount reports how many buckets the limiter currently holds. It exists so
+// the cleanup loop's tests can assert that eviction actually happened.
 func (l *Limiter) bucketCount() int {
 	n := 0
 	l.buckets.Range(func(_, _ any) bool {

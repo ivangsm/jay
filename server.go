@@ -21,19 +21,19 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 		Addr:    addr,
 		Handler: handler,
 		// ReadTimeout cubre headers + body, y un PUT de 5 GiB necesita esos 5
-		// minutos. ReadHeaderTimeout acota aparte la fase de headers: sin él,
-		// un slowloris que manda un byte de header cada tanto retenía la
-		// conexión los 5 minutos completos.
+		// minutes. ReadHeaderTimeout bounds the header phase separately:
+		// without it, a slowloris dribbling one header byte at a time held the
+		// connection for the full five minutes.
 		ReadHeaderTimeout: 20 * time.Second,
 		ReadTimeout:       5 * time.Minute,
 		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20, // 1 MB
-		// Siendo S3-compatible, jay parsea cabeceras arbitrarias del cliente
-		// (`x-amz-meta-*`) y listas de `SignedHeaders`. El tope de bytes por sí
+		// Being S3-compatible, jay parses arbitrary client headers
+		// (`x-amz-meta-*`) and SignedHeaders lists. A byte cap alone
 		// solo no impide mandar decenas de miles de cabeceras diminutas, cada
-		// una con su entrada en el mapa. 500 es el default del stdlib y sobra
-		// para cualquier cliente S3 real.
+		// each with its own map entry. 500 is the stdlib default and is plenty
+		// for any real S3 client.
 		MaxHeaderValueCount: http.DefaultMaxHeaderValueCount,
 	}
 
@@ -55,24 +55,25 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 }
 
 // mountPprof cuelga net/http/pprof de mux bajo /debug/pprof/, envuelto en
-// guard. En jay el mux es el del listener admin (:4011) y el guard es la
-// autenticación por JAY_ADMIN_TOKEN: los perfiles filtran nombres de funciones
-// y layout de memoria del proceso, y /debug/pprof/profile además quema CPU a
-// pedido, así que nunca van sin autenticar.
+// guard. In jay the mux is the admin listener's (:4011) and the guard is
+// JAY_ADMIN_TOKEN authentication: profiles leak function names and the process's
+// memory layout, and /debug/pprof/profile burns CPU on demand, so they are never
+// served unauthenticated.
 //
-// Ojo: el `init()` de net/http/pprof registra los mismos handlers en el
-// http.DefaultServeMux, sin autenticación, con solo importar el paquete — no
-// hay forma de evitarlo. Eso es inofensivo mientras jay NUNCA sirva el
-// DefaultServeMux, y hoy no lo hace: startServer siempre recibe un mux
+// Note: net/http/pprof's init() registers the same handlers on
+// http.DefaultServeMux, unauthenticated, merely by being imported — there is no
+// way to prevent that. It is harmless as long as jay NEVER serves the
+// DefaultServeMux, and today it does not: startServer always receives an
+// explicit mux
 // explícito. Si algún día alguien pasa nil o http.DefaultServeMux a
 // startServer, pprof queda abierto a internet. Registrarlos a mano acá es lo
-// que mantiene la copia autenticada bajo nuestro control.
+// which keeps the authenticated copy the only reachable one.
 //
-// El perfil que motiva todo esto es /debug/pprof/goroutineleak, nuevo en Go
-// 1.27: lista las goroutines que quedaron colgadas para siempre. Dos objetivos
-// conocidos en jay — el probe de readiness de health.go deja una goroutine por
-// chequeo mientras bbolt no conteste, y el watchdog de apagado de main.go
-// abandona la suya cuando gana el time.After.
+// The profile that justifies all of this is /debug/pprof/goroutineleak, new in
+// Go 1.27: it lists goroutines that are stuck forever. Two known candidates in
+// jay — health.go's readiness probe leaves one goroutine per check for as long
+// as bbolt does not answer, and main.go's shutdown watchdog abandons its own
+// whenever the time.After wins.
 func mountPprof(mux *http.ServeMux, guard func(http.Handler) http.Handler) {
 	pprofMux := http.NewServeMux()
 	pprofMux.HandleFunc("/debug/pprof/", pprof.Index)

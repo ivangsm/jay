@@ -9,6 +9,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// Sentinel errors for token and account lookups. Distinguishing them from a
+// read failure is what lets the API answer 404 rather than 500.
 var (
 	ErrTokenNotFound   = errors.New("token not found")
 	ErrAccountNotFound = errors.New("account not found")
@@ -50,7 +52,8 @@ func (db *DB) CreateToken(t *Token) error {
 }
 
 // GetToken retrieves a token by ID and transparently decrypts SecretKey.
-// Wrapper fino sobre getRecord: lo único propio es el descifrado del secreto.
+// A thin wrapper over getRecord: decrypting the secret is the only thing it
+// adds.
 func (db *DB) GetToken(tokenID string) (*Token, error) {
 	t, err := db.getRecord[Token](bucketTokens, tokenID, ErrTokenNotFound)
 	if err != nil {
@@ -73,7 +76,7 @@ func (db *DB) ListTokens(accountID string) ([]Token, error) {
 	if err != nil {
 		return nil, err
 	}
-	// El cerado de secretos es lo único que este listado agrega sobre el núcleo.
+	// Zeroing the secrets is the only thing this listing adds over the core.
 	for i := range tokens {
 		tokens[i].SecretHash = ""
 		tokens[i].SecretKey = ""
@@ -84,6 +87,9 @@ func (db *DB) ListTokens(accountID string) ([]Token, error) {
 // TokenSeedStatus describes the outcome of CreateTokenIfNotExists.
 type TokenSeedStatus int
 
+// The three outcomes of seeding a token. Mismatch is the one that matters: it
+// means the id exists with a DIFFERENT secret, so booting would silently leave
+// the operator with credentials that do not work.
 const (
 	TokenSeedCreated  TokenSeedStatus = iota // brand new token persisted
 	TokenSeedReused                          // token existed with matching secret hash
@@ -100,8 +106,8 @@ func (db *DB) CreateAccountIfNotExists(name string) (*Account, bool, error) {
 		return nil, false, err
 	}
 	if len(matches) > 0 {
-		// Mismo criterio que antes: si hay varias con el mismo nombre, gana la
-		// última que devuelve el recorrido de bbolt (orden por clave).
+		// Same rule as before: with several of the same name, the last one
+		// bbolt's key-ordered walk returns wins.
 		return &matches[len(matches)-1], false, nil
 	}
 

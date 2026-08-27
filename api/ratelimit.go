@@ -102,6 +102,8 @@ func writeRateLimited(w http.ResponseWriter, r *http.Request, retryAfter int) {
 // is loopback or RFC1918 private — the standard "trust the proxy that
 // terminates TLS for us" arrangement. Set JAY_TRUST_PROXY_HEADERS=1 only
 // when you actually front jay with a reverse proxy you control.
+//
+//nolint:revive // trustProxyHeaders is deployment config, not a behaviour flag
 func clientIP(r *http.Request, trustProxyHeaders bool) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

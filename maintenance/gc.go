@@ -27,9 +27,9 @@ type GC struct {
 	quit     chan struct{}
 	running  atomic.Bool
 
-	// passes cuenta las pasadas completadas. Es el único observable que
-	// distingue "el loop corrió y no encontró nada" de "el loop no corrió",
-	// que es exactamente lo que hay que poder afirmar al probar el agendado.
+	// passes counts completed sweeps. It is the only observable that tells
+	// "the loop ran and found nothing" apart from "the loop did not run", which
+	// is exactly what the scheduling tests need to be able to assert.
 	passes atomic.Int64
 
 	// deleted is signalled (non-blocking send) by NotifyDeletion whenever an
@@ -94,9 +94,9 @@ func (gc *GC) loop() {
 			gc.RunOnce()
 			timer.Reset(gc.interval)
 		case <-gc.deleted:
-			// Desde Go 1.23 el canal de un Timer no tiene buffer: Stop() ya
-			// garantiza que no quede un valor viejo esperando, así que el
-			// drenado manual que había acá era un no-op.
+			// Since Go 1.23 a Timer's channel is unbuffered: Stop() already
+			// guarantees no stale value is left waiting, so the manual drain
+			// that used to be here was a no-op.
 			timer.Stop()
 			gc.RunOnce()
 			timer.Reset(gc.interval)

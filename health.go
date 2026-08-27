@@ -43,8 +43,9 @@ func (hc *HealthChecker) SetReady(v bool) {
 func (hc *HealthChecker) LivenessHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	// Un fallo al escribir la respuesta ya no es accionable: las cabeceras
-	// salieron y el probe se dará por caído solo. Y aquí no hay logger.
+	// A write failure is no longer actionable here: the headers are already out
+	// and the prober will mark the check failed on its own. There is also no
+	// logger at this point.
 	_ = jsonv2.MarshalWrite(w, map[string]string{"status": "alive"})
 }
 

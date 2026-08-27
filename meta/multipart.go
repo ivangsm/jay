@@ -12,8 +12,13 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// MaxMultipartParts caps how many parts one multipart upload may have, matching
+// the S3 limit clients already code against.
 const MaxMultipartParts = 10000
 
+// Sentinel errors for multipart uploads. An unknown upload id either never
+// existed or was already reclaimed by the GC as abandoned; the two are
+// indistinguishable to a caller, and deliberately so.
 var (
 	bucketMultipart      = []byte("multipart")
 	ErrUploadNotFound    = errors.New("upload not found")

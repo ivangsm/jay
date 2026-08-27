@@ -36,6 +36,9 @@ type Encoder struct {
 	err error
 }
 
+// NewEncoder starts an encoder that reuses buf's backing array, truncated to
+// zero length. Reusing the caller's buffer is what keeps the hot path off the
+// allocator.
 func NewEncoder(buf []byte) *Encoder {
 	return &Encoder{buf: buf[:0]}
 }
@@ -63,6 +66,7 @@ func (e *Encoder) String(s string) {
 	e.buf = appendString(e.buf, s)
 }
 
+// Int64 appends a 64-bit signed integer.
 func (e *Encoder) Int64(v int64) {
 	if e.err != nil {
 		return
@@ -70,6 +74,7 @@ func (e *Encoder) Int64(v int64) {
 	e.buf = binary.BigEndian.AppendUint64(e.buf, uint64(v))
 }
 
+// Int32 appends a 32-bit signed integer.
 func (e *Encoder) Int32(v int32) {
 	if e.err != nil {
 		return
@@ -77,6 +82,9 @@ func (e *Encoder) Int32(v int32) {
 	e.buf = binary.BigEndian.AppendUint32(e.buf, uint32(v))
 }
 
+// Bool appends a boolean as a single byte.
+//
+//nolint:revive // v is the value being encoded, not a control flag
 func (e *Encoder) Bool(v bool) {
 	if e.err != nil {
 		return
@@ -100,6 +108,7 @@ func (e *Encoder) Count(n int) {
 	e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(n))
 }
 
+// StringMap appends a string map, length-prefixed.
 func (e *Encoder) StringMap(m map[string]string) {
 	e.Count(len(m))
 	for k, v := range m {
@@ -108,6 +117,7 @@ func (e *Encoder) StringMap(m map[string]string) {
 	}
 }
 
+// Strings appends a string slice, length-prefixed.
 func (e *Encoder) Strings(ss []string) {
 	e.Count(len(ss))
 	for _, s := range ss {
@@ -115,6 +125,7 @@ func (e *Encoder) Strings(ss []string) {
 	}
 }
 
+// Ints appends an int slice, length-prefixed.
 func (e *Encoder) Ints(ii []int) {
 	e.Count(len(ii))
 	if e.err != nil {
@@ -149,10 +160,16 @@ type Decoder struct {
 	err error
 }
 
+// NewDecoder reads fields back out of an encoded buffer.
+//
+// It mirrors Encoder: the first failure is latched and every later read returns a
+// zero value, so a caller can decode a whole message and check Err once at the
+// end instead of after every field.
 func NewDecoder(buf []byte) *Decoder {
 	return &Decoder{buf: buf}
 }
 
+// Err returns the first error hit while decoding, if any.
 func (d *Decoder) Err() error { return d.err }
 
 func (d *Decoder) String() string {
@@ -174,6 +191,7 @@ func (d *Decoder) String() string {
 	return s
 }
 
+// Int64 reads a 64-bit signed integer.
 func (d *Decoder) Int64() int64 {
 	if d.err != nil {
 		return 0
@@ -187,6 +205,7 @@ func (d *Decoder) Int64() int64 {
 	return v
 }
 
+// Int32 reads a 32-bit signed integer.
 func (d *Decoder) Int32() int32 {
 	if d.err != nil {
 		return 0
@@ -200,6 +219,7 @@ func (d *Decoder) Int32() int32 {
 	return v
 }
 
+// Bool reads a boolean.
 func (d *Decoder) Bool() bool {
 	if d.err != nil {
 		return false
@@ -213,6 +233,7 @@ func (d *Decoder) Bool() bool {
 	return v
 }
 
+// StringMap reads a string map.
 func (d *Decoder) StringMap() map[string]string {
 	if d.err != nil {
 		return nil
@@ -238,6 +259,7 @@ func (d *Decoder) StringMap() map[string]string {
 	return m
 }
 
+// Strings reads a string slice.
 func (d *Decoder) Strings() []string {
 	if d.err != nil {
 		return nil
@@ -261,6 +283,7 @@ func (d *Decoder) Strings() []string {
 	return ss
 }
 
+// Ints reads an int slice.
 func (d *Decoder) Ints() []int {
 	if d.err != nil {
 		return nil

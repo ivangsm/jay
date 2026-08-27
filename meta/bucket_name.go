@@ -1,3 +1,9 @@
+// Package meta is jay's metadata layer: accounts, buckets, objects, tokens and
+// multipart uploads, all persisted in a single embedded bbolt database.
+//
+// It owns the ACID boundary. Object bytes live on disk (see package store) and
+// are only ever referenced from here by LocationRef, so metadata and data can
+// disagree after a crash — reconciling that is package recovery's job.
 package meta
 
 import (

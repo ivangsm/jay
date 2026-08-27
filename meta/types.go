@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+// Account owns buckets and tokens. It is jay's tenancy boundary: a token can
+// only ever reach the buckets of the account that issued it.
 type Account struct {
 	AccountID string    `json:"account_id"`
 	Name      string    `json:"name"`
@@ -12,22 +14,28 @@ type Account struct {
 	Status    string    `json:"status"` // "active", "suspended"
 }
 
+// Bucket is a named container of objects, owned by exactly one account.
 type Bucket struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
 	OwnerAccountID string    `json:"owner_account_id"`
 	CreatedAt      time.Time `json:"created_at"`
 	Visibility     string    `json:"visibility"` // "private", "public-read"
-	// omitzero, no omitempty: en un campo de JSON crudo las dos opciones
-	// divergen. v1 con omitempty omite el slice vacío pero escribe el literal
-	// `null`; v2 con omitempty omite el `null` — o sea, cambiaría los bytes en
-	// disco. Con omitzero los dos coinciden en los cuatro estados posibles
+	// omitzero, not omitempty: on a raw-JSON field the two diverge. v1 with
+	// omitempty omits the empty slice but writes the literal `null`; v2 with
+	// omitempty omits the `null` — which would change the bytes on disk. With
+	// omitzero the two agree across all four possible states
 	// (nil → omitido, `null` → escrito, valor → escrito, vacío-no-nil → error).
 	// Lo cubre TestJSONWireCompatV1V2.
 	PolicyJSON jsontext.Value `json:"policy_json,omitzero"`
 	Status     string         `json:"status"` // "active", "deleting"
 }
 
+// Object is one stored blob: where its bytes live, what they hash to, and the
+// metadata that came with them.
+//
+// The checksum is what makes the scrubber possible — it is compared against the
+// bytes actually on disk, so silent corruption is detectable rather than served.
 type Object struct {
 	BucketID        string            `json:"bucket_id"`
 	Key             string            `json:"key"`
@@ -43,6 +51,9 @@ type Object struct {
 	MetadataHeaders map[string]string `json:"metadata_headers,omitempty"`
 }
 
+// Token is a credential issued to an account. SecretKey is never stored in the
+// clear: it is encrypted at rest with the signing secret, so a leaked bbolt file
+// does not hand over working credentials.
 type Token struct {
 	TokenID        string     `json:"token_id"`
 	AccountID      string     `json:"account_id"`

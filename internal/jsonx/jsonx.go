@@ -1,3 +1,20 @@
+// Package jsonx holds this service's encoding/json/v2 option profiles.
+//
+// Which options a boundary uses is not a style choice, so they live in exactly
+// one place:
+//
+//   - Wire     — data that is persisted or published. Emits byte-for-byte what
+//     encoding/json v1 emitted; changing it is a data-format change.
+//   - Lenient  — reading data written by older versions, or by third parties.
+//     Accepts broken UTF-8 and duplicate keys rather than making an
+//     existing file unreadable.
+//   - Strict   — bodies of our own APIs. Rejects unknown fields, so a misspelt
+//     key is a 400 instead of a silently ignored value.
+//
+// This file is MIRRORED byte-for-byte across owl, auk, falco, jay and magpie.
+// The duplication is deliberate: falco and jay are independent public repos, and
+// a shared module would tie them to this monorepo. Any change here has to be
+// applied to all five copies.
 package jsonx
 
 import (

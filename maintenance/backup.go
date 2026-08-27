@@ -1,3 +1,8 @@
+// Package maintenance holds jay's background jobs: integrity scrubbing, garbage
+// collection, verified backups and the metrics they feed.
+//
+// All of them are best-effort and none may block serving traffic — but they
+// report what they could not do rather than failing quietly.
 package maintenance
 
 import (

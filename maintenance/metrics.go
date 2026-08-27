@@ -24,10 +24,10 @@ type Metrics struct {
 
 	ObjectsQuarantined atomic.Int64
 
-	// MetadataDecodeFailures cuenta los registros de bbolt que no
-	// deserializaron y por eso se omitieron de un listado. Un jay.db que se
-	// degrada tiene que ser visible: sin este contador la única señal era una
-	// lista a la que le faltaban filas, sin nada que lo dijera.
+	// MetadataDecodeFailures counts bbolt records that failed to decode and were
+	// therefore skipped from a listing. A jay.db that is degrading has to be
+	// visible: without this counter the only signal was a listing with rows
+	// missing and nothing to say so.
 	MetadataDecodeFailures atomic.Int64
 
 	BytesUploaded   atomic.Int64
@@ -48,9 +48,9 @@ func (m *Metrics) RecordFsyncFailure() {
 	m.FsyncFailures.Add(1)
 }
 
-// RecordMetadataDecodeFailure incrementa el contador de registros de metadata
-// ilegibles. Nil-safe: se engancha a meta.DB.SetDecodeFailureHook, que puede
-// estar activo en fixtures sin métricas.
+// RecordMetadataDecodeFailure bumps the unreadable-metadata counter. Nil-safe:
+// it is wired into meta.DB.SetDecodeFailureHook, which can be active in fixtures
+// that have no metrics.
 func (m *Metrics) RecordMetadataDecodeFailure() {
 	if m == nil {
 		return

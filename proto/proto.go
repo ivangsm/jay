@@ -6,7 +6,8 @@ const (
 	// Magic bytes: "JAY\0"
 	Magic uint32 = 0x4A415900
 
-	// Protocol version
+	// Version is the protocol version carried in every frame. A peer that does
+	// not recognise it is refused rather than guessed at.
 	Version byte = 0x01
 
 	// HeaderSize is the fixed size of a request/response frame header.

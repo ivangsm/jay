@@ -15,6 +15,8 @@ import (
 // MaxBucketsPerAccount is the maximum number of buckets a single account may own.
 const MaxBucketsPerAccount = 1000
 
+// Sentinel errors for bucket operations. Callers branch on them with errors.Is,
+// and the S3 layer maps each to its own status code.
 var (
 	ErrBucketExists        = errors.New("bucket already exists")
 	ErrBucketNotFound      = errors.New("bucket not found")
@@ -187,10 +189,10 @@ func (db *DB) GetBucket(name string) (*Bucket, error) {
 
 // GetBucketByID retrieves a bucket by its ID.
 //
-// Wrapper fino sobre getRecordTx: lo propio es el salto por el índice inverso
-// id→nombre, y las dos lecturas tienen que ir en la MISMA transacción (con dos
-// transacciones separadas, un DeleteBucket concurrente entre ambas dejaría el
-// índice y el registro en desacuerdo).
+// A thin wrapper over getRecordTx: what it adds is the hop through the id→name
+// reverse index, and both reads have to happen in the SAME transaction. Split
+// across two, a concurrent DeleteBucket landing between them would leave the
+// index and the record disagreeing.
 func (db *DB) GetBucketByID(id string) (*Bucket, error) {
 	var out *Bucket
 	err := db.bolt.View(func(tx *bolt.Tx) error {
@@ -374,9 +376,9 @@ func (db *DB) RebuildAllBucketStatsIfMissing() error {
 
 // UpdateBucketPolicy updates the policy JSON for a bucket.
 //
-// Una política no-nil tiene que ser JSON sintácticamente válido. Antes, un
-// policy vacío-no-nil se persistía en silencio como "sin política" y la
-// llamada devolvía éxito; ahora se rechaza en la frontera, que es donde el
+// A non-nil policy has to be syntactically valid JSON. An empty-but-non-nil
+// policy used to be persisted silently as "no policy" while the call returned
+// success; now it is rejected at the boundary, which is where the
 // error es atribuible a quien lo mandó.
 func (db *DB) UpdateBucketPolicy(name string, policy jsontext.Value) error {
 	if policy != nil && !policy.IsValid() {

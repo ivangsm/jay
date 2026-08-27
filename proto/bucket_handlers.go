@@ -1,3 +1,9 @@
+// Package proto implements jay's native binary TCP protocol and its Go client.
+//
+// It exists alongside the S3-compatible HTTP API because a Go caller in the same
+// datacentre pays for HTTP's framing, header parsing and XML for nothing. The
+// native protocol is length-prefixed binary over a persistent connection, and
+// falco is its only consumer in this stack.
 package proto
 
 import (

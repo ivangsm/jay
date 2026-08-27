@@ -10,22 +10,22 @@ import (
 	"github.com/ivangsm/jay/internal/jsonx"
 )
 
-// Este archivo concentra el CRUD de los registros JSON de bbolt (cuentas,
-// tokens, buckets, multipart). Antes había ~15 métodos byte por byte iguales
-// salvo el tipo y el bbolt bucket; ahora hay un solo núcleo.
+// This file holds the CRUD core for bbolt's JSON records: accounts, tokens,
+// buckets, multipart uploads. There used to be roughly fifteen methods that were
+// byte-for-byte identical apart from the type and the bbolt bucket; now there is
+// one core.
 //
-// Los métodos con parámetros de tipo propios (`func (db *DB) getRecord[T any]`)
-// son legales desde Go 1.27. El par `*Tx` de más abajo existe para los casos
-// que necesitan hacer varias lecturas dentro de la MISMA transacción —
-// GetBucketByID, por ejemplo, resuelve el índice inverso id→nombre y después
-// lee el registro, y separar eso en dos transacciones perdería atomicidad.
+// The *Tx variants below exist for the cases that need several reads inside the
+// SAME transaction — GetBucketByID, for instance, resolves the id→name reverse
+// index and then reads the record, and splitting that across two transactions
+// would lose atomicity.
 
-// SetDecodeFailureHook registra un callback que se dispara cada vez que un
-// registro de metadata no deserializa. El wiring de main.go lo apunta al
+// SetDecodeFailureHook registers a callback fired whenever a metadata record
+// fails to decode. main.go's wiring points it at the
 // contador MetadataDecodeFailures de maintenance.Metrics.
 //
-// meta no puede importar maintenance (maintenance ya importa meta), así que la
-// dependencia se invierte con un hook, igual que tokenInvalidateHook.
+// meta cannot import maintenance — maintenance already imports meta — so the
+// dependency is inverted with a hook, exactly like tokenInvalidateHook.
 // Pasar nil lo limpia.
 func (db *DB) SetDecodeFailureHook(fn func(bucket, key string)) {
 	db.hookMu.Lock()
@@ -35,11 +35,11 @@ func (db *DB) SetDecodeFailureHook(fn func(bucket, key string)) {
 
 // reportDecodeFailure deja constancia de un registro ilegible.
 //
-// El registro corrupto se omite (una sola fila podrida no puede tumbar el
-// listado entero), pero NO en silencio: se loguea a nivel error con la clave y
+// A corrupt record is skipped — one rotten row must not take down a whole
+// listing — but NOT silently: it is logged at error level with the key and
 // se incrementa un contador expuesto en /metrics. Un jay.db degradándose tiene
-// que ser visible; antes esto era un `return nil` pelado que devolvía una lista
-// "exitosa" a la que le faltaban filas.
+// has to be visible. This used to be a bare `return nil` that handed back a
+// "successful" listing with rows missing from it.
 func (db *DB) reportDecodeFailure(bucket []byte, key string, err error) {
 	slog.Error("meta: registro de metadata ilegible, se omite",
 		"bucket", string(bucket), "key", key, "err", err)
@@ -51,8 +51,8 @@ func (db *DB) reportDecodeFailure(bucket []byte, key string, err error) {
 	}
 }
 
-// getRecordTx lee y deserializa un registro dentro de una transacción abierta.
-// Devuelve notFound si la clave no existe.
+// getRecordTx reads and decodes a record inside an open transaction. Returns
+// notFound when the key does not exist.
 func getRecordTx[T any](tx *bolt.Tx, bucket, key []byte, notFound error) (*T, error) {
 	bk := tx.Bucket(bucket)
 	if bk == nil {
@@ -69,7 +69,7 @@ func getRecordTx[T any](tx *bolt.Tx, bucket, key []byte, notFound error) (*T, er
 	return &v, nil
 }
 
-// putRecordTx serializa y escribe un registro dentro de una transacción abierta.
+// putRecordTx encodes and writes a record inside an open transaction.
 func putRecordTx[T any](tx *bolt.Tx, bucket, key []byte, v *T) error {
 	bk := tx.Bucket(bucket)
 	if bk == nil {
@@ -106,9 +106,9 @@ func (db *DB) putRecord[T any](bucket []byte, key string, v *T) error {
 	})
 }
 
-// listRecords recorre un bbolt bucket entero y devuelve los registros que keep
-// acepta (keep nil = todos). Los registros ilegibles se omiten y se reportan
-// vía reportDecodeFailure; ver el comentario de esa función.
+// listRecords walks a whole bbolt bucket and returns the records keep accepts —
+// a nil keep means all of them. Unreadable records are skipped and reported via
+// reportDecodeFailure; see that function's comment.
 func (db *DB) listRecords[T any](bucket []byte, keep func(*T) bool) ([]T, error) {
 	var out []T
 	err := db.bolt.View(func(tx *bolt.Tx) error {
@@ -131,9 +131,9 @@ func (db *DB) listRecords[T any](bucket []byte, keep func(*T) bool) ([]T, error)
 	return out, err
 }
 
-// updateRecord aplica un read-modify-write sobre un registro en una sola
-// transacción de escritura. mutate recibe el registro ya deserializado y puede
-// abortar devolviendo un error (que se propaga y revierte la transacción).
+// updateRecord applies a read-modify-write to a record in a single write
+// transaction. mutate receives the decoded record and can abort by returning an
+// error, which propagates and rolls the transaction back.
 func (db *DB) updateRecord[T any](bucket []byte, key string, notFound error, mutate func(*T) error) error {
 	return db.bolt.Update(func(tx *bolt.Tx) error {
 		rec, err := getRecordTx[T](tx, bucket, []byte(key), notFound)

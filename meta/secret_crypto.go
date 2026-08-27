@@ -156,13 +156,13 @@ func (db *DB) MigrateTokenSecrets() (migrated int, err error) {
 	})
 }
 
-// resecretTokens es el núcleo compartido de RekeyTokens y MigrateTokenSecrets:
-// escanea el bucket de tokens en una transacción de lectura, deja que rewrite
-// decida cuáles tocar y cómo, y escribe todos los afectados en UNA sola
+// resecretTokens is the shared core of RekeyTokens and MigrateTokenSecrets: it
+// scans the token bucket in a read transaction, lets rewrite decide which ones to
+// touch and how, and writes every affected one back in a SINGLE
 // transacción de escritura (todo o nada).
 //
-// El escaneo va en su propia transacción a propósito: re-cifrar es trabajo de
-// CPU (AES-GCM por token) y no queremos tener tomada la escritura mientras
+// The scan gets its own transaction on purpose: re-encrypting is CPU work —
+// AES-GCM per token — and holding the write transaction while
 // tanto.
 func (db *DB) resecretTokens(rewrite func(*Token) (bool, error)) (int, error) {
 	type pending struct {

@@ -1,3 +1,8 @@
+// Package admin implements jay's management plane: accounts, tokens, presigned
+// URLs, metrics and quarantine inspection.
+//
+// It is served on its own listener (JAY_ADMIN_ADDR) and gated by
+// JAY_ADMIN_TOKEN. Nothing here should ever be reachable from the internet.
 package admin
 
 import (
@@ -69,9 +74,9 @@ type AdminConfig struct {
 
 // NewHandler creates a new admin API handler.
 func NewHandler(cfg AdminConfig) *Handler {
-	// Sin logger, el primer request no autorizado hacía nil-deref en
-	// authenticateAdmin: o sea, el handler reventaba justo en la ruta de fallo,
-	// que es la única que nadie ejercita antes de producción.
+	// Without a logger, the first unauthorised request nil-dereferenced inside
+	// authenticateAdmin — the handler blew up on exactly the path nobody
+	// exercises before production.
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
@@ -555,13 +560,13 @@ func (h *Handler) handlePurge(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, `{"error":"specify bucket_id+key for single purge, or mode=all for purge all"}`, http.StatusBadRequest)
 }
 
-// RequireAdmin envuelve un handler con la misma autenticación que usa el
-// admin API (Bearer JAY_ADMIN_TOKEN, con el mismo backoff por IP ante fallos).
+// RequireAdmin wraps a handler in the same authentication the admin API uses:
+// Bearer JAY_ADMIN_TOKEN, with the same per-IP backoff on failure.
 //
-// Existe para montar `net/http/pprof` en el listener admin sin exponerlo: los
-// perfiles de pprof filtran nombres de funciones, argumentos en los stacks y
-// el layout de memoria del proceso, y `/debug/pprof/profile` además consume
-// CPU a pedido. Nunca los pongas detrás de nada más laxo que esto.
+// It exists so net/http/pprof can be mounted on the admin listener without
+// exposing it: pprof profiles leak function names, stack arguments and the
+// process's memory layout, and /debug/pprof/profile burns CPU on demand. Never
+// put them behind anything looser than this.
 func (h *Handler) RequireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !h.authenticateAdmin(r) {

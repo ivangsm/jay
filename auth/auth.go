@@ -1,3 +1,10 @@
+// Package auth validates jay's credentials: bearer tokens and real SigV4
+// signatures, plus per-action, per-bucket and per-prefix scoping.
+//
+// SigV4 verification recomputes the body hash rather than trusting the one the
+// client declared, so an altered body does not pass. That is why signed requests
+// carrying a payload hash are size-capped: the body has to be buffered to be
+// hashed.
 package auth
 
 import (
@@ -16,6 +23,10 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// Sentinel errors for authentication.
+//
+// They are deliberately NOT distinguished in the HTTP response: telling a caller
+// whether a token exists, is expired or was revoked is itself an oracle.
 var (
 	ErrNoCredentials      = errors.New("no credentials provided")
 	ErrInvalidCredentials = errors.New("invalid credentials")
@@ -342,11 +353,11 @@ func (a *Auth) AuthorizeWithPolicy(token *meta.Token, action, bucketName, object
 		return nil
 	}
 
-	// Lenient, no los defaults de v2: la política la escribe un humano y v1
-	// hacía matching de nombres case-insensitive. Con los defaults de v2 (case
-	// sensitive) una política escrita al estilo AWS ("Effect"/"Statements")
-	// dejaría de parsearse y el statement Deny desaparecería en silencio —
-	// abriendo acceso donde antes se negaba. Lenient conserva el matching de v1.
+	// Lenient rather than v2's defaults: bucket policies are written by hand,
+	// and v1 matched field names case-insensitively. Under v2's case-sensitive
+	// defaults an AWS-style policy ("Effect"/"Statements") would stop parsing
+	// and its Deny statement would vanish silently — opening access where it
+	// used to be refused. Lenient preserves v1's matching.
 	var policy BucketPolicy
 	if err := jsonv2.Unmarshal(policyJSON, &policy, jsonx.Lenient); err != nil {
 		// Malformed policy should not silently grant access.
