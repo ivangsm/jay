@@ -39,8 +39,8 @@ func TestWireMatchesV1(t *testing.T) {
 		} `json:"anidado"`
 	}
 
-	texto := "valor"
-	casos := []todo{
+	text := "valor"
+	cases := []todo{
 		{}, // valor cero: cubre FormatNilSliceAsNull y FormatNilMapAsNull
 		{
 			SliceNil:   nil,
@@ -58,11 +58,11 @@ func TestWireMatchesV1(t *testing.T) {
 			Numero:  -0.5,
 			Bandera: true,
 			Momento: time.Date(2026, 8, 21, 15, 4, 5, 123456789, time.UTC),
-			Puntero: &texto,
+			Puntero: &text,
 		},
 	}
 
-	for i, c := range casos {
+	for i, c := range cases {
 		v1b, err := jsonv1.Marshal(c)
 		if err != nil {
 			t.Fatalf("caso %d: v1 Marshal: %v", i, err)
@@ -77,10 +77,10 @@ func TestWireMatchesV1(t *testing.T) {
 	}
 }
 
-// TestStrictRechazaCamposDesconocidos fija lo que Strict promete: en los bodies
+// TestStrictRejectsUnknownFields fija lo que Strict promete: en los bodies
 // de nuestras propias APIs un campo que no reconocemos es un bug del cliente,
 // no algo para ignorar en silencio.
-func TestStrictRechazaCamposDesconocidos(t *testing.T) {
+func TestStrictRejectsUnknownFields(t *testing.T) {
 	type req struct {
 		Nombre string `json:"nombre"`
 	}
@@ -102,7 +102,7 @@ func TestStrictRechazaCamposDesconocidos(t *testing.T) {
 // nombres CASE-INSENSITIVE. Con los defaults de v2 una política escrita al
 // estilo AWS ("Effect") dejaría de parsearse y su Deny desaparecería en
 // silencio — que en jay significa dar acceso donde antes se negaba.
-func TestLenientAceptaLoQueV1AceptabaSinChistar(t *testing.T) {
+func TestLenientAcceptsWhatV1AcceptedSilently(t *testing.T) {
 	type statement struct {
 		Effect string `json:"effect"`
 	}
