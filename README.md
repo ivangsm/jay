@@ -13,16 +13,16 @@ Jay provides dual API access: a fully S3-compatible HTTP API and a high-performa
 
 ## Features
 
-- **S3-compatible HTTP API** -- works with AWS CLI, SDKs, and any S3 client
+- **S3-compatible HTTP API** -- the AWS CLI and the AWS SDKs work end to end. Clients that upload with SigV4 *streaming* signatures (`aws-chunked` framing) are refused with `501 NotImplemented` on the upload only, see [aws-chunked uploads](#aws-chunked-streaming-uploads-are-not-supported)
 - **Native binary protocol** -- efficient Go client with connection pooling
 - **Built-in CLI** -- `jay cp/ls/rm/sync` over the native protocol, no aws-cli needed
-- **Multipart uploads** -- S3-compatible chunked uploads up to 10,000 parts
-- **Presigned URLs** -- time-limited delegated access via HMAC-SHA256
+- **Multipart uploads** -- S3-compatible, up to 10,000 parts (this is `CreateMultipartUpload`/`UploadPart`, not the `aws-chunked` body framing below)
+- **Presigned URLs** -- two forms: standard SigV4 query-string URLs that boto3, the AWS SDKs, minio-go and `aws s3 presign` produce, plus Jay's own `X-Jay-*` HMAC form
 - **Range requests** -- partial object reads (`bytes=0-499`, suffix, open-ended)
 - **CopyObject** -- server-side copy between buckets
 - **Bucket policies** -- prefix-based allow/deny rules with IP conditions
 - **Token authentication** -- scoped by actions, buckets, and key prefixes
-- **AWS SigV4** -- HMAC-validated mode for AWS CLI compatibility
+- **AWS SigV4** -- both the `Authorization` header form and the query-string (presigned URL) form
 - **Integrity scrubbing** -- incremental SHA-256 verification (cursor-based, resumes across ticks)
 - **Quarantine** -- automatic isolation of corrupted objects
 - **Rate limiting** -- per-token token bucket with configurable rate/burst
@@ -317,7 +317,9 @@ curl -X POST http://localhost:9001/_jay/tokens \
 Authorization: Bearer <token_id>:<secret>
 ```
 
-**AWS SigV4:** Use `token_id` as the access key and the token secret as the secret key. Jay validates the request timestamp and verifies the SigV4 HMAC signature.
+**AWS SigV4:** Use `token_id` as the access key and the token secret as the secret key. Jay validates the request timestamp and verifies the SigV4 HMAC signature. Both SigV4 forms work: the `Authorization` header and the query-string form used by presigned URLs (see [Presigned URLs](#presigned-urls)).
+
+The region is not configured server-side. Jay reads it back out of `X-Amz-Credential`, so any region works as long as the client signs and sends the same one; `us-east-1` is a safe default.
 
 ### Token Scoping
 
@@ -345,7 +347,9 @@ Available actions: `bucket:list`, `bucket:read-meta`, `bucket:write-meta`, `obje
 | CreateBucket | `PUT /<bucket>` | |
 | HeadBucket | `HEAD /<bucket>` | |
 | DeleteBucket | `DELETE /<bucket>` | |
+| GetBucketLocation | `GET /<bucket>?location` | Always the empty `<LocationConstraint/>` (us-east-1) |
 | ListObjectsV2 | `GET /<bucket>?list-type=2` | |
+| DeleteObjects | `POST /<bucket>?delete` | Batch delete, up to 1000 keys |
 | PutObject | `PUT /<bucket>/<key>` | |
 | GetObject | `GET /<bucket>/<key>` | |
 | HeadObject | `HEAD /<bucket>/<key>` | |
@@ -356,6 +360,98 @@ Available actions: `bucket:list`, `bucket:read-meta`, `bucket:write-meta`, `obje
 | CompleteMultipartUpload | `POST /<bucket>/<key>?uploadId=X` | |
 | AbortMultipartUpload | `DELETE /<bucket>/<key>?uploadId=X` | |
 | ListParts | `GET /<bucket>/<key>?uploadId=X` | |
+| ListMultipartUploads | `GET /<bucket>?uploads` | `prefix`, `delimiter`, `key-marker`, `upload-id-marker`, `max-uploads`, `encoding-type` |
+
+Everything else S3 defines — versioning, ACL, tagging, lifecycle, CORS, policy,
+encryption, object lock, `GetObjectAttributes`, `SelectObjectContent` — answers
+**501 Not Implemented**, never a misleading 200.
+
+#### `aws-chunked` streaming uploads are not supported
+
+SigV4 has a streaming mode: the client declares
+`x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (or one of the
+`STREAMING-*-TRAILER` variants) and sends the body wrapped in `aws-chunked`
+framing — `<hex-size>;chunk-signature=<sig>\r\n<data>\r\n`, repeated until a
+zero-length chunk. `Content-Length` then counts the framing and the real length
+travels in `x-amz-decoded-content-length`.
+
+**Jay has no decoder for that framing, so it refuses the mode**: any request
+carrying it answers `501 NotImplemented` and writes nothing — no object, no
+metadata, no temp file. The refusal happens before authentication, so it costs
+the same on every entry point that takes a body (`PutObject`, `UploadPart`,
+`CompleteMultipartUpload`, `DeleteObjects`, `CreateBucket`) and under every
+credential form (Bearer, SigV4 header, both presigned styles). All three
+announcements are treated as framing, because a client may send any of them:
+`x-amz-content-sha256: STREAMING-*`, `x-amz-decoded-content-length`, and
+`Content-Encoding: aws-chunked`.
+
+Refusing is not the ideal answer; it is the honest one. Jay used to *recognise*
+the mode — SigV4 skipped the payload check for `STREAMING-*` — and then store
+the body verbatim. A 15-byte file uploaded with `mc` became a 187-byte object
+whose content began `f;chunk-signature=…`, answered `200`, and carried an ETag
+and a SHA-256 computed over the corrupted bytes. Nothing could detect it
+afterwards: the scrubber verified the object against its own bad digest and
+reported it healthy forever.
+
+What this means per client:
+
+| Client | Status |
+|---|---|
+| **AWS CLI** (`aws s3` / `aws s3api`), AWS SDKs, boto3 | Fully working, up and down, single-part and multipart. They send a real payload hash |
+| **minio-go** and everything built on it — `mc`, `warp` | **Uploads fail** with `501`: minio-go frames every `PutObject` and `UploadPart` by default. Downloads, listings, `stat` and deletes work normally |
+| **Presigned URLs** (both styles) | Working. A presigned `PUT` that adds the framing is refused like any other |
+| **Jay's own CLI and native protocol** | Unaffected — the native protocol has no SigV4 and no framing |
+
+Implementing the decoder (and verifying the chained chunk signatures) is
+tracked separately; until it lands, the mode stays refused rather than silently
+accepted.
+
+#### Checksums
+
+Every object carries a SHA-256 digest, computed while the bytes are written.
+`PutObject`, `GetObject` and `HeadObject` return it as `x-amz-checksum-sha256`,
+**base64 of the raw digest**, which is what S3 defines and what the AWS CLI
+verifies on every download. Internally the digest is kept hex-encoded — that is
+what the scrubber compares, what the native protocol carries and what
+`jay ls -l` prints; base64 exists only on the HTTP edge.
+
+A ranged `GET` (`206 Partial Content`) carries **no** checksum header. The
+digest covers the whole object, so a client verifying it against a slice would
+reject a perfectly good transfer — which is every download the AWS CLI splits
+above its 8 MiB threshold.
+
+#### DeleteObjects
+
+Every key of the request comes back in `<Deleted>` or in `<Error>`, never
+omitted: a key that could not be deleted has to be visible to the caller, or a
+partial delete reads as a success. `<Quiet>true</Quiet>` suppresses the
+successes only — the errors are always reported.
+
+The token's actions, bucket scope and prefix scope, and the bucket policy, are
+evaluated **per key**. A key outside the caller's reach is an `<Error>` with
+`AccessDenied`, not a delete.
+
+Request-level limits, each of which refuses the whole batch rather than applying
+part of it:
+
+| Limit | Behaviour |
+|---|---|
+| More than 1000 keys | `400 MalformedXML` |
+| Body over 4 MiB | `400 MaxMessageLengthExceeded` |
+| Malformed or empty `<Delete>` | `400 MalformedXML` |
+| `<VersionId>` on an entry | Per-key `<Error>` with `NotImplemented` — jay has no versioning, and deleting the live object instead would not be the operation asked for |
+
+`Content-MD5` is **verified when sent, and not required**. SigV4 already covers
+the body through `x-amz-content-sha256`, and the bearer and presigned paths
+cannot produce the header, so demanding it would reject working clients; a
+header that does not match the body answers `400 BadDigest`.
+
+#### ListMultipartUploads
+
+Scoped to the caller's account and to the token's prefix scope: an upload id
+from another account is unusable to this token anyway (every part, complete and
+abort authorizes against the initiator), so listing it would only disclose
+object keys.
 
 ### AWS CLI Usage
 
@@ -371,6 +467,14 @@ aws --endpoint-url http://localhost:9000 s3 cp file.txt s3://mybucket/
 aws --endpoint-url http://localhost:9000 s3 ls s3://mybucket/
 aws --endpoint-url http://localhost:9000 s3 cp s3://mybucket/file.txt ./downloaded.txt
 aws --endpoint-url http://localhost:9000 s3 sync ./local-dir s3://mybucket/prefix/
+aws --endpoint-url http://localhost:9000 s3 rm --recursive s3://mybucket/prefix/
+aws --endpoint-url http://localhost:9000 s3 rb --force s3://mybucket
+
+# Batch delete and the bucket-level multipart listing
+aws --endpoint-url http://localhost:9000 s3api delete-objects --bucket mybucket \
+    --delete 'Objects=[{Key=a.txt},{Key=b.txt}]'
+aws --endpoint-url http://localhost:9000 s3api list-multipart-uploads --bucket mybucket
+aws --endpoint-url http://localhost:9000 s3api get-bucket-location --bucket mybucket
 ```
 
 ## Native Protocol
@@ -443,13 +547,61 @@ jay-admin list-tokens
 jay-admin revoke-token -id TOKEN_ID
 jay-admin metrics
 jay-admin presign -bucket mybucket -key file.txt -token-id TOKEN_ID
+jay-admin presign -bucket mybucket -key file.txt -token-id TOKEN_ID -style aws -host s3.example.com
 jay-admin quarantine-list
 jay-admin quarantine-purge
 ```
 
 ## Presigned URLs
 
-Generate time-limited URLs via the admin API:
+A presigned URL grants one operation on one key for a limited time, with no
+authorization header. Jay accepts two forms.
+
+### SigV4 (standard)
+
+Anything that speaks S3 can mint one — boto3's `generate_presigned_url`,
+`aws s3 presign`, minio-go's `PresignedGetObject`, the AWS SDK presigners —
+using `token_id` as the access key and the token secret as the secret key. Jay
+verifies `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+`X-Amz-SignedHeaders` and `X-Amz-Signature` against the same canonical request
+it uses for header authentication.
+
+```python
+import boto3
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://localhost:9000",
+    aws_access_key_id="TOKEN_ID",
+    aws_secret_access_key="TOKEN_SECRET",
+    region_name="us-east-1",
+)
+url = s3.generate_presigned_url(
+    "get_object",
+    Params={"Bucket": "mybucket", "Key": "secret-file.txt"},
+    ExpiresIn=3600,
+)
+```
+
+Rules Jay enforces on every such URL:
+
+- `X-Amz-Expires` is mandatory and capped at 7 days, AWS's own limit. There is
+  no such thing as a presigned URL without a deadline.
+- `X-Amz-Date` must be within 15 minutes of server time in the future, and the
+  URL is dead once signing time + `X-Amz-Expires` has passed.
+- `host` must be among the `SignedHeaders`, so a URL minted for one endpoint
+  cannot be replayed against another.
+- The signature covers the method, the path and every query parameter except
+  `X-Amz-Signature` itself.
+- The URL can never do more than the token that signed it: actions, bucket
+  scope, prefix scope and bucket policies are all still applied.
+
+### Jay's own form
+
+`X-Jay-Token`, `X-Jay-Expires` and `X-Jay-Signature`, HMAC'd with
+`JAY_SIGNING_SECRET`. It predates SigV4 support and is still the default of the
+admin endpoint.
+
+### Minting one from the admin API
 
 ```bash
 curl -X POST http://localhost:9001/_jay/presign \
@@ -460,11 +612,22 @@ curl -X POST http://localhost:9001/_jay/presign \
     "method": "GET",
     "bucket": "mybucket",
     "key": "secret-file.txt",
-    "expires_seconds": 3600
+    "expires_seconds": 3600,
+    "style": "aws",
+    "host": "s3.example.com"
   }'
+# {"url": "http://s3.example.com/mybucket/secret-file.txt?X-Amz-Algorithm=...", "style": "aws"}
 ```
 
-The returned URL contains `X-Jay-Token`, `X-Jay-Expires`, and `X-Jay-Signature` query parameters and can be used without any authorization header.
+| Field | Default | Notes |
+|-------|---------|-------|
+| `style` | `"jay"` | `"aws"` emits SigV4; `"jay"` emits `X-Jay-*` |
+| `host` | `JAY_LISTEN_ADDR` | Required for `"aws"` when the listen address has no hostname (`:9000`), because the SigV4 signature covers the host |
+| `region` | `"us-east-1"` | `"aws"` only |
+| `expires_seconds` | `3600` | A number, not a string; capped at 604800 (7 days) |
+
+`style` defaults to `"jay"` so existing callers keep getting what they got
+before. New integrations should ask for `"aws"`.
 
 ## Bucket Policies
 
@@ -494,6 +657,35 @@ Set JSON policies on buckets to control access by token, prefix, and IP:
 ```
 
 Deny statements always take precedence over allow.
+
+### Who a policy applies to
+
+A token can only reach the buckets of the account that issued it. That is the
+default and it holds for **every** operation — objects, listings, multipart and
+bucket metadata alike — no matter how wide the token's actions or how empty its
+scopes. A bucket that says nothing about a stranger says no.
+
+Three things open a bucket to an account that does not own it, and nothing else:
+
+| | What it grants |
+|---|---|
+| `bucket_scope` on the token | Everything the token's actions allow, on the named buckets. Set through the admin API, so it is the operator delegating, not the bucket |
+| `visibility: public-read` | `object:get` and `object:list`, to anyone — including callers with no credentials at all. Never writes |
+| An `allow` statement in the bucket policy | Exactly the actions, prefixes and IP ranges the statement names, to the subjects it names |
+
+An `allow` statement only ever **grants**. It cannot narrow what the owner may
+do, and it cannot widen what the caller's token was issued for: the token's own
+actions, bucket scope and prefix scope are checked first and a policy never
+overrides them. A `deny` is evaluated after the grant and wins over it.
+
+> An allow with `"actions": ["*"]` and `"subjects": ["*"]` and no `prefixes`
+> hands the whole bucket to every authenticated token of every account,
+> `DeleteBucket` included. Name the actions and the prefixes.
+
+**There is no endpoint that installs a policy yet.** `PutBucketPolicy` answers
+501 and the admin API has no route for it, so a policy can only be put in place
+by writing the bucket record directly. The evaluation described here is real and
+tested; the way to configure it is not built.
 
 ## Monitoring
 
