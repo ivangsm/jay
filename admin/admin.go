@@ -10,7 +10,6 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -429,18 +428,31 @@ type presignRequest struct {
 	Bucket         string `json:"bucket"`
 	Key            string `json:"key"`
 	ExpiresSeconds int    `json:"expires_seconds"`
+	// Style selects the signature form: "jay" (default) or "aws".
+	Style string `json:"style"`
+	// Host overrides the host baked into the URL. Required for the aws style
+	// whenever JAY_LISTEN_ADDR carries no hostname, because the SigV4
+	// signature covers it.
+	Host string `json:"host"`
+	// Region is the SigV4 credential-scope region; aws style only.
+	Region string `json:"region"`
 }
 
 type presignResponse struct {
 	URL string `json:"url"`
+	// Style echoes which form was emitted, so a caller can tell without
+	// parsing the URL — and so the day the default changes is visible.
+	Style string `json:"style"`
 }
 
+// handlePresign mints a presigned URL in one of two forms.
+//
+// The default is "jay", not "aws": `jay-admin presign` and falco already
+// consume the X-Jay-* form, and flipping the default would change what they get
+// without them asking. AWS-style presigning is opt-in until it has run in
+// production long enough to be the safe default, which is exactly what
+// PND-0161 deferred with "default aws cuando se estabilice".
 func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
-	if h.signingSecret == "" {
-		http.Error(w, `{"error":"signing secret not configured"}`, http.StatusBadRequest)
-		return
-	}
-
 	var req presignRequest
 	if err := jsonv2.UnmarshalRead(r.Body, &req, jsonx.Strict); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -452,32 +464,98 @@ func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	style := strings.ToLower(strings.TrimSpace(req.Style))
+	if style == "" {
+		style = presignStyleJay
+	}
+	if style != presignStyleJay && style != presignStyleAWS {
+		http.Error(w, `{"error":"style must be \"jay\" or \"aws\""}`, http.StatusBadRequest)
+		return
+	}
+
+	// The jay form is HMAC'd with the server signing secret; the aws form is
+	// HMAC'd with the token's own secret and needs no server secret at all.
+	if style == presignStyleJay && h.signingSecret == "" {
+		http.Error(w, `{"error":"signing secret not configured"}`, http.StatusBadRequest)
+		return
+	}
+
 	if req.ExpiresSeconds <= 0 {
 		req.ExpiresSeconds = 3600
 	}
+	expires := time.Duration(req.ExpiresSeconds) * time.Second
 
-	// Verify token exists
-	if _, err := h.db.GetToken(req.TokenID); err != nil {
+	token, err := h.db.GetToken(req.TokenID)
+	if err != nil {
 		http.Error(w, `{"error":"token not found"}`, http.StatusBadRequest)
 		return
 	}
+	// A URL signed by a revoked or expired token is rejected the moment anyone
+	// uses it, so handing one out with a 200 would be a confirmation with
+	// nothing behind it.
+	if token.Status != "active" {
+		writeJSONError(w, http.StatusBadRequest, "token is not active")
+		return
+	}
+	if token.ExpiresAt != nil && time.Now().After(*token.ExpiresAt) {
+		writeJSONError(w, http.StatusBadRequest, "token has expired")
+		return
+	}
+
+	host := resolvePresignHost(req.Host, h.listenAddr)
 
 	path := "/" + req.Bucket
 	if req.Key != "" {
 		path += "/" + req.Key
 	}
 
-	presignedURL, err := generateAdminPresignedURL(h.signingSecret, h.listenAddr, req.TokenID, req.Method, path, time.Duration(req.ExpiresSeconds)*time.Second, h.tlsEnabled)
+	scheme := "http"
+	if h.tlsEnabled {
+		scheme = "https"
+	}
+
+	var presignedURL string
+	switch style {
+	case presignStyleAWS:
+		// Only the aws form needs a real hostname: its signature covers the
+		// host. The jay form keeps taking the listen address as-is, so an
+		// existing deployment does not start failing on a call that answered
+		// yesterday.
+		if err := requirePresignHostname(host); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		region := strings.TrimSpace(req.Region)
+		if region == "" {
+			region = defaultPresignRegion
+		}
+		presignedURL, err = generateAWSPresignedURL(token.SecretKey, scheme, host, req.TokenID, region, req.Method, path, expires)
+	default:
+		presignedURL, err = generateAdminPresignedURL(h.signingSecret, scheme, host, req.TokenID, req.Method, path, expires)
+	}
 	if err != nil {
-		h.log.Error("generate presigned URL", "err", err)
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		h.log.Error("generate presigned URL", "err", err, "style", style)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := jsonv2.MarshalWrite(w, presignResponse{URL: presignedURL}); err != nil {
+	if err := jsonv2.MarshalWrite(w, presignResponse{URL: presignedURL, Style: style}); err != nil {
 		h.log.Error("encode presign response", "err", err)
 	}
+}
+
+// writeJSONError answers with a JSON error body whose message is safely quoted.
+// fmt.Sprintf into a JSON literal broke the response as soon as the message
+// contained a quote — which the presign errors do, since they quote the host.
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	body, err := jsonv2.Marshal(map[string]string{"error": message})
+	if err != nil {
+		body = []byte(`{"error":"internal error"}`)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 // Quarantine handlers

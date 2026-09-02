@@ -188,3 +188,91 @@ func formatETag(etag string) string {
 	}
 	return `"` + etag + `"`
 }
+
+// ── DeleteObjects (POST /<bucket>?delete) ─────────────────────────────────
+
+// DeleteObjectsInput is the <Delete> request document of DeleteObjects.
+//
+// The namespace is not matched: encoding/xml resolves element names by local
+// name, so a document carrying the S3 namespace and one without it both decode.
+type DeleteObjectsInput struct {
+	XMLName xml.Name             `xml:"Delete"`
+	Quiet   bool                 `xml:"Quiet"`
+	Objects []DeleteObjectsEntry `xml:"Object"`
+}
+
+// DeleteObjectsEntry is one key of a <Delete> request. VersionID is parsed only
+// so a version-scoped delete can be refused explicitly — jay has no versioning,
+// and deleting the current object when a specific version was asked for would be
+// reporting work that was not done.
+type DeleteObjectsEntry struct {
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId"`
+}
+
+// DeleteResult is the XML response of DeleteObjects. Every key of the request
+// appears exactly once, in Deleted or in Errors: a key that failed is never
+// omitted, because a client that sees neither reads the batch as a success.
+type DeleteResult struct {
+	XMLName xml.Name            `xml:"DeleteResult"`
+	XMLNS   string              `xml:"xmlns,attr"`
+	Deleted []DeletedObject     `xml:"Deleted"`
+	Errors  []DeleteObjectError `xml:"Error"`
+}
+
+// DeletedObject reports one key DeleteObjects removed. Suppressed in Quiet mode.
+type DeletedObject struct {
+	Key string `xml:"Key"`
+}
+
+// DeleteObjectError reports one key DeleteObjects did NOT remove, with the same
+// code it would have carried as a single-object failure. Reported in Quiet mode
+// too — quiet suppresses the successes, never the failures.
+type DeleteObjectError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+// ── GetBucketLocation (GET /<bucket>?location) ────────────────────────────
+
+// LocationConstraint is the XML response of GetBucketLocation. jay has no
+// regions, so the value is always empty — which is exactly how S3 spells
+// us-east-1 and what SDKs expect from a single-region endpoint.
+type LocationConstraint struct {
+	XMLName xml.Name `xml:"LocationConstraint"`
+	XMLNS   string   `xml:"xmlns,attr"`
+	Value   string   `xml:",chardata"`
+}
+
+// ── ListMultipartUploads (GET /<bucket>?uploads) ──────────────────────────
+
+// ListMultipartUploadsResult is the XML response of ListMultipartUploads. Field
+// order follows the S3 documented response, not Go convention.
+type ListMultipartUploadsResult struct {
+	XMLName            xml.Name         `xml:"ListMultipartUploadsResult"`
+	XMLNS              string           `xml:"xmlns,attr"`
+	Bucket             string           `xml:"Bucket"`
+	KeyMarker          string           `xml:"KeyMarker"`
+	UploadIDMarker     string           `xml:"UploadIdMarker"`
+	NextKeyMarker      string           `xml:"NextKeyMarker"`
+	Prefix             string           `xml:"Prefix"`
+	Delimiter          string           `xml:"Delimiter,omitempty"`
+	NextUploadIDMarker string           `xml:"NextUploadIdMarker"`
+	MaxUploads         int              `xml:"MaxUploads"`
+	IsTruncated        bool             `xml:"IsTruncated"`
+	Uploads            []S3Upload       `xml:"Upload"`
+	CommonPrefixes     []S3CommonPrefix `xml:"CommonPrefixes,omitempty"`
+	EncodingType       string           `xml:"EncodingType,omitempty"`
+}
+
+// S3Upload is one in-progress multipart upload in a ListMultipartUploads
+// response.
+type S3Upload struct {
+	Key          string  `xml:"Key"`
+	UploadID     string  `xml:"UploadId"`
+	Initiator    S3Owner `xml:"Initiator"`
+	Owner        S3Owner `xml:"Owner"`
+	StorageClass string  `xml:"StorageClass"`
+	Initiated    string  `xml:"Initiated"`
+}

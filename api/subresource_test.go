@@ -223,16 +223,36 @@ func TestBucket_UnimplementedSubresource_DoesNotDeleteTheBucket(t *testing.T) {
 	}
 }
 
-// Batch delete is a POST sub-resource jay does not implement; it must say so
-// rather than fall through to the method switch.
-func TestBucket_BatchDelete_Returns501(t *testing.T) {
-	h, _, tok, secret := fullSetupTestHandler(t)
-	auth := authHeader(tok, secret)
-	createBucket(t, h, auth, "photos")
+// The three bucket sub-resources jay now implements are claimed by method, and
+// only by their own. `?delete` is DeleteObjects on POST; on PUT or DELETE it is
+// a name the allowlist still has to refuse, because reaching handleDeleteBucket
+// with it would delete the bucket. Same for `?location` and `?uploads`.
+func TestBucket_ImplementedSubresource_OnWrongMethod_Returns501(t *testing.T) {
+	cases := []struct{ method, sub string }{
+		{http.MethodPut, "delete"},
+		{http.MethodDelete, "delete"},
+		{http.MethodPut, "location"},
+		{http.MethodDelete, "location"},
+		{http.MethodPut, "uploads"},
+		{http.MethodPost, "uploads"},
+		{http.MethodDelete, "uploads"},
+	}
 
-	w := do(t, h, auth, http.MethodPost, "/photos?delete", "<Delete><Object><Key>a</Key></Object></Delete>")
-	if w.Code != http.StatusNotImplemented {
-		t.Errorf("POST /photos?delete: want 501, got %d: %s", w.Code, w.Body.String())
+	for _, c := range cases {
+		t.Run(c.method+"_"+c.sub, func(t *testing.T) {
+			h, _, tok, secret := fullSetupTestHandler(t)
+			auth := authHeader(tok, secret)
+			createBucket(t, h, auth, "photos")
+
+			w := do(t, h, auth, c.method, "/photos?"+c.sub, "<Delete><Object><Key>a</Key></Object></Delete>")
+			if w.Code != http.StatusNotImplemented {
+				t.Errorf("%s /photos?%s: want 501, got %d: %s", c.method, c.sub, w.Code, w.Body.String())
+			}
+
+			if w := do(t, h, auth, http.MethodHead, "/photos", ""); w.Code != http.StatusOK {
+				t.Fatalf("%s ?%s deleted the bucket: HEAD returned %d", c.method, c.sub, w.Code)
+			}
+		})
 	}
 }
 

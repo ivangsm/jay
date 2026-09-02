@@ -58,12 +58,10 @@ var unimplementedBucketSubresources = map[string]struct{}{
 	"acl":                 {},
 	"analytics":           {},
 	"cors":                {},
-	"delete":              {}, // DeleteObjects (batch)
 	"encryption":          {},
 	"intelligent-tiering": {},
 	"inventory":           {},
 	"lifecycle":           {},
-	"location":            {},
 	"logging":             {},
 	"metrics":             {},
 	"notification":        {},
@@ -75,7 +73,6 @@ var unimplementedBucketSubresources = map[string]struct{}{
 	"replication":         {},
 	"requestPayment":      {},
 	"tagging":             {},
-	"uploads":             {}, // ListMultipartUploads
 	"versioning":          {},
 	"versions":            {},
 	"website":             {},
@@ -201,31 +198,76 @@ func (h *Handler) SetMaxObjectSize(n int64) {
 // that bcrypt/SigV4 verification is never reached by a source that is already
 // over its budget (see withIPRateLimit). withRateLimit then applies the
 // per-token quota once the caller is known.
+//
+// withUnframedBody sits between the two rate limiters and withPresigned: an
+// aws-chunked body cannot be served by any handler, so it is refused before a
+// signature is verified and before a single byte is read — but still inside the
+// IP limiter, so refusing it is not free for the sender.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	handler := h.withLogging(h.withIPRateLimit(h.withPresigned(h.withRequestIDAndAuth(h.withRateLimit(h.dispatch)))))
+	handler := h.withLogging(h.withIPRateLimit(h.withUnframedBody(h.withPresigned(h.withRequestIDAndAuth(h.withRateLimit(h.dispatch))))))
 	handler(w, r)
 }
 
 // withPresigned checks for presigned URL query params before falling through
 // to the normal auth middleware.
+//
+// Two forms are accepted and they do not overlap:
+//
+//   - SigV4 in its query-string form (X-Amz-Signature and friends), which is
+//     what every AWS SDK, boto3, minio-go and `aws s3 presign` produce. It is
+//     verified against the signing token's own secret, so it works whether or
+//     not the server has a JAY_SIGNING_SECRET-derived presign secret wired.
+//   - jay's own X-Jay-* form, HMAC'd with the server signing secret. falco and
+//     `jay-admin presign` emit it, so it stays.
+//
+// The SigV4 branch is tried first and IsPresignedSigV4 already refuses a
+// request that also carries an Authorization header, so there is no way to
+// attach two credentials and have jay shop for the one that verifies.
 func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if auth.IsPresignedSigV4(r) {
+			token, err := h.auth.AuthenticatePresignedSigV4(r)
+			if err != nil {
+				h.rejectPresigned(w, r)
+				return
+			}
+			h.servePresigned(w, r, token)
+			return
+		}
 		if h.signingSecret != "" && r.URL.Query().Get("X-Jay-Token") != "" {
 			token, err := validatePresignedRequest(r, h.signingSecret, h.db)
 			if err != nil {
-				writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Invalid presigned URL", r.URL.Path)
+				h.rejectPresigned(w, r)
 				return
 			}
-			// Set request ID and token, then go straight to rate limit + dispatch
-			reqID := generateRequestID()
-			ctx := context.WithValue(r.Context(), ctxKeyRequestID, reqID)
-			ctx = context.WithValue(ctx, ctxKeyToken, token)
-			w.Header().Set("x-amz-request-id", reqID)
-			h.withRateLimit(h.dispatch)(w, r.WithContext(ctx))
+			h.servePresigned(w, r, token)
 			return
 		}
 		next(w, r)
 	}
+}
+
+// servePresigned hands an authenticated presigned request straight to the rate
+// limiter and dispatcher, skipping the credential middleware it has no
+// credentials for. Authorization still runs: every handler calls requireAuth,
+// so the token's actions, bucket scope and prefix scope apply exactly as they
+// would to a Bearer or SigV4-header request.
+func (h *Handler) servePresigned(w http.ResponseWriter, r *http.Request, token *meta.Token) {
+	reqID := generateRequestID()
+	ctx := context.WithValue(r.Context(), ctxKeyRequestID, reqID)
+	ctx = context.WithValue(ctx, ctxKeyToken, token)
+	w.Header().Set("x-amz-request-id", reqID)
+	h.withRateLimit(h.dispatch)(w, r.WithContext(ctx))
+}
+
+// rejectPresigned answers a presigned URL that did not verify. The reason is
+// deliberately not reported: which of "expired", "no such token" and "bad
+// signature" it was is an oracle, the same reasoning as auth's sentinel errors.
+func (h *Handler) rejectPresigned(w http.ResponseWriter, r *http.Request) {
+	if h.metrics != nil {
+		h.metrics.AuthFailures.Add(1)
+	}
+	writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Invalid presigned URL", r.URL.Path)
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
@@ -259,11 +301,32 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	bucketName, objectKey, _ := strings.Cut(path, "/")
 
 	if objectKey == "" {
+		bq := r.URL.Query()
+
+		// Bucket sub-resources jay does implement. They are claimed here, ahead
+		// of the filter below, for the same reason the multipart params are
+		// claimed ahead of it at object level: on a mutating method the filter
+		// is an allowlist, so an operation it does not claim first can never be
+		// reached. Each one is pinned to its own method — `PUT /bucket?delete`
+		// is not DeleteObjects, it is a PUT carrying a name we recognise, and
+		// the allowlist still refuses it.
+		switch {
+		case r.Method == http.MethodPost && bq.Has("delete"):
+			h.handleDeleteObjects(w, r, bucketName)
+			return
+		case r.Method == http.MethodGet && bq.Has("location"):
+			h.handleGetBucketLocation(w, r, bucketName)
+			return
+		case r.Method == http.MethodGet && bq.Has("uploads"):
+			h.handleListMultipartUploads(w, r, bucketName)
+			return
+		}
+
 		// Same reasoning as at object level (see unsupportedSubresource): an
 		// unimplemented sub-resource must not reach the switch. `DELETE
 		// /bucket?tagging` used to reach handleDeleteBucket and delete the
 		// bucket itself.
-		if sub := unsupportedSubresource(r.URL.Query(), r.Method, unimplementedBucketSubresources); sub != "" {
+		if sub := unsupportedSubresource(bq, r.Method, unimplementedBucketSubresources); sub != "" {
 			writeUnsupportedSubresource(w, r, sub, "/"+bucketName)
 			return
 		}

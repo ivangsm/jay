@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"uuid"
 
+	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -91,12 +92,11 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 
 	// Tenant isolation: "bucket:write-meta" says *what* the token may do, not
 	// *whose* buckets it may do it to. Deleting an existing bucket owned by
-	// another account requires ownership (or explicit BucketScope delegation).
-	if err := h.auth.AuthorizeBucketOwnership(token, bucket); err != nil {
-		if h.metrics != nil {
-			h.metrics.AuthFailures.Add(1)
-		}
-		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", r.URL.Path)
+	// another account requires ownership (or explicit BucketScope delegation,
+	// or a bucket policy that says so). requireAuth already applied this gate;
+	// repeating it on the bucket in hand is what keeps destroying a stranger's
+	// bucket from depending on a caller further up remembering to ask.
+	if !h.authorizeLoadedBucket(r, w, token, bucket, meta.ActionBucketWriteMeta, "") {
 		return
 	}
 
@@ -142,7 +142,9 @@ func (h *Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucke
 	}
 
 	// Reading another account's bucket metadata is still cross-tenant access.
-	if err := h.auth.AuthorizeBucketOwnership(token, bucket); err != nil {
+	// HEAD carries no XML body, so the gate is applied by hand here to answer
+	// with a bare 403.
+	if err := auth.AuthorizeBucketAccess(token, bucket, meta.ActionBucketReadMeta, "", clientIP(r, h.trustProxyHeaders)); err != nil {
 		if h.metrics != nil {
 			h.metrics.AuthFailures.Add(1)
 		}
@@ -186,4 +188,40 @@ func (h *Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeXML(w, r, http.StatusOK, result)
+}
+
+// handleGetBucketLocation handles GET /<bucket>?location.
+//
+// jay has no regions, so the answer is always the empty <LocationConstraint/>,
+// which is how S3 itself spells us-east-1. SDKs call this before their first
+// real operation to decide where to send it; a 501 there stops the client
+// before it ever tries.
+//
+// Authorization mirrors HeadBucket: the location of a bucket is bucket
+// metadata, and confirming it exists to another account's token is the same
+// cross-tenant disclosure.
+func (h *Handler) handleGetBucketLocation(w http.ResponseWriter, r *http.Request, bucketName string) {
+	token, ok := h.requireAuth(r, w, meta.ActionBucketReadMeta, bucketName, "")
+	if !ok {
+		return
+	}
+
+	bucket, err := h.db.GetBucket(bucketName)
+	if err != nil {
+		if errors.Is(err, meta.ErrBucketNotFound) {
+			writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchBucket,
+				"Bucket not found", "/"+bucketName)
+			return
+		}
+		h.log.Error("get bucket location", "err", err, "bucket", bucketName)
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+			"Internal error", "/"+bucketName)
+		return
+	}
+
+	if !h.authorizeLoadedBucket(r, w, token, bucket, meta.ActionBucketReadMeta, "") {
+		return
+	}
+
+	writeXML(w, r, http.StatusOK, LocationConstraint{XMLNS: s3Namespace})
 }

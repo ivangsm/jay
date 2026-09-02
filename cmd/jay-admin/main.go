@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/ivangsm/jay/internal/jsonx"
@@ -105,8 +106,13 @@ Commands:
   list-tokens                                           List all tokens
   revoke-token    -id <token-id>                        Revoke a token
   metrics                                               Show server metrics
-  presign         -bucket <b> -key <k> [-method GET]    Generate presigned URL
-                  [-expires 3600]
+  presign         -bucket <b> -key <k> -token-id <id>   Generate presigned URL
+                  [-method GET] [-expires 3600]
+                  [-style jay|aws] [-host s3.example.com]
+                  [-region us-east-1]
+                  style "aws" emits a SigV4 URL any S3 client
+                  understands; it needs -host unless
+                  JAY_LISTEN_ADDR carries a hostname
   quarantine-list                                       List quarantined objects
   quarantine-revalidate -bucket-id <id> -key <key>      Revalidate object
   quarantine-purge                                      Purge all quarantined`)
@@ -253,6 +259,9 @@ func metrics(addr, token string) error {
 	return nil
 }
 
+const presignUsage = "usage: presign -bucket <b> -key <k> -token-id <id> " +
+	"[-method GET] [-expires 3600] [-style jay|aws] [-host s3.example.com] [-region us-east-1]"
+
 func presign(addr, token string, args []string) error {
 	bucket := parseFlag(args, "-bucket")
 	key := parseFlag(args, "-key")
@@ -260,7 +269,7 @@ func presign(addr, token string, args []string) error {
 	expires := parseFlag(args, "-expires")
 
 	if bucket == "" {
-		return errors.New("usage: presign -bucket <b> -key <k> [-method GET] [-expires 3600]")
+		return errors.New(presignUsage)
 	}
 	if method == "" {
 		method = "GET"
@@ -268,11 +277,18 @@ func presign(addr, token string, args []string) error {
 	if expires == "" {
 		expires = "3600"
 	}
+	// expires_seconds is a number on the wire. Sending it as the string the
+	// flag arrived as made the admin API answer 400 "invalid request body" on
+	// every single presign, because its decoder rejects a string for an int.
+	expiresSeconds, err := strconv.Atoi(expires)
+	if err != nil || expiresSeconds <= 0 {
+		return fmt.Errorf("-expires must be a positive number of seconds, got %q", expires)
+	}
 
 	// We also need a token_id for presigning — use the first token from list or require it
 	tokenID := parseFlag(args, "-token-id")
 	if tokenID == "" {
-		return errors.New("usage: presign -bucket <b> -key <k> -token-id <id> [-method GET] [-expires 3600]")
+		return errors.New(presignUsage)
 	}
 
 	body := map[string]any{
@@ -280,7 +296,14 @@ func presign(addr, token string, args []string) error {
 		"method":          method,
 		"bucket":          bucket,
 		"key":             key,
-		"expires_seconds": expires,
+		"expires_seconds": expiresSeconds,
+	}
+	// Only send the optional fields that were actually given: the server picks
+	// the defaults, and it is the one place they are documented.
+	for flag, field := range map[string]string{"-style": "style", "-host": "host", "-region": "region"} {
+		if v := parseFlag(args, flag); v != "" {
+			body[field] = v
+		}
 	}
 
 	data, status, err := doRequest("POST", addr+"/_jay/presign", token, body)

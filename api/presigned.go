@@ -15,6 +15,13 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
+// jay's own presigned URL form, HMAC'd with the server signing secret.
+//
+// It predates SigV4 query-string support (auth/presign_sigv4.go) and is kept
+// because falco and `jay-admin presign` emit it. The two live side by side:
+// withPresigned dispatches on which parameters are present, and no request can
+// carry both without the SigV4 branch claiming it.
+
 // presignedMetaParams are query parameters used by the presigned URL mechanism
 // and excluded from the canonical query string that is signed.
 var presignedMetaParams = map[string]bool{
