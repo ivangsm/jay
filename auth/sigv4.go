@@ -21,6 +21,11 @@ import (
 // maxClockSkew is the maximum allowed time difference between client and server.
 const maxClockSkew = 15 * time.Minute
 
+// unsignedPayload is the placeholder S3 clients put in the canonical request
+// when the body is not covered by the signature. It is the default for
+// presigned URLs, where there is no opportunity to hash the body up front.
+const unsignedPayload = "UNSIGNED-PAYLOAD"
+
 // AuthenticateSigV4 validates AWS Signature V4 auth from an HTTP request.
 // Format: AWS4-HMAC-SHA256 Credential=<access-key>/<date>/<region>/s3/aws4_request,
 //
@@ -103,24 +108,33 @@ func (a *Auth) AuthenticateSigV4(r *http.Request) (*meta.Token, error) {
 
 // maxSignedPayloadSize bounds how much request body we are willing to buffer in
 // order to verify x-amz-content-sha256. Signing a payload requires hashing it
-// end-to-end anyway, so real S3 clients switch to UNSIGNED-PAYLOAD or
-// STREAMING-AWS4-HMAC-SHA256-PAYLOAD well below this. A request that declares a
-// signed payload larger than this is rejected rather than buffered.
+// end-to-end anyway, so real S3 clients switch to UNSIGNED-PAYLOAD or multipart
+// well below this. A request that declares a signed payload larger than this is
+// rejected rather than buffered.
 const maxSignedPayloadSize = 32 << 20 // 32 MiB
 
 // verifyPayloadHash checks that the request body actually hashes to the value
 // declared in x-amz-content-sha256, and leaves the body readable by handlers.
 //
-// Skipped for UNSIGNED-PAYLOAD, the STREAMING-* variants (chunk signatures
-// carry their own integrity) and an absent header, which the canonical request
-// already treats as UNSIGNED-PAYLOAD.
+// An aws-chunked body is refused outright, whatever the declared hash says:
+// jay cannot decode the framing, so there is nothing here that could verify it.
+// This used to be a *skip* — STREAMING-* returned nil "because chunk signatures
+// carry their own integrity" — and since nothing downstream decoded the framing
+// either, the framing itself was stored as the object body under a 200.
+//
+// Verification is skipped, honestly, for UNSIGNED-PAYLOAD and for an absent
+// header, which the canonical request already treats as UNSIGNED-PAYLOAD.
 func verifyPayloadHash(r *http.Request, declared string) error {
-	if declared == "" || declared == "UNSIGNED-PAYLOAD" || strings.HasPrefix(declared, "STREAMING-") {
+	if hdr := ChunkedBodyIndicator(r); hdr != "" {
+		return fmt.Errorf("%w: announced by %s", ErrChunkedBodyUnsupported, hdr)
+	}
+
+	if declared == "" || declared == unsignedPayload {
 		return nil
 	}
 
 	if r.ContentLength > maxSignedPayloadSize {
-		return fmt.Errorf("%w: signed payload exceeds %d bytes, use UNSIGNED-PAYLOAD or streaming",
+		return fmt.Errorf("%w: signed payload exceeds %d bytes, use UNSIGNED-PAYLOAD or multipart",
 			ErrInvalidCredentials, maxSignedPayloadSize)
 	}
 
@@ -134,7 +148,7 @@ func verifyPayloadHash(r *http.Request, declared string) error {
 			return ErrInvalidCredentials
 		}
 		if len(body) > maxSignedPayloadSize {
-			return fmt.Errorf("%w: signed payload exceeds %d bytes, use UNSIGNED-PAYLOAD or streaming",
+			return fmt.Errorf("%w: signed payload exceeds %d bytes, use UNSIGNED-PAYLOAD or multipart",
 				ErrInvalidCredentials, maxSignedPayloadSize)
 		}
 	}
@@ -179,7 +193,25 @@ func parseSigV4Header(header string) map[string]string {
 	return result
 }
 
+// buildCanonicalRequest derives the canonical request for the header form of
+// SigV4, where the whole query string is signed and the payload hash comes from
+// x-amz-content-sha256.
 func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
+	payloadHash := r.Header.Get("x-amz-content-sha256")
+	if payloadHash == "" {
+		payloadHash = unsignedPayload
+	}
+	return buildCanonicalRequestFrom(r, signedHeaders, r.URL.RawQuery, payloadHash)
+}
+
+// buildCanonicalRequestFrom is the single implementation of the SigV4 canonical
+// request, shared by the header form and the query-string (presigned) form.
+//
+// The two forms differ only in their inputs — a presigned URL excludes
+// X-Amz-Signature from the query it signs and defaults to UNSIGNED-PAYLOAD — so
+// they are passed in rather than recomputed. Two copies of this function is how
+// the two forms start disagreeing about what a signature covers.
+func buildCanonicalRequestFrom(r *http.Request, signedHeaders, rawQuery, payloadHash string) string {
 	// HTTP method
 	method := r.Method
 
@@ -192,7 +224,7 @@ func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
 
 	// Canonical query string — SigV4 requires it normalised (sorted, RFC 3986
 	// percent-encoded), not the raw string as it arrived on the wire.
-	queryString := canonicalQueryString(r.URL.RawQuery)
+	queryString := canonicalQueryString(rawQuery)
 
 	// Canonical headers — header names must be lowercased per SigV4 spec.
 	headerNames := strings.Split(signedHeaders, ";")
@@ -214,12 +246,6 @@ func buildCanonicalRequest(r *http.Request, signedHeaders string) string {
 
 	// Signed headers list must also be lowercased.
 	signedHeadersLower := strings.Join(headerNames, ";")
-
-	// Payload hash
-	payloadHash := r.Header.Get("x-amz-content-sha256")
-	if payloadHash == "" {
-		payloadHash = "UNSIGNED-PAYLOAD"
-	}
 
 	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
 		method, uri, queryString, canonHeaders.String(), signedHeadersLower, payloadHash)

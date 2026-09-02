@@ -1184,7 +1184,12 @@ func TestAuthenticateSigV4_UnsignedPayloadSkipsVerification(t *testing.T) {
 	}
 }
 
-func TestAuthenticateSigV4_StreamingPayloadSkipsVerification(t *testing.T) {
+// STREAMING-* means the body is aws-chunked, and jay has no decoder for that
+// framing. This test used to assert the opposite — that the mode was accepted
+// and verification skipped — which is exactly what let the chunk headers and
+// signatures be stored as the object body under a 200. The signature itself
+// still verifies here; what must fail is the payload gate.
+func TestAuthenticateSigV4_StreamingPayloadRejected(t *testing.T) {
 	db := openTestDB(t)
 	_, _ = seedToken(t, db, "pay-stream", "sigv4-secret-key", []string{"*"})
 	a := New(db)
@@ -1192,13 +1197,42 @@ func TestAuthenticateSigV4_StreamingPayloadSkipsVerification(t *testing.T) {
 	now := time.Now().UTC()
 	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
 
+	for _, declared := range []string{
+		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+		"STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+	} {
+		t.Run(declared, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("chunk data"))
+			r.Host = "s3.example.com"
+			signRequestWithPayload(r, "pay-stream", "sigv4-secret-key", "us-east-1", dateStr, amzDate, declared)
+
+			_, err := a.AuthenticateSigV4(r)
+			if !errors.Is(err, ErrChunkedBodyUnsupported) {
+				t.Fatalf("want ErrChunkedBodyUnsupported for %s, got %v", declared, err)
+			}
+		})
+	}
+}
+
+// A framed body announced only by x-amz-decoded-content-length is refused too:
+// the declared hash is a perfectly ordinary UNSIGNED-PAYLOAD, so the payload
+// hash alone would have waved it through.
+func TestAuthenticateSigV4_DecodedContentLengthRejected(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-decoded", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	now := time.Now().UTC()
+	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
+
 	r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("chunk data"))
 	r.Host = "s3.example.com"
-	signRequestWithPayload(r, "pay-stream", "sigv4-secret-key", "us-east-1", dateStr, amzDate,
-		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	r.Header.Set("x-amz-decoded-content-length", "10")
+	signRequestWithPayload(r, "pay-decoded", "sigv4-secret-key", "us-east-1", dateStr, amzDate, "UNSIGNED-PAYLOAD")
 
-	if _, err := a.AuthenticateSigV4(r); err != nil {
-		t.Fatalf("STREAMING payload must not be verified: %v", err)
+	if _, err := a.AuthenticateSigV4(r); !errors.Is(err, ErrChunkedBodyUnsupported) {
+		t.Fatalf("want ErrChunkedBodyUnsupported, got %v", err)
 	}
 }
 
