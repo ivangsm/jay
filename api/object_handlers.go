@@ -62,7 +62,8 @@ func (h *Handler) mapObjopsErr(w http.ResponseWriter, r *http.Request, err error
 
 // handlePutObject handles PUT /<bucket>/<key>. Delegates to objops.Service for
 // the authorize → write → commit path. Preserves the existing response
-// headers: ETag (quoted per S3), x-amz-checksum-sha256, 200 OK.
+// headers: ETag (quoted per S3), x-amz-checksum-sha256 (base64, see
+// setChecksumHeader), 200 OK.
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	token, ok := h.requireAuth(r, w, meta.ActionObjectPut, bucketName, objectKey)
 	if !ok {
@@ -105,7 +106,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 
 	w.Header().Set("ETag", formatETag(obj.ETag))
-	w.Header().Set("x-amz-checksum-sha256", obj.ChecksumSHA256)
+	setChecksumHeader(w, obj.ChecksumSHA256)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -113,6 +114,10 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 // seeking into the physical file; full-object GETs are streamed via io.Copy
 // so the kernel sendfile(2) path is reached (statusWriter implements
 // ReadFrom). No per-read checksum verification — the scrubber owns integrity.
+//
+// x-amz-checksum-sha256 is emitted on the 200 only: it covers the whole object,
+// and a client that verified it against a 206 body would reject a correct
+// transfer. The AWS CLI downloads anything over 8 MiB as ranged GETs.
 func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	token, ok := h.requireAuth(r, w, meta.ActionObjectGet, bucketName, objectKey)
 	if !ok {
@@ -144,7 +149,6 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 	w.Header().Set("Content-Type", obj.ContentType)
 	w.Header().Set("ETag", formatETag(obj.ETag))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-	w.Header().Set("x-amz-checksum-sha256", obj.ChecksumSHA256)
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	for k, v := range obj.MetadataHeaders {
@@ -184,6 +188,10 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.SizeBytes, 10))
+	// Whole-object response: the digest describes exactly the bytes below.
+	// The 206 path above deliberately omits it — a client verifying a range
+	// against the full-object digest would reject a correct transfer.
+	setChecksumHeader(w, obj.ChecksumSHA256)
 
 	if h.metrics != nil {
 		h.metrics.BytesDownloaded.Add(obj.SizeBytes)
@@ -198,8 +206,8 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 }
 
 // handleHeadObject handles HEAD /<bucket>/<key>. Returns the same headers as
-// GET minus the body. x-amz-checksum-sha256 is exposed so clients can verify
-// post-download without a second round-trip.
+// GET minus the body. x-amz-checksum-sha256 (base64) is exposed so clients can
+// verify post-download without a second round-trip.
 func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	if h.metrics != nil {
 		h.metrics.HeadObjectTotal.Add(1)
@@ -230,7 +238,7 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, bucke
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.SizeBytes, 10))
 	w.Header().Set("ETag", formatETag(obj.ETag))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-	w.Header().Set("x-amz-checksum-sha256", obj.ChecksumSHA256)
+	setChecksumHeader(w, obj.ChecksumSHA256)
 	for k, v := range obj.MetadataHeaders {
 		w.Header().Set(k, v)
 	}

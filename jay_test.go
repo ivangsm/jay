@@ -463,19 +463,28 @@ func TestChecksumOnWrite(t *testing.T) {
 	_ = resp.Body.Close()
 
 	content := "checksum test content"
+	// Digest computed outside the process, so the assertion cannot inherit an
+	// encoding bug from jay itself:
+	//
+	//	printf 'checksum test content' | openssl dgst -sha256 -binary | base64
+	//
+	// S3 defines x-amz-checksum-* as the raw digest in base64; jay stores it
+	// hex-encoded and converts on the way out (api.setChecksumHeader).
+	const wantChecksum = "tgINgITlJiJKa8liFr87KLYyFjiAcL0xR9MxiyquDVc="
+
 	resp = env.s3Request(t, "PUT", "/checkbucket/file.bin",
 		bytes.NewReader([]byte(content)))
 	checksum := resp.Header.Get("x-amz-checksum-sha256")
 	_ = resp.Body.Close()
 
-	if checksum == "" {
-		t.Fatal("missing checksum in response")
+	if checksum != wantChecksum {
+		t.Fatalf("put checksum = %q, want %q", checksum, wantChecksum)
 	}
 
 	// Verify via head
 	resp = env.s3Request(t, "HEAD", "/checkbucket/file.bin", nil)
-	if resp.Header.Get("x-amz-checksum-sha256") != checksum {
-		t.Fatal("checksum mismatch between put and head")
+	if got := resp.Header.Get("x-amz-checksum-sha256"); got != wantChecksum {
+		t.Fatalf("head checksum = %q, want %q", got, wantChecksum)
 	}
 	_ = resp.Body.Close()
 }
