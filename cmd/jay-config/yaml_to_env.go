@@ -64,20 +64,13 @@ func yamlToEnvLines(doc map[string]any, srcPath string) ([]string, []string) {
 			warnings = append(warnings, "skipping unknown YAML key: "+key)
 			continue
 		}
-		if key == "scrub" {
+		// Sections are walked generically: a new nested binding must not need
+		// a matching `if key == ...` here to be seen.
+		if known, nested := nestedKnownKeys[key]; nested {
 			if m, ok := asMap(value); ok {
 				for sk := range m {
-					if !scrubKnownKeys[sk] {
-						warnings = append(warnings, "skipping unknown YAML key: scrub."+sk)
-					}
-				}
-			}
-		}
-		if key == "seed_token" {
-			if m, ok := asMap(value); ok {
-				for sk := range m {
-					if !seedTokenKnownKeys[sk] {
-						warnings = append(warnings, "skipping unknown YAML key: seed_token."+sk)
+					if !known[sk] {
+						warnings = append(warnings, "skipping unknown YAML key: "+key+"."+sk)
 					}
 				}
 			}

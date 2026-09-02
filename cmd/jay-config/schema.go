@@ -34,9 +34,17 @@ var fieldSpecs = []fieldSpec{
 	{yamlKey: "scrub.bytes_per_sec", yamlPath: []string{"scrub", "bytes_per_sec"}, envKey: "JAY_SCRUB_BYTES_PER_SEC", kind: typeInt},
 	{yamlKey: "scrub.max_per_run", yamlPath: []string{"scrub", "max_per_run"}, envKey: "JAY_SCRUB_MAX_PER_RUN", kind: typeInt},
 
+	{yamlKey: "backup.dir", yamlPath: []string{"backup", "dir"}, envKey: "JAY_BACKUP_DIR", kind: typeString},
+	{yamlKey: "min_free_bytes", yamlPath: []string{"min_free_bytes"}, envKey: "JAY_MIN_FREE_BYTES", kind: typeInt},
+	{yamlKey: "max_object_size", yamlPath: []string{"max_object_size"}, envKey: "JAY_MAX_OBJECT_SIZE", kind: typeInt},
+
 	{yamlKey: "seed_token.account", yamlPath: []string{"seed_token", "account"}, envKey: "JAY_SEED_TOKEN_ACCOUNT", kind: typeString},
 	{yamlKey: "seed_token.id", yamlPath: []string{"seed_token", "id"}, envKey: "JAY_SEED_TOKEN_ID", kind: typeString},
 	{yamlKey: "seed_token.secret", yamlPath: []string{"seed_token", "secret"}, envKey: "JAY_SEED_TOKEN_SECRET", kind: typeString},
+
+	// Client credentials: unused by the server, read by the `jay` subcommands.
+	{yamlKey: "client.token_id", yamlPath: []string{"client", "token_id"}, envKey: "JAY_TOKEN_ID", kind: typeString},
+	{yamlKey: "client.token_secret", yamlPath: []string{"client", "token_secret"}, envKey: "JAY_TOKEN_SECRET", kind: typeString},
 }
 
 func specByEnvKey(key string) (fieldSpec, bool) {
@@ -48,31 +56,35 @@ func specByEnvKey(key string) (fieldSpec, bool) {
 	return fieldSpec{}, false
 }
 
-var topLevelKnownKeys = map[string]bool{
-	"data_dir":            true,
-	"listen_addr":         true,
-	"admin_addr":          true,
-	"native_addr":         true,
-	"admin_token":         true,
-	"signing_secret":      true,
-	"log_level":           true,
-	"tls_cert":            true,
-	"tls_key":             true,
-	"rate_limit":          true,
-	"rate_burst":          true,
-	"trust_proxy_headers": true,
-	"scrub":               true,
-	"seed_token":          true,
+// The accepted YAML shape is derived from fieldSpecs, never written twice.
+// A second hand-maintained list is what let backup.dir, min_free_bytes and
+// max_object_size sit in the server's bindings for months while yaml-to-env
+// warned "unknown YAML key" and dropped them on the floor.
+var (
+	topLevelKnownKeys = derivedTopLevelKeys()
+	nestedKnownKeys   = derivedNestedKeys()
+)
+
+func derivedTopLevelKeys() map[string]bool {
+	out := map[string]bool{}
+	for _, s := range fieldSpecs {
+		out[s.yamlPath[0]] = true
+	}
+	return out
 }
 
-var scrubKnownKeys = map[string]bool{
-	"interval_hours": true,
-	"bytes_per_sec":  true,
-	"max_per_run":    true,
-}
-
-var seedTokenKnownKeys = map[string]bool{
-	"account": true,
-	"id":      true,
-	"secret":  true,
+// derivedNestedKeys maps a section name to the keys allowed inside it.
+func derivedNestedKeys() map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for _, s := range fieldSpecs {
+		if len(s.yamlPath) != 2 {
+			continue
+		}
+		section := s.yamlPath[0]
+		if out[section] == nil {
+			out[section] = map[string]bool{}
+		}
+		out[section][s.yamlPath[1]] = true
+	}
+	return out
 }

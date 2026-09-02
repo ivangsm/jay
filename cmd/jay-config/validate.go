@@ -285,7 +285,7 @@ func validateScrub(path string, fields map[string]*yaml.Node, errs *[]string, wa
 
 	for i := 0; i+1 < len(scrub.Content); i += 2 {
 		k := scrub.Content[i]
-		if !scrubKnownKeys[k.Value] {
+		if !nestedKnownKeys["scrub"][k.Value] {
 			*warns = append(*warns, fmt.Sprintf("%s: unknown scrub key %q", locLabel(path, k), k.Value))
 		}
 	}
