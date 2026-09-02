@@ -15,6 +15,7 @@ Jay provides dual API access: a fully S3-compatible HTTP API and a high-performa
 
 - **S3-compatible HTTP API** -- works with AWS CLI, SDKs, and any S3 client
 - **Native binary protocol** -- efficient Go client with connection pooling
+- **Built-in CLI** -- `jay cp/ls/rm/sync` over the native protocol, no aws-cli needed
 - **Multipart uploads** -- S3-compatible chunked uploads up to 10,000 parts
 - **Presigned URLs** -- time-limited delegated access via HMAC-SHA256
 - **Range requests** -- partial object reads (`bytes=0-499`, suffix, open-ended)
@@ -30,20 +31,59 @@ Jay provides dual API access: a fully S3-compatible HTTP API and a high-performa
 - **Metrics** -- JSON endpoint with operation counters and byte totals
 - **Backups** -- hourly metadata snapshots with automatic pruning
 
-## Quick Start
+## Install
+
+### Docker
+
+```bash
+docker run -d --name jay \
+  -p 9000:9000 -p 127.0.0.1:9001:9001 \
+  -v jay_data:/data \
+  -e JAY_ADMIN_TOKEN=$(openssl rand -base64 32) \
+  -e JAY_SIGNING_SECRET=$(openssl rand -base64 32) \
+  ghcr.io/ivangsm/jay:latest
+```
+
+Images are published for `linux/amd64` and `linux/arm64`. Tags follow the
+releases: `latest`, `0.8`, `0.8.2`.
 
 ### Docker Compose
 
 ```bash
+curl -O https://raw.githubusercontent.com/ivangsm/jay/main/docker-compose.yml
 export JAY_ADMIN_TOKEN=$(openssl rand -base64 32)
 export JAY_SIGNING_SECRET=$(openssl rand -base64 32)
 docker compose up -d
 ```
 
-### Build from Source
+### go install
 
 ```bash
+go install github.com/ivangsm/jay@latest
+go install github.com/ivangsm/jay/cmd/jay-admin@latest
+go install github.com/ivangsm/jay/cmd/jay-config@latest
+go install github.com/ivangsm/jay/cmd/jay-rekey@latest
+```
+
+### Prebuilt binaries
+
+Each [release](https://github.com/ivangsm/jay/releases) ships one archive per
+platform (`linux/amd64`, `linux/arm64`, `darwin/arm64`) containing the server
+plus the three auxiliary CLIs, and a `checksums.txt`.
+
+### Build from source
+
+```bash
+git clone https://github.com/ivangsm/jay.git && cd jay
 go build -o jay .
+```
+
+## Running
+
+Both secrets are **required** and must be at least 32 characters. Jay refuses
+to start without them -- there is no default:
+
+```bash
 JAY_ADMIN_TOKEN=$(openssl rand -base64 32) \
 JAY_SIGNING_SECRET=$(openssl rand -base64 32) \
 ./jay
@@ -53,6 +93,52 @@ Jay listens on three ports:
 - `:9000` -- S3-compatible API
 - `:9001` -- Admin API + health checks
 - `:4444` -- Native binary protocol
+
+Only `:9000` is meant to face untrusted networks. The admin API creates
+accounts and tokens, and the native protocol carries the token secret in the
+clear, so keep both on an internal network.
+
+## Command-line client
+
+The same binary is the client. Any subcommand talks to a running jay over the
+native binary protocol; with no subcommand, `jay` starts the server.
+
+```bash
+export JAY_TOKEN_ID=<token_id>
+export JAY_TOKEN_SECRET=<token-secret>
+export JAY_NATIVE_ADDR=localhost:4444
+
+jay bucket mb images
+jay cp ./photo.webp jay://images/users/123.webp
+jay ls -l jay://images/users/
+jay sync ./assets jay://images/assets
+jay rm -r jay://images/old/
+```
+
+| Command | What it does |
+|---------|--------------|
+| `jay bucket ls` / `mb NAME` / `rb NAME` | List, create or delete buckets |
+| `jay ls [-r] [-l] jay://B[/PREFIX]` | List objects; `-r` descends, `-l` adds size, checksum and type |
+| `jay cp [-r] SRC DST` | Copy to, from, or between buckets |
+| `jay rm [-r] jay://B/KEY` | Delete an object, or everything under a prefix |
+| `jay sync SRC DST` | Mirror a directory to or from a bucket |
+| `jay version` | Print the build version |
+
+Locations are either local paths or `jay://BUCKET/KEY` URIs. Credentials come
+from `JAY_TOKEN_ID` / `JAY_TOKEN_SECRET` (or `client.token_id` /
+`client.token_secret` in the YAML config), and every command also accepts
+`--addr`, `--token-id` and `--token-secret`.
+
+Three behaviours worth knowing:
+
+- **`sync` compares SHA-256, not timestamps.** Jay stores a checksum for every
+  object, so an unchanged file is skipped because its contents match — not
+  because its mtime looks old.
+- **Uploads over 64 MiB are split into multipart automatically**, and a failure
+  aborts the upload server-side instead of leaving orphan parts behind.
+- **A partial failure exits non-zero.** `cp -r` and `sync` keep going after a
+  failed file, print which ones failed, and end with a count — a transfer that
+  skipped half its files never reports success.
 
 ## Configuration
 
@@ -82,6 +168,8 @@ Jay accepts configuration from environment variables, a YAML config file, or bot
 | `JAY_SEED_TOKEN_ACCOUNT` | *(optional)* | Idempotent account+token seed; all three seed vars must be set together |
 | `JAY_SEED_TOKEN_ID` | *(optional)* | Seed token ID |
 | `JAY_SEED_TOKEN_SECRET` | *(optional)* | Seed token secret (bcrypt-hashed before persisting) |
+| `JAY_TOKEN_ID` | *(optional)* | Token ID used by the `jay` subcommands; the server ignores it |
+| `JAY_TOKEN_SECRET` | *(optional)* | Token secret used by the `jay` subcommands |
 
 ### YAML Configuration File
 
@@ -122,6 +210,11 @@ seed_token:
   account: ${JAY_SEED_TOKEN_ACCOUNT:-}
   id: ${JAY_SEED_TOKEN_ID:-}
   secret: ${JAY_SEED_TOKEN_SECRET:-}
+
+# Credentials for the `jay` subcommands. The server never reads these.
+client:
+  token_id: ${JAY_TOKEN_ID:-}
+  token_secret: ${JAY_TOKEN_SECRET:-}
 ```
 
 Rules:
@@ -132,11 +225,9 @@ Rules:
 
 ### `jay-config` CLI
 
-Convert between YAML and `.env` or validate a YAML config:
+`jay-config` ships in the release archives and in the container image.
 
 ```bash
-go build -o jay-config ./cmd/jay-config
-
 # YAML → .env (writes to stdout if --output omitted)
 jay-config yaml-to-env --input config.yml --output .env
 
@@ -341,9 +432,9 @@ All endpoints require `Authorization: Bearer <JAY_ADMIN_TOKEN>`.
 
 ### CLI Admin Tool
 
-```bash
-go build -o jay-admin ./cmd/jay-admin
+`jay-admin` ships in the release archives and in the container image.
 
+```bash
 export JAY_ADMIN_TOKEN=my-secret-admin-token
 
 jay-admin create-account -name myapp

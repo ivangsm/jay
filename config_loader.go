@@ -129,6 +129,9 @@ func bindings() []yamlKeyBinding {
 		bindString("seed_token.account", "JAY_SEED_TOKEN_ACCOUNT", func(c *Config) *string { return &c.SeedTokenAccount }),
 		bindString("seed_token.id", "JAY_SEED_TOKEN_ID", func(c *Config) *string { return &c.SeedTokenID }),
 		bindString("seed_token.secret", "JAY_SEED_TOKEN_SECRET", func(c *Config) *string { return &c.SeedTokenSecret }),
+
+		bindString("client.token_id", "JAY_TOKEN_ID", func(c *Config) *string { return &c.ClientTokenID }),
+		bindString("client.token_secret", "JAY_TOKEN_SECRET", func(c *Config) *string { return &c.ClientTokenSecret }),
 	}
 }
 

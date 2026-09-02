@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -17,6 +19,7 @@ import (
 	"github.com/ivangsm/jay/admin"
 	"github.com/ivangsm/jay/api"
 	"github.com/ivangsm/jay/auth"
+	"github.com/ivangsm/jay/internal/cli"
 	"github.com/ivangsm/jay/internal/version"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
@@ -48,13 +51,20 @@ const (
 )
 
 func main() {
+	// A known subcommand turns the binary into a client; anything else — no
+	// arguments, or only flags like --config-file — starts the server, which
+	// is what the container ENTRYPOINT depends on.
+	if len(os.Args) > 1 && cli.IsCommand(os.Args[1]) {
+		os.Exit(runClient(os.Args[1:]))
+	}
+
 	cfg := mustLoadConfig()
 
 	log := setupLogging(cfg.LogLevel)
 
 	// version and commit come from -ldflags (see the Dockerfile). Without this
 	// log line nothing imported internal/version at all, so the injection was
-	// letra muerta y no había forma de saber qué binario estaba corriendo.
+	// dead weight and there was no way to tell which binary was running.
 	log.Info("jay: starting",
 		"version", version.Version,
 		"commit", version.Commit,
@@ -162,6 +172,29 @@ func main() {
 // token, or with two of the three seed-token fields set, is worse than one that
 // does not boot — the first looks healthy while handing out credentials that do
 // not work.
+// runClient resolves the connection settings through the same config pipeline
+// the server uses — env > YAML > defaults, every key registered in bindings()
+// — and hands them to the subcommand. It deliberately does NOT go through
+// mustLoadConfig: `jay ls` has no business demanding the server's admin token
+// and signing secret.
+func runClient(args []string) int {
+	// Config problems are reported by the command itself; a client run must
+	// not print server-side YAML conflict warnings over its output.
+	quiet := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	cfg, err := LoadConfigFromSources(os.Getenv("JAY_CONFIG_FILE"), quiet)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jay: %v\n", err)
+		return 1
+	}
+
+	return cli.Run(cli.Options{
+		Addr:        cfg.NativeAddr,
+		TokenID:     cfg.ClientTokenID,
+		TokenSecret: cfg.ClientTokenSecret,
+	}, args)
+}
+
 func mustLoadConfig() Config {
 	// An empty --config-file preserves the legacy env-only path. JAY_CONFIG_FILE
 	// is honoured as a fallback so container runtimes that only inject env vars
