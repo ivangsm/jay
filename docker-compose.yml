@@ -1,0 +1,38 @@
+# Minimal deployment: pulls the published image, no build step, no external
+# network. This is the file shipped with every release.
+#
+# The birdple-v2 deployment lives in docker-compose.dokploy.yml, and building
+# from source is docker-compose.dev.yml.
+services:
+  jay:
+    image: ghcr.io/ivangsm/jay:latest
+    ports:
+      # Only the S3 API is published on all interfaces. The admin API creates
+      # accounts and tokens, and the native protocol carries the token secret
+      # in the clear, so both stay bound to loopback.
+      - "9000:9000"
+      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:4444:4444"
+    volumes:
+      - jay_data:/data
+    environment:
+      JAY_DATA_DIR: /data
+      JAY_LISTEN_ADDR: ":9000"
+      JAY_ADMIN_ADDR: ":9001"
+      JAY_NATIVE_ADDR: ":4444"
+      JAY_LOG_LEVEL: info
+      # Both are required and must be at least 32 characters. Generate them
+      # with `openssl rand -base64 32`; jay refuses to start without them.
+      JAY_ADMIN_TOKEN: ${JAY_ADMIN_TOKEN:?JAY_ADMIN_TOKEN required}
+      JAY_SIGNING_SECRET: ${JAY_SIGNING_SECRET:?JAY_SIGNING_SECRET required}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9001/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  jay_data:

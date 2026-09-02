@@ -1,0 +1,133 @@
+# GoReleaser builds the binaries attached to every GitHub release.
+#
+# The four binaries ship together in a single archive per platform on purpose:
+# jay-rekey is the documented disaster-recovery tool and jay-admin/jay-config
+# are the management plane. Downloading the server without them leaves an
+# operator with no way to create a token or rotate the signing secret.
+#
+# Windows is not built. The readiness free-space check calls syscall.Statfs,
+# which does not exist there, and directory fsync is not a Windows concept.
+# Publishing a target that does not compile is worse than not listing it.
+version: 2
+
+before:
+  hooks:
+    # Only download: the release must build the tree as tagged, never mutate it.
+    - go mod download
+
+builds:
+  - id: jay
+    main: .
+    binary: jay
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/ivangsm/jay/internal/version.Version={{ .Version }}
+      - -X github.com/ivangsm/jay/internal/version.Commit={{ .ShortCommit }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # No darwin/amd64: jay is deployed on linux and developed on Apple silicon.
+      - goos: darwin
+        goarch: amd64
+
+  # The auxiliary CLIs do not import internal/version, so they take no -X flags.
+  - id: jay-admin
+    main: ./cmd/jay-admin
+    binary: jay-admin
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+
+  - id: jay-config
+    main: ./cmd/jay-config
+    binary: jay-config
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+
+  - id: jay-rekey
+    main: ./cmd/jay-rekey
+    binary: jay-rekey
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+
+archives:
+  - id: jay
+    ids:
+      - jay
+      - jay-admin
+      - jay-config
+      - jay-rekey
+    name_template: "jay_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      # The compose file that ships here is the minimal public one, not the
+      # Dokploy deployment file.
+      - docker-compose.yml
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore\\(deps\\):"
+
+release:
+  draft: false
+  prerelease: auto
+  footer: |
+    ## Container image
+
+    ```bash
+    docker pull ghcr.io/ivangsm/jay:{{ .Version }}
+    ```

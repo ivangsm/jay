@@ -1,5 +1,8 @@
 # Binaries
 jay
+
+# GoReleaser output
+dist/
 *.exe
 *.dll
 *.so

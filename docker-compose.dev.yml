@@ -1,3 +1,5 @@
+# Build from source. Use this when hacking on jay itself; docker-compose.yml
+# pulls the published image instead.
 services:
   jay:
     build: .

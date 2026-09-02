@@ -1,3 +1,6 @@
+# birdple-v2 deployment (Dokploy). Not a general-purpose compose file: it
+# builds from source and joins an external network that only exists on the
+# deployment host. For a local or self-hosted run use docker-compose.yml.
 services:
   jay:
     build: .
