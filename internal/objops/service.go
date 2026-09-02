@@ -3,6 +3,7 @@
 // handler. It is the single place where:
 //
 //   - token-level authorization is applied (via auth.Authorize)
+//   - the cross-account gate is applied (via auth.AuthorizeBucketAccess)
 //   - bucket-policy deny overlays are evaluated (via auth.EvaluatePolicyDeny)
 //   - metadata is written / read / deleted against meta.DB
 //   - bytes are streamed to/from the physical store
@@ -15,7 +16,6 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
-	jsonv2 "encoding/json/v2"
 	"errors"
 	"hash"
 	"io"
@@ -29,7 +29,6 @@ import (
 	"uuid"
 
 	"github.com/ivangsm/jay/auth"
-	"github.com/ivangsm/jay/internal/jsonx"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
 )
@@ -124,26 +123,32 @@ func (s *Service) authorize(
 		if err := checkTokenAction(token, identity.Action, bucket.Name, objectKey); err != nil {
 			return err
 		}
+		// Cross-account gate. checkTokenAction above answers what the token is
+		// scoped to; this answers whether its account may reach this bucket at
+		// all. A token with "*" and no BucketScope passes the former for every
+		// bucket in the store (PND-0185).
+		//
+		// Only for an authenticated caller: a nil token here is the anonymous
+		// read of a public-read bucket, which the transport already gated.
+		if err := auth.AuthorizeBucketAccess(token, bucket, identity.Action, objectKey, identity.SourceIP); err != nil {
+			return ErrAccessDenied
+		}
 	}
 
 	if len(bucket.PolicyJSON) == 0 {
 		return nil
 	}
 
-	// Lenient rather than v2's defaults: bucket policies are written by hand,
-	// and v1 matched field names case-insensitively. Under v2's case-sensitive
-	// defaults an AWS-style policy ("Effect"/"Statements") would stop parsing
-	// and its Deny statement would vanish silently — opening access where it
-	// used to be refused. Lenient preserves v1's matching.
-	var policy auth.BucketPolicy
-	if err := jsonv2.Unmarshal(bucket.PolicyJSON, &policy, jsonx.Lenient); err != nil {
+	policy, err := auth.ParsePolicy(bucket.PolicyJSON)
+	if err != nil {
 		s.log.Warn("malformed bucket policy — failing closed",
 			"bucket", bucket.Name, "err", err)
 		return ErrPolicyDenied
 	}
-	policy.Compile()
 
-	if auth.EvaluatePolicyDeny(&policy, identity.TokenID, identity.Action, objectKey, identity.SourceIP) {
+	// Deny is evaluated last, on purpose: it outranks ownership and any allow
+	// statement that granted access above.
+	if auth.EvaluatePolicyDeny(policy, identity.TokenID, identity.Action, objectKey, identity.SourceIP) {
 		return ErrPolicyDenied
 	}
 	return nil

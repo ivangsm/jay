@@ -315,6 +315,19 @@ type connHandler struct {
 	limitKey string
 }
 
+// authorizeBucketAccess is the cross-account gate of the native protocol: the
+// counterpart of api.Handler.authorizeBucketAccess, and the same decision
+// function underneath.
+//
+// Object put/get/head/delete reach it through objops; everything that resolves
+// a bucket here without going through objops — list, multipart, and the bucket
+// metadata operations — calls it directly. A token whose account does not own
+// the bucket is refused unless the bucket says otherwise (public-read for
+// reads, or an explicit allow statement in its policy).
+func (h *connHandler) authorizeBucketAccess(bucket *meta.Bucket, action, objectKey string) error {
+	return auth.AuthorizeBucketAccess(h.token, bucket, action, objectKey, h.sourceIP)
+}
+
 // identity builds an objops.Identity for the given action. Called once per
 // operation so the Action field is always set correctly (it changes per op).
 func (h *connHandler) identity(action string) objops.Identity {

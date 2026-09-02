@@ -24,6 +24,10 @@ func (h *connHandler) handleListObjects(req *request) error {
 		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
 	}
 
+	if err := h.authorizeBucketAccess(bkt, meta.ActionObjectList, ""); err != nil {
+		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
+	}
+
 	if maxKeys <= 0 {
 		maxKeys = 1000
 	}

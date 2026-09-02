@@ -31,6 +31,9 @@ func (h *connHandler) multipartUploadForRequest(bucket, key, uploadID string) (*
 }
 
 func (h *connHandler) authorizeMultipart(tokenBucket *meta.Bucket, action, key string) error {
+	if err := h.authorizeBucketAccess(tokenBucket, action, key); err != nil {
+		return err
+	}
 	return h.auth.AuthorizeWithPolicy(h.token, action, tokenBucket.Name, key, h.sourceIP, tokenBucket.PolicyJSON)
 }
 

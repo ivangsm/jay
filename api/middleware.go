@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -83,6 +85,13 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 
 // requireAuth returns 401/403 if no valid token is present and the operation
 // doesn't qualify for public access. Call this inside handlers that need auth.
+//
+// It is the single authorization gate of the HTTP surface: every handler in
+// this package goes through it, so both halves of the decision live here — what
+// the token is scoped to (auth.Authorize) and whether the token's account may
+// reach this bucket at all (auth.AuthorizeBucketAccess). A handler added later
+// inherits both by calling requireAuth, which it must do anyway to obtain the
+// token.
 func (h *Handler) requireAuth(r *http.Request, w http.ResponseWriter, action, bucketName, objectKey string) (*meta.Token, bool) {
 	token := tokenFromContext(r.Context())
 
@@ -106,7 +115,60 @@ func (h *Handler) requireAuth(r *http.Request, w http.ResponseWriter, action, bu
 		return nil, false
 	}
 
+	if !h.authorizeBucketAccess(r, w, token, action, bucketName, objectKey) {
+		return nil, false
+	}
+
 	return token, true
+}
+
+// authorizeBucketAccess resolves the named bucket and applies the cross-account
+// gate. Reports whether the request may proceed; writes the error response when
+// it may not.
+//
+// A bucket that does not exist is NOT refused here: CreateBucket arrives with
+// nothing to own, and every other handler answers its own 404 a few lines
+// later. Turning a missing bucket into a 403 here would replace those with a
+// misleading "access denied".
+func (h *Handler) authorizeBucketAccess(
+	r *http.Request, w http.ResponseWriter,
+	token *meta.Token, action, bucketName, objectKey string,
+) bool {
+	if bucketName == "" {
+		// Account-wide operation (ListBuckets); there is no bucket to own.
+		return true
+	}
+
+	bucket, err := h.db.GetBucket(bucketName)
+	if err != nil {
+		if errors.Is(err, meta.ErrBucketNotFound) {
+			return true
+		}
+		h.log.Error("authorize bucket access: get bucket", "err", err, "bucket", bucketName)
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+			"Internal error", r.URL.Path)
+		return false
+	}
+
+	return h.authorizeLoadedBucket(r, w, token, bucket, action, objectKey)
+}
+
+// authorizeLoadedBucket applies the cross-account gate to a bucket the caller
+// already resolved. Handlers that load the bucket themselves use it so the
+// decision keeps coming from one function — never from a second, slightly
+// different rule.
+func (h *Handler) authorizeLoadedBucket(
+	r *http.Request, w http.ResponseWriter,
+	token *meta.Token, bucket *meta.Bucket, action, objectKey string,
+) bool {
+	if err := auth.AuthorizeBucketAccess(token, bucket, action, objectKey, clientIP(r, h.trustProxyHeaders)); err != nil {
+		if h.metrics != nil {
+			h.metrics.AuthFailures.Add(1)
+		}
+		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", r.URL.Path)
+		return false
+	}
+	return true
 }
 
 // statusWriter wraps ResponseWriter to capture the status code and enable sendfile.

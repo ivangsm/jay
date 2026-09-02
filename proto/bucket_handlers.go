@@ -72,7 +72,7 @@ func (h *connHandler) handleDeleteBucket(req *request) error {
 
 	// Token scope alone is not enough to destroy a bucket owned by another
 	// account — mirrors the HTTP handler (api/bucket_handlers.go).
-	if err := h.auth.AuthorizeBucketOwnership(h.token, bkt); err != nil {
+	if err := h.authorizeBucketAccess(bkt, meta.ActionBucketWriteMeta, ""); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
@@ -109,7 +109,7 @@ func (h *connHandler) handleHeadBucket(req *request) error {
 
 	// Reading another account's bucket metadata requires ownership (or an
 	// explicit BucketScope) — mirrors the HTTP handler.
-	if err := h.auth.AuthorizeBucketOwnership(h.token, bkt); err != nil {
+	if err := h.authorizeBucketAccess(bkt, meta.ActionBucketReadMeta, ""); err != nil {
 		return h.writeError(StatusForbidden, req.streamID, "access denied", "AccessDenied")
 	}
 
