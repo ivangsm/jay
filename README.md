@@ -9,11 +9,19 @@
 
 S3-compatible object storage server with a native binary protocol, written in Go.
 
-Jay provides dual API access: a fully S3-compatible HTTP API and a high-performance native binary protocol for Go clients. It uses bbolt for metadata, atomic file writes with SHA-256 checksums, and includes background integrity scrubbing, garbage collection, and automated backups.
+Jay provides dual API access: an S3-compatible HTTP API and a high-performance native binary protocol for Go clients. It uses bbolt for metadata, atomic file writes with SHA-256 checksums, and includes background integrity scrubbing, garbage collection, and automated backups.
+
+"S3-compatible" here means a specific, measured list rather than a boast. The
+[Supported Operations](#supported-operations) table is the whole surface;
+everything else answers `501`. The one client limitation worth knowing before
+you start is that **minio-go clients (`mc`, `warp`) cannot upload over plain
+HTTP** — see [aws-chunked uploads](#aws-chunked-streaming-uploads-are-not-supported).
+What the claim rests on is [`scripts/conformance.sh`](#conformance), which
+drives a throwaway jay with the real aws-cli, `mc` and `warp` on every CI run.
 
 ## Features
 
-- **S3-compatible HTTP API** -- the AWS CLI and the AWS SDKs work end to end. Clients that upload with SigV4 *streaming* signatures (`aws-chunked` framing) are refused with `501 NotImplemented` on the upload only, see [aws-chunked uploads](#aws-chunked-streaming-uploads-are-not-supported)
+- **S3-compatible HTTP API** -- the AWS CLI and the AWS SDKs work end to end, up and down, single-part and multipart. Clients that upload with SigV4 *streaming* signatures (`aws-chunked` framing) are refused with `501 NotImplemented` on the upload only -- in practice that is minio-go (`mc`, `warp`) over plain HTTP, see [aws-chunked uploads](#aws-chunked-streaming-uploads-are-not-supported)
 - **Native binary protocol** -- efficient Go client with connection pooling
 - **Built-in CLI** -- `jay cp/ls/rm/sync` over the native protocol, no aws-cli needed
 - **Multipart uploads** -- S3-compatible, up to 10,000 parts (this is `CreateMultipartUpload`/`UploadPart`, not the `aws-chunked` body framing below)
@@ -96,7 +104,10 @@ Jay listens on three ports:
 
 Only `:9000` is meant to face untrusted networks. The admin API creates
 accounts and tokens, and the native protocol carries the token secret in the
-clear, so keep both on an internal network.
+clear, so keep both on an internal network. A deployment that does not use the
+native protocol can turn its listener off entirely with an empty
+`JAY_NATIVE_ADDR` (or `native_addr: ""` in YAML); the startup line then reports
+`"native":"disabled"`.
 
 ## Command-line client
 
@@ -150,7 +161,7 @@ Jay accepts configuration from environment variables, a YAML config file, or bot
 | `JAY_DATA_DIR` | `./data` | Data directory for objects and metadata |
 | `JAY_LISTEN_ADDR` | `:9000` | S3 API listen address |
 | `JAY_ADMIN_ADDR` | `:9001` | Admin API listen address |
-| `JAY_NATIVE_ADDR` | `:4444` | Native protocol listen address |
+| `JAY_NATIVE_ADDR` | `:4444` | Native protocol listen address; **empty disables the native listener** (from the environment and from YAML alike) |
 | `JAY_ADMIN_TOKEN` | *(required)* | Bearer token for admin API; must be at least 32 characters |
 | `JAY_SIGNING_SECRET` | *(required)* | AES-GCM key for presigned URLs and token secrets; must be at least 32 characters |
 | `JAY_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
@@ -220,6 +231,7 @@ client:
 Rules:
 
 - **Precedence:** env var > YAML > hardcoded default. A conflict (both set to different values) logs `WARN` at startup but doesn't fail.
+- **An empty value means "not configured"** — `key: ""` in YAML and `JAY_KEY=""` in the environment are both discarded and the default stands. That is what keeps a template whose variable is unset (`listen_addr: ${JAY_LISTEN_ADDR}`, or a compose file passing the variable straight through) from moving the data directory or serving on port 80. The one exception is `native_addr`, whose empty value is the documented off switch for the native listener. When discarding an empty value actually overrides something, it is logged at `WARN`; when the key would have been empty anyway (`tls_cert`, `backup.dir`, `seed_token.*`, `client.*` above), it is not.
 - **Interpolation:** `${VAR}` and `${VAR:-default}` are resolved against `os.Getenv` on string values only. If neither is set, the value ends up empty (which then triggers the normal secret-length fail-fast if it's `admin_token` or `signing_secret`).
 - **Mixing sources:** perfectly fine to put non-sensitive config in YAML and keep secrets in env vars — interpolation is the bridge.
 
@@ -350,14 +362,14 @@ Available actions: `bucket:list`, `bucket:read-meta`, `bucket:write-meta`, `obje
 | GetBucketLocation | `GET /<bucket>?location` | Always the empty `<LocationConstraint/>` (us-east-1) |
 | ListObjectsV2 | `GET /<bucket>?list-type=2` | |
 | DeleteObjects | `POST /<bucket>?delete` | Batch delete, up to 1000 keys |
-| PutObject | `PUT /<bucket>/<key>` | |
+| PutObject | `PUT /<bucket>/<key>` | Verifies `Content-MD5` and `x-amz-checksum-*` when sent — see [Checksums](#checksums) |
 | GetObject | `GET /<bucket>/<key>` | |
 | HeadObject | `HEAD /<bucket>/<key>` | |
 | DeleteObject | `DELETE /<bucket>/<key>` | |
 | CopyObject | `PUT /<bucket>/<key>` | `x-amz-copy-source` header |
-| CreateMultipartUpload | `POST /<bucket>/<key>?uploads` | |
-| UploadPart | `PUT /<bucket>/<key>?uploadId=X&partNumber=N` | |
-| CompleteMultipartUpload | `POST /<bucket>/<key>?uploadId=X` | |
+| CreateMultipartUpload | `POST /<bucket>/<key>?uploads` | `x-amz-checksum-algorithm` is refused if jay cannot compute it, rather than ignored |
+| UploadPart | `PUT /<bucket>/<key>?uploadId=X&partNumber=N` | Same digest verification as `PutObject` |
+| CompleteMultipartUpload | `POST /<bucket>/<key>?uploadId=X` | A whole-object `x-amz-checksum-*` answers `501`; the parts are what get verified |
 | AbortMultipartUpload | `DELETE /<bucket>/<key>?uploadId=X` | |
 | ListParts | `GET /<bucket>/<key>?uploadId=X` | |
 | ListMultipartUploads | `GET /<bucket>?uploads` | `prefix`, `delimiter`, `key-marker`, `upload-id-marker`, `max-uploads`, `encoding-type` |
@@ -397,14 +409,17 @@ What this means per client:
 
 | Client | Status |
 |---|---|
-| **AWS CLI** (`aws s3` / `aws s3api`), AWS SDKs, boto3 | Fully working, up and down, single-part and multipart. They send a real payload hash |
-| **minio-go** and everything built on it — `mc`, `warp` | **Uploads fail** with `501`: minio-go frames every `PutObject` and `UploadPart` by default. Downloads, listings, `stat` and deletes work normally |
+| **AWS CLI** (`aws s3` / `aws s3api`), AWS SDKs, boto3 | Fully working, up and down, single-part and multipart, with or without `--checksum-algorithm`. They send a real payload hash |
+| **minio-go** over plain HTTP — `mc`, `warp` | **Uploads fail** with `501`: minio-go signs a non-TLS `PutObject` with the streaming signature, so it frames the body. Downloads, listings, `stat`, presigned URLs and deletes work normally |
+| **minio-go over HTTPS** — same `mc`, same `warp` | **Fully working**, uploads included. minio-go only reaches for the streaming signature when the connection is not secure, so over TLS it sends an unframed body. Measured with `mc` and with `warp mixed` (PUT/GET/DELETE/STAT), zero errors |
 | **Presigned URLs** (both styles) | Working. A presigned `PUT` that adds the framing is refused like any other |
 | **Jay's own CLI and native protocol** | Unaffected — the native protocol has no SigV4 and no framing |
 
-Implementing the decoder (and verifying the chained chunk signatures) is
-tracked separately; until it lands, the mode stays refused rather than silently
-accepted.
+So the practical workaround, if you must use `mc` or another minio-go client
+for uploads, is to [put jay behind TLS](#configuration) rather than to wait for
+the decoder. Implementing the decoder (and verifying the chained chunk
+signatures) is tracked separately; until it lands, the mode stays refused
+rather than silently accepted.
 
 #### Checksums
 
@@ -419,6 +434,48 @@ A ranged `GET` (`206 Partial Content`) carries **no** checksum header. The
 digest covers the whole object, so a client verifying it against a slice would
 reject a perfectly good transfer — which is every download the AWS CLI splits
 above its 8 MiB threshold.
+
+##### The checksum the client declares is verified
+
+Sending `Content-MD5` or `x-amz-checksum-*` on an upload is not decoration: it
+is the client asking *"prove that what reached you is what I sent"*. On
+`PutObject` and `UploadPart` jay hashes the body as it writes it and compares:
+
+| What arrives | Answer |
+|---|---|
+| A digest that matches the bytes | `200`, and the response carries the digest for the algorithm that was **asked about** |
+| A digest that does not match | `400 BadDigest`, and **nothing is written** |
+| A malformed `Content-MD5` | `400 InvalidDigest` |
+| A malformed `x-amz-checksum-*`, two of them at once, or one that disagrees with `x-amz-sdk-checksum-algorithm` | `400 InvalidRequest` |
+| An algorithm jay cannot compute | `400 InvalidRequest`, never a `200` carrying some other algorithm |
+
+The five algorithms S3 defines for object payloads — **CRC32, CRC32C,
+CRC64NVME, SHA1 and SHA256** — are all implemented, so no declared digest is
+ever ignored. CRC64NVME matters more than it looks: it is what the AWS CLI
+declares on **every** upload it makes, single-part and per part.
+
+"Nothing is written" is the load-bearing half, and it is verified against the
+data directory rather than against the response: the check runs between the
+`fsync` and the `rename`, so a refused upload never becomes a file under
+`buckets/`, never leaves a temp file, and never commits metadata. The same is
+true of a refused part — and because a part's path is derived from its number,
+refusing before the rename is also what keeps a bad retry from destroying the
+part that was already accepted.
+
+Two things jay deliberately does **not** do:
+
+- **`CompleteMultipartUpload` refuses a whole-object checksum with `501`.** S3
+  composes that value from the part digests; jay does not implement the
+  composition, and accepting the header would be answering `200` to a
+  verification that never happened. Each part is verified instead. No client
+  measured against jay sends it.
+- **The extra digest is not persisted.** A `PutObject` that declares CRC32 gets
+  its CRC32 back in that response, but only the SHA-256 is stored, so a later
+  `GetObject`/`HeadObject` reports `x-amz-checksum-sha256` and nothing else.
+
+Until 2026-09-02 none of this was true: a `PUT` carrying a deliberately wrong
+`x-amz-checksum-sha256` answered `200`, stored the object, and echoed back the
+digest jay had computed itself. `x-amz-checksum-algorithm` was ignored outright.
 
 #### DeleteObjects
 
@@ -441,10 +498,11 @@ part of it:
 | Malformed or empty `<Delete>` | `400 MalformedXML` |
 | `<VersionId>` on an entry | Per-key `<Error>` with `NotImplemented` — jay has no versioning, and deleting the live object instead would not be the operation asked for |
 
-`Content-MD5` is **verified when sent, and not required**. SigV4 already covers
-the body through `x-amz-content-sha256`, and the bearer and presigned paths
-cannot produce the header, so demanding it would reject working clients; a
-header that does not match the body answers `400 BadDigest`.
+`Content-MD5` is **verified when sent, and not required** — the same rule
+uploads follow (see [Checksums](#checksums)). SigV4 already covers the body
+through `x-amz-content-sha256`, and the bearer and presigned paths cannot
+produce the header, so demanding it would reject working clients; a header that
+does not match the body answers `400 BadDigest`.
 
 #### ListMultipartUploads
 
@@ -476,6 +534,46 @@ aws --endpoint-url http://localhost:9000 s3api delete-objects --bucket mybucket 
 aws --endpoint-url http://localhost:9000 s3api list-multipart-uploads --bucket mybucket
 aws --endpoint-url http://localhost:9000 s3api get-bucket-location --bucket mybucket
 ```
+
+### Conformance
+
+Everything this page claims about S3 compatibility is checked by
+[`scripts/conformance.sh`](scripts/conformance.sh), which runs on every CI
+build. It boots two throwaway jays (one plain HTTP, one TLS, both on random
+high ports, both deleted on exit) and drives them with clients jay did not
+write:
+
+```bash
+scripts/conformance.sh                # run whatever is installed
+scripts/conformance.sh --require-all  # a missing client fails the run (CI)
+scripts/conformance.sh --keep         # keep the work dir and the server logs
+```
+
+| Client | What it exercises |
+|---|---|
+| **aws-cli** (botocore) | `mb`/`rb --force`, `cp` up and down, `sync`, `rm --recursive`, `ListObjectsV2` with prefix and delimiter, multipart upload and ranged download of a 12 MiB object, `presign` (including an expired URL), `GetBucketLocation`, `ListMultipartUploads`, `DeleteObjects` whole and partial, a `501` sub-resource, and that `--checksum-algorithm` answers with the algorithm it asked for — all five of them |
+| **curl** (the `integrity` group) | That a *deliberately wrong* digest is refused and writes nothing — which no correct client will ever send, so it has to be forged by hand. Asserted against the data directory, not the response, plus a control that a correct digest is still accepted |
+| **aws-cli, second account** | That a token of account B can neither list, read, write, delete nor batch-delete inside a bucket of account A — each asserted against A's own view of the bucket, not against B's error message |
+| **mc** (minio-go) over HTTP | Listing, `stat`, `get`, bucket create/delete, `rm`, a presigned URL minted by minio-go, and that an upload is refused with `501` leaving nothing behind |
+| **mc** over HTTPS | That the same client uploads fine over TLS, small and 12 MiB, byte for byte |
+| **warp** (minio-go) | That `warp put` over HTTP is refused and writes nothing, and that `warp mixed` over TLS runs PUT/GET/DELETE/STAT with zero errors |
+
+Three things about how it reports:
+
+- **`SKIP` is not `PASS`.** A missing client skips its group and says so; a run
+  where every *client* group skipped exits `2` with `NOTHING WAS PROVEN`,
+  because a green exit that tested nothing is the failure mode this repo cares
+  about most. The `integrity` group runs on curl alone and is deliberately left
+  out of that count: it proves jay refuses a forged digest, not that jay
+  interoperates with anything.
+- **Every check asserts an effect** — bytes on the wire, an object present or
+  absent, a status code — never a confirmation message. `aws s3 cp --quiet`
+  hides its own failure line, so the checks read the exit code and then ask the
+  server what actually happened.
+- **The known limitations are asserted, not tolerated.** The `mc` and `warp`
+  upload refusals are checks that pass *because* the answer is `501` and
+  nothing was written. If the `aws-chunked` decoder ever lands, they go red on
+  purpose, so nobody can ship it without updating this page.
 
 ## Native Protocol
 
@@ -693,6 +791,17 @@ tested; the way to configure it is not built.
 - `GET /health/live` -- liveness probe (always 200)
 - `GET /health/ready` -- readiness probe (200 after startup recovery)
 
+**Access log:** every request writes one JSON line -- `request_id`, method,
+path, `remote_ip` (the key the pre-auth rate limiter buckets by, so a `429` can
+be attributed), status, duration. The `request_id` is the same value the response carries
+in `x-amz-request-id` and the same one inside the `<RequestId>` of an error
+document, on every path including rejections, so an ID quoted in a bug report
+finds its request:
+
+```bash
+grep '"request_id":"cc7a373fb33f4963"' jay.log
+```
+
 **Metrics:**
 ```bash
 curl http://localhost:9001/_jay/metrics \
@@ -705,7 +814,7 @@ Returns JSON with counters for PutObject, GetObject, DeleteObject, HeadObject, L
 
 - **Metadata**: bbolt embedded key-value store (single-file, ACID)
 - **Object storage**: Atomic writes (temp file, fsync, rename, fsync dir) with 2-level sharded directory layout
-- **Checksums**: SHA-256 computed on every write; reads are not re-hashed (integrity is the scrubber's job)
+- **Checksums**: SHA-256 computed on every write; a digest the client declares (`Content-MD5`, `x-amz-checksum-*`) is verified in that same pass, before the temp file is renamed into place. Reads are not re-hashed (integrity is the scrubber's job)
 - **Scrubber**: Background goroutine, every `JAY_SCRUB_INTERVAL_HOURS`; each tick verifies up to `JAY_SCRUB_MAX_PER_RUN` objects per bucket, resuming from a per-bucket cursor until the whole bucket has been covered
 - **GC**: Cleans temp files and empty dirs every 15 minutes, and reclaims multipart uploads abandoned for >24h
 - **Backup**: Hourly metadata snapshots, verified after write (corrupt snapshots are deleted), keeps 24, prunes after 7 days
