@@ -70,3 +70,50 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
+
+  # A separate job on purpose: it installs three third-party S3 clients, which
+  # the unit suite has no use for, and it runs in parallel with test/build/lint
+  # so the normal cycle does not get any longer.
+  #
+  # `go test` proves jay agrees with itself. This proves jay agrees with clients
+  # it did not write — the only thing that can back the README's compatibility
+  # claim. --require-all turns a client that failed to install into a failed
+  # run: a skipped check is not a passing one, and a green job that quietly
+  # tested nothing is exactly what this job exists to prevent.
+  conformance:
+    name: S3 conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+          cache: true
+
+      # aws-cli v2 ships with the runner image. Fail loudly if that changes
+      # rather than letting the group skip.
+      - name: Verify aws-cli
+        run: aws --version
+
+      # Into the runner's own bin rather than /usr/local/bin, which needs sudo.
+      # GITHUB_PATH only affects later steps, so the version check is its own.
+      - name: Install mc (minio-go)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$HOME/.local/bin/mc"
+          chmod +x "$HOME/.local/bin/mc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify mc
+        run: mc --version
+
+      # warp lands in $(go env GOPATH)/bin, which conformance.sh looks in.
+      # Unpinned on purpose: the point is to track what a current minio-go
+      # client does, not to freeze one.
+      - name: Install warp
+        run: go install github.com/minio/warp@latest
+
+      - name: Run the conformance suite
+        run: scripts/conformance.sh --require-all

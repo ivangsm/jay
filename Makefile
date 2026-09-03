@@ -4,7 +4,7 @@
 # (.golangci.yml) es lo que impide que la legibilidad se vuelva a degradar:
 # sin él, la deuda se acumula sin que nada avise.
 
-.PHONY: check fmt vet lint test build
+.PHONY: check fmt vet lint test build conformance
 
 check: fmt vet lint test build ## Todo lo que tiene que pasar antes de un commit
 	@echo "ok: check completo"
@@ -24,3 +24,9 @@ test: ## Tests unitarios
 
 build: ## Compila todo
 	go build ./...
+
+# Fuera de `check` a propósito: necesita aws-cli, mc y warp instalados y tarda
+# alrededor de un minuto. `go test` prueba que jay coincide consigo mismo; esto
+# prueba que coincide con clientes que no escribió.
+conformance: ## Suite de conformidad S3 contra aws-cli, mc y warp
+	./scripts/conformance.sh
