@@ -71,7 +71,7 @@ func main() {
 		"data_dir", cfg.DataDir,
 		"listen", cfg.ListenAddr,
 		"admin", cfg.AdminAddr,
-		"native", cfg.NativeAddr,
+		"native", nativeAddrForLog(cfg.NativeAddr),
 	)
 
 	// Open metadata database
@@ -165,13 +165,16 @@ func main() {
 	shutdownAll(log, shutdownAdmin, shutdownS3, shutdownNative, backupDone, backupWG)
 }
 
-// mustLoadConfig reads the configuration and refuses to continue if anything about
-// it is unsafe.
-//
-// Every check here is fail-fast on purpose: a jay that boots with a weak admin
-// token, or with two of the three seed-token fields set, is worse than one that
-// does not boot — the first looks healthy while handing out credentials that do
-// not work.
+// nativeAddrForLog renders the native listen address for the startup line. An
+// empty address is the off switch, and printing it as "" reads like a value
+// that failed to load rather than a listener that was asked not to exist.
+func nativeAddrForLog(addr string) string {
+	if addr == "" {
+		return "disabled"
+	}
+	return addr
+}
+
 // runClient resolves the connection settings through the same config pipeline
 // the server uses — env > YAML > defaults, every key registered in bindings()
 // — and hands them to the subcommand. It deliberately does NOT go through
@@ -195,6 +198,13 @@ func runClient(args []string) int {
 	}, args)
 }
 
+// mustLoadConfig reads the configuration and refuses to continue if anything
+// about it is unsafe.
+//
+// Every check here is fail-fast on purpose: a jay that boots with a weak admin
+// token, or with two of the three seed-token fields set, is worse than one that
+// does not boot — the first looks healthy while handing out credentials that do
+// not work.
 func mustLoadConfig() Config {
 	// An empty --config-file preserves the legacy env-only path. JAY_CONFIG_FILE
 	// is honoured as a fallback so container runtimes that only inject env vars
@@ -422,6 +432,9 @@ func startDataListeners(
 	}
 
 	if cfg.NativeAddr == "" {
+		// Said out loud, because the alternative reading of a missing
+		// "native server listening" line is "it failed to start".
+		log.Info("native server disabled", "reason", "native_addr is empty")
 		return shutdownS3, nil
 	}
 

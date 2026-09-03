@@ -506,6 +506,7 @@ func clearJAYEnv(t *testing.T) {
 		"JAY_SCRUB_BYTES_PER_SEC", "JAY_SCRUB_MAX_PER_RUN",
 		"JAY_BACKUP_DIR", "JAY_MIN_FREE_BYTES", "JAY_MAX_OBJECT_SIZE",
 		"JAY_SEED_TOKEN_ACCOUNT", "JAY_SEED_TOKEN_ID", "JAY_SEED_TOKEN_SECRET",
+		"JAY_TOKEN_ID", "JAY_TOKEN_SECRET",
 		"JAY_CONFIG_FILE",
 	}
 	for _, v := range vars {
@@ -546,4 +547,239 @@ func equalAny(got, want any) bool {
 		}
 	}
 	return got == want
+}
+
+// --- empty values: "unset" for every key but native_addr ---------------------
+
+// An empty JAY_NATIVE_ADDR is the documented off switch. It used to be
+// discarded as "unset", so the native protocol came up on the :4444 default.
+func TestLoadConfigFromSources_EmptyNativeAddrEnvDisablesNative(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_NATIVE_ADDR", "")
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.NativeAddr != "" {
+		t.Errorf("NativeAddr = %q, want empty", cfg.NativeAddr)
+	}
+}
+
+// Both doors, same answer: an asymmetry here is the same defect through the
+// other one.
+func TestLoadConfigFromSources_EmptyNativeAddrYAMLDisablesNative(t *testing.T) {
+	clearJAYEnv(t)
+
+	for _, body := range []string{"native_addr: \"\"\n", "native_addr:\n"} {
+		path := filepath.Join(t.TempDir(), "jay.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write yaml: %v", err)
+		}
+		log, _ := captureLogger()
+		cfg, err := LoadConfigFromSources(path, log)
+		if err != nil {
+			t.Fatalf("LoadConfigFromSources(%q): %v", body, err)
+		}
+		if cfg.NativeAddr != "" {
+			t.Errorf("%q: NativeAddr = %q, want empty", body, cfg.NativeAddr)
+		}
+	}
+}
+
+// An env var explicitly set to "" still wins over a YAML address: the operator
+// asked for the listener to be off.
+func TestLoadConfigFromSources_EmptyNativeAddrEnvOverridesYAML(t *testing.T) {
+	clearJAYEnv(t)
+	path := filepath.Join(t.TempDir(), "jay.yaml")
+	if err := os.WriteFile(path, []byte("native_addr: \":4012\"\n"), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	t.Setenv("JAY_NATIVE_ADDR", "")
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources(path, log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.NativeAddr != "" {
+		t.Errorf("NativeAddr = %q, want empty", cfg.NativeAddr)
+	}
+	if !strings.Contains(buf.String(), "env var overrides YAML value") {
+		t.Errorf("expected an override warning, got: %s", buf.String())
+	}
+}
+
+// Every other key keeps treating empty as "not configured". Honouring it
+// literally would make an unset compose variable relocate the store or serve
+// on :80.
+func TestLoadConfigFromSources_EmptyEnvKeepsDefaults(t *testing.T) {
+	clearJAYEnv(t)
+	for _, v := range []string{"JAY_DATA_DIR", "JAY_LISTEN_ADDR", "JAY_ADMIN_ADDR", "JAY_LOG_LEVEL"} {
+		t.Setenv(v, "")
+	}
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	def := defaultConfig()
+	if cfg.DataDir != def.DataDir || cfg.ListenAddr != def.ListenAddr ||
+		cfg.AdminAddr != def.AdminAddr || cfg.LogLevel != def.LogLevel {
+		t.Errorf("empty env vars changed the defaults: %+v", cfg)
+	}
+	if strings.Contains(buf.String(), "level\":\"ERROR") {
+		t.Errorf("empty env vars must not log parse errors, got: %s", buf.String())
+	}
+}
+
+// Same for numeric keys: an empty value is not a parse error to shout about.
+func TestLoadConfigFromSources_EmptyNumericEnvKeepsDefaultsQuietly(t *testing.T) {
+	clearJAYEnv(t)
+	for _, v := range []string{"JAY_RATE_LIMIT", "JAY_RATE_BURST", "JAY_MIN_FREE_BYTES", "JAY_MAX_OBJECT_SIZE"} {
+		t.Setenv(v, "")
+	}
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	def := defaultConfig()
+	if cfg.RateLimit != def.RateLimit || cfg.RateBurst != def.RateBurst ||
+		cfg.MinFreeBytes != def.MinFreeBytes || cfg.MaxObjectSize != def.MaxObjectSize {
+		t.Errorf("empty numeric env vars changed the defaults: %+v", cfg)
+	}
+	if strings.Contains(buf.String(), "invalid JAY_") {
+		t.Errorf("empty numeric env vars must not log an invalid-value error, got: %s", buf.String())
+	}
+}
+
+// The YAML side follows the same rule, and says so instead of silently
+// applying an empty string that would have moved the listener to :80.
+func TestLoadConfigFromSources_EmptyYAMLValueIgnoredAndWarned(t *testing.T) {
+	clearJAYEnv(t)
+	path := filepath.Join(t.TempDir(), "jay.yaml")
+	if err := os.WriteFile(path, []byte("listen_addr: \"\"\ndata_dir: \"\"\n"), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources(path, log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	def := defaultConfig()
+	if cfg.ListenAddr != def.ListenAddr || cfg.DataDir != def.DataDir {
+		t.Errorf("empty YAML values changed the defaults: %+v", cfg)
+	}
+	if !strings.Contains(buf.String(), "empty YAML value ignored") {
+		t.Errorf("expected a warning for the ignored keys, got: %s", buf.String())
+	}
+}
+
+// The secrets fail-fast lives in mustLoadConfig, which reads what the loader
+// returns: an empty JAY_ADMIN_TOKEN must never resolve to something that
+// passes the length check, and must not wipe a YAML-provided one either.
+func TestLoadConfigFromSources_EmptySecretEnvDoesNotDefeatFailFast(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_ADMIN_TOKEN", "")
+	t.Setenv("JAY_SIGNING_SECRET", "")
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if len(cfg.AdminToken) >= minSecretLen || len(cfg.SigningSecret) >= minSecretLen {
+		t.Fatalf("empty secret env vars produced acceptable secrets: %q / %q",
+			cfg.AdminToken, cfg.SigningSecret)
+	}
+}
+
+func TestLoadConfigFromSources_EmptySecretEnvKeepsYAMLSecret(t *testing.T) {
+	clearJAYEnv(t)
+	const token = "yaml-admin-token-with-enough-characters"
+	path := filepath.Join(t.TempDir(), "jay.yaml")
+	if err := os.WriteFile(path, []byte("admin_token: \""+token+"\"\n"), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	t.Setenv("JAY_ADMIN_TOKEN", "")
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources(path, log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.AdminToken != token {
+		t.Fatalf("AdminToken = %q, want the YAML value", cfg.AdminToken)
+	}
+}
+
+// The documented YAML template is written with ${VAR:-} on the optional keys,
+// so an ordinary boot interpolates several of them to "". Those must load
+// without a single warning: an empty tls_cert is the same as no tls_cert, and
+// seven lines of noise per boot is how operators learn to skip the one warning
+// that means something.
+func TestLoadConfigFromSources_EmptyYAMLValueOnOptionalKeysIsSilent(t *testing.T) {
+	clearJAYEnv(t)
+	path := filepath.Join(t.TempDir(), "jay.yaml")
+	body := "tls_cert: \"\"\ntls_key: \"\"\nbackup:\n  dir: \"\"\nseed_token:\n  account: \"\"\n  id: \"\"\n  secret: \"\"\nclient:\n  token_id: \"\"\n  token_secret: \"\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	log, buf := captureLogger()
+	if _, err := LoadConfigFromSources(path, log); err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("optional empty keys must load silently, got: %s", buf.String())
+	}
+}
+
+// Same on the env side: an unset variable passed through by a compose file
+// must not warn when the key would have been empty anyway.
+func TestLoadConfigFromSources_EmptyEnvOnOptionalKeysIsSilent(t *testing.T) {
+	clearJAYEnv(t)
+	for _, v := range []string{"JAY_TLS_CERT", "JAY_TLS_KEY", "JAY_BACKUP_DIR", "JAY_TOKEN_ID"} {
+		t.Setenv(v, "")
+	}
+
+	log, buf := captureLogger()
+	if _, err := LoadConfigFromSources("", log); err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("optional empty env vars must load silently, got: %s", buf.String())
+	}
+}
+
+// But an empty value that DOES override something says so, through either
+// door, with the same predicate.
+func TestLoadConfigFromSources_IgnoredEmptyIsReportedOnBothDoors(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_LISTEN_ADDR", "")
+	logEnv, bufEnv := captureLogger()
+	if _, err := LoadConfigFromSources("", logEnv); err != nil {
+		t.Fatalf("LoadConfigFromSources (env): %v", err)
+	}
+	if !strings.Contains(bufEnv.String(), "empty env var ignored") {
+		t.Errorf("expected a warning for the ignored env var, got: %s", bufEnv.String())
+	}
+
+	clearJAYEnv(t)
+	path := filepath.Join(t.TempDir(), "jay.yaml")
+	if err := os.WriteFile(path, []byte("listen_addr: \"\"\n"), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	logYAML, bufYAML := captureLogger()
+	if _, err := LoadConfigFromSources(path, logYAML); err != nil {
+		t.Fatalf("LoadConfigFromSources (yaml): %v", err)
+	}
+	if !strings.Contains(bufYAML.String(), "empty YAML value ignored") {
+		t.Errorf("expected a warning for the ignored YAML key, got: %s", bufYAML.String())
+	}
 }

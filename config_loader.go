@@ -33,7 +33,42 @@ type yamlKeyBinding struct {
 	// applyEnv applies the env var value to cfg. Returns true if the env var
 	// was set (regardless of parse success).
 	applyEnv func(cfg *Config, value string, log *slog.Logger) bool
+	// emptyIsValue marks a key whose empty value is a setting, not an absence.
+	// See emptyMeansUnset for why it defaults to false.
+	emptyIsValue bool
 }
+
+// withEmptyAsValue marks a binding whose empty value MEANS something, so the
+// overlays apply it instead of falling back to the default.
+//
+// Only native_addr carries it. An empty JAY_NATIVE_ADDR is the documented off
+// switch for the native protocol (main.go binds no listener when it is empty),
+// and before this flag existed only the YAML door honoured it: the env var was
+// discarded as "unset" and the listener came up on the :4444 default, so a
+// deployment that believed it had turned the native protocol off had the port
+// open — with a protocol that carries the token secret in the clear and is not
+// meant to face the internet.
+func withEmptyAsValue(b yamlKeyBinding) yamlKeyBinding {
+	b.emptyIsValue = true
+	return b
+}
+
+// emptyMeansUnset reports whether an empty value for this binding must be
+// ignored, leaving the default (or an earlier layer) in place.
+//
+// The default answer is yes, for every key but the one above, and that is a
+// deliberate refusal to make "empty" mean "empty" everywhere. Config arrives
+// through templates that produce an empty string for an unset variable —
+// `JAY_LISTEN_ADDR: ${JAY_LISTEN_ADDR}` in a compose file, `${VAR}` inside the
+// YAML — so an empty value is nearly always "nobody configured this", not a
+// choice. Honouring it literally would make an unset variable move the store
+// (data_dir "") or serve on port 80 (net/http reads an empty Addr as ":http"),
+// and would turn an empty numeric variable into an "invalid JAY_*" error line
+// on every boot.
+//
+// The rule is applied identically to the YAML overlay and the env overlay. An
+// asymmetry there is not a fix, it is the same defect through the other door.
+func emptyMeansUnset(b yamlKeyBinding) bool { return !b.emptyIsValue }
 
 // LoadConfigFromSources loads config from a YAML file (optional) merged with
 // env vars. Precedence: env vars > YAML > defaults. If yamlPath == "", the
@@ -108,7 +143,9 @@ func bindings() []yamlKeyBinding {
 		bindString("data_dir", "JAY_DATA_DIR", func(c *Config) *string { return &c.DataDir }),
 		bindString("listen_addr", "JAY_LISTEN_ADDR", func(c *Config) *string { return &c.ListenAddr }),
 		bindString("admin_addr", "JAY_ADMIN_ADDR", func(c *Config) *string { return &c.AdminAddr }),
-		bindString("native_addr", "JAY_NATIVE_ADDR", func(c *Config) *string { return &c.NativeAddr }),
+		// Empty disables the native listener — from YAML and from the
+		// environment alike. See withEmptyAsValue.
+		withEmptyAsValue(bindString("native_addr", "JAY_NATIVE_ADDR", func(c *Config) *string { return &c.NativeAddr })),
 		bindString("admin_token", "JAY_ADMIN_TOKEN", func(c *Config) *string { return &c.AdminToken }),
 		bindString("signing_secret", "JAY_SIGNING_SECRET", func(c *Config) *string { return &c.SigningSecret }),
 		bindString("log_level", "JAY_LOG_LEVEL", func(c *Config) *string { return &c.LogLevel }),
@@ -141,6 +178,16 @@ func applyYAMLOverlay(cfg *Config, yamlMap map[string]any, log *slog.Logger) err
 		if !ok {
 			continue
 		}
+		// `key:` with no value and `key: ""` are the same statement; both
+		// reach the binding as an empty string when the key admits one.
+		if isEmptyYAMLValue(raw) {
+			if emptyMeansUnset(b) {
+				reportIgnoredEmpty(b, cfg, log, "config: empty YAML value ignored, key treated as unset",
+					"key", b.path)
+				continue
+			}
+			raw = ""
+		}
 		if _, _, err := b.applyYAML(cfg, raw, log); err != nil {
 			return fmt.Errorf("yaml key %q: %w", b.path, err)
 		}
@@ -148,10 +195,61 @@ func applyYAMLOverlay(cfg *Config, yamlMap map[string]any, log *slog.Logger) err
 	return nil
 }
 
+// isEmptyYAMLValue reports whether a decoded YAML value carries nothing: an
+// explicit empty string, or a key written with no value at all.
+func isEmptyYAMLValue(raw any) bool {
+	if raw == nil {
+		return true
+	}
+	s, ok := raw.(string)
+	return ok && s == ""
+}
+
+// discardLog swallows what a probing call would otherwise print.
+var discardLog = slog.New(slog.DiscardHandler)
+
+// reportIgnoredEmpty logs msg only when dropping the empty value actually
+// decided something — that is, when the value in place is not already the
+// empty one.
+//
+// The silent half matters as much as the loud half: the config file this repo
+// documents is written as `tls_cert: ${JAY_TLS_CERT:-}`, `backup.dir:
+// ${JAY_BACKUP_DIR:-}`, `seed_token.*`, `client.*` — keys that interpolate to
+// an empty string on every ordinary boot and whose default is empty anyway.
+// Warning about those would put seven lines of noise in front of every
+// operator until they learned to skip config warnings, which is how the one
+// that matters (`listen_addr: ${JAY_LISTEN_ADDR}` with the variable unset,
+// silently keeping :9000) gets skipped too.
+func reportIgnoredEmpty(b yamlKeyBinding, cfg *Config, log *slog.Logger, msg string, args ...any) {
+	if !applyingEmptyWouldChange(b, cfg) {
+		return
+	}
+	log.Warn(msg, args...)
+}
+
+// applyingEmptyWouldChange reports whether an empty value would move the
+// config away from what it holds right now. A binding that cannot represent an
+// empty value at all (every number and bool) answers yes: the key was written
+// and will do nothing, which is worth one line.
+func applyingEmptyWouldChange(b yamlKeyBinding, cfg *Config) bool {
+	probe := *cfg
+	if _, _, err := b.applyYAML(&probe, "", discardLog); err != nil {
+		return true
+	}
+	return probe != *cfg
+}
+
 func applyEnvOverlay(cfg *Config, yamlMap map[string]any, log *slog.Logger) {
 	for _, b := range bindings() {
 		v, ok := os.LookupEnv(b.envVar)
-		if !ok || v == "" {
+		if !ok {
+			continue
+		}
+		if v == "" && emptyMeansUnset(b) {
+			// Same rule as the YAML overlay, and reported the same way: the
+			// two doors must not disagree about what an empty value means.
+			reportIgnoredEmpty(b, cfg, log, "config: empty env var ignored, treated as unset",
+				"key", b.path, "env_var", b.envVar)
 			continue
 		}
 		// Detect conflict: YAML had a non-empty value for this key.
