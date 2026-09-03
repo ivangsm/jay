@@ -194,17 +194,24 @@ func (h *Handler) SetMaxObjectSize(n int64) {
 
 // ServeHTTP dispatches S3 requests based on path and method.
 //
-// Middleware order matters: withIPRateLimit runs BEFORE any authentication so
-// that bcrypt/SigV4 verification is never reached by a source that is already
-// over its budget (see withIPRateLimit). withRateLimit then applies the
-// per-token quota once the caller is known.
+// Middleware order matters, outermost first:
 //
-// withUnframedBody sits between the two rate limiters and withPresigned: an
-// aws-chunked body cannot be served by any handler, so it is refused before a
-// signature is verified and before a single byte is read — but still inside the
-// IP limiter, so refusing it is not free for the sender.
+//   - withRequestID mints the ID before anything can answer, so the header the
+//     client gets, the access log line and the <RequestId> of any error
+//     document are the same string on EVERY path — including the ones that
+//     never reach the credential middleware (429, aws-chunked 501, presigned
+//     rejection). It used to be minted in the middle of the chain and the
+//     logger, sitting outside it, logged request_id="" on every request.
+//   - withIPRateLimit runs BEFORE any authentication so that bcrypt/SigV4
+//     verification is never reached by a source that is already over its
+//     budget (see withIPRateLimit). withRateLimit then applies the per-token
+//     quota once the caller is known.
+//   - withUnframedBody sits between the two rate limiters and withPresigned: an
+//     aws-chunked body cannot be served by any handler, so it is refused before
+//     a signature is verified and before a single byte is read — but still
+//     inside the IP limiter, so refusing it is not free for the sender.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	handler := h.withLogging(h.withIPRateLimit(h.withUnframedBody(h.withPresigned(h.withRequestIDAndAuth(h.withRateLimit(h.dispatch))))))
+	handler := h.withRequestID(h.withLogging(h.withIPRateLimit(h.withUnframedBody(h.withPresigned(h.withAuth(h.withRateLimit(h.dispatch)))))))
 	handler(w, r)
 }
 
@@ -252,11 +259,13 @@ func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 // credentials for. Authorization still runs: every handler calls requireAuth,
 // so the token's actions, bucket scope and prefix scope apply exactly as they
 // would to a Bearer or SigV4-header request.
+//
+// It does NOT mint a request ID. This branch skips withAuth, and back when the
+// ID was minted there it had to mint its own — which is exactly how a request
+// could log one ID and answer with another. withRequestID now owns the single
+// generator and this path inherits its value like every other.
 func (h *Handler) servePresigned(w http.ResponseWriter, r *http.Request, token *meta.Token) {
-	reqID := generateRequestID()
-	ctx := context.WithValue(r.Context(), ctxKeyRequestID, reqID)
-	ctx = context.WithValue(ctx, ctxKeyToken, token)
-	w.Header().Set("x-amz-request-id", reqID)
+	ctx := context.WithValue(r.Context(), ctxKeyToken, token)
 	h.withRateLimit(h.dispatch)(w, r.WithContext(ctx))
 }
 

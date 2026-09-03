@@ -48,23 +48,51 @@ func generateRequestID() string {
 	return hex.EncodeToString(buf[:])
 }
 
-// withRequestIDAndAuth combines request ID generation and authentication into
-// a single middleware to avoid multiple r.WithContext / request clone calls.
-func (h *Handler) withRequestIDAndAuth(next http.HandlerFunc) http.HandlerFunc {
+// withRequestID mints the request ID and is the OUTERMOST middleware of the
+// chain. Everything else — the access log, the x-amz-request-id header, the
+// <RequestId> inside every error document — reads it from the context this
+// middleware installs, so all three carry the same value by construction.
+//
+// It has to be first because a middleware only ever sees the request it was
+// handed. While the ID was minted halfway down the chain (in the old
+// withRequestIDAndAuth), the logger wrapping it kept reading the ORIGINAL
+// request and logged request_id="" on every single line, while the client got
+// a real ID in its header: the one thing a request ID is for — finding the
+// request someone reports by the ID the server gave them — did not work.
+//
+// Minting it here also covers the paths that never reach the credential
+// middleware, all of which used to answer with no ID at all: the pre-auth IP
+// rate limiter's 429, the aws-chunked 501, and a presigned URL that fails to
+// verify.
+//
+// The ID is always generated, never taken from an inbound header: a client
+// that could choose its own request ID could collide with someone else's or
+// forge log entries.
+func (h *Handler) withRequestID(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqID := generateRequestID()
-
-		token, _ := h.auth.Authenticate(r)
-
-		ctx := context.WithValue(r.Context(), ctxKeyRequestID, reqID)
-		ctx = context.WithValue(ctx, ctxKeyToken, token)
-
 		w.Header().Set("x-amz-request-id", reqID)
-		next(w, r.WithContext(ctx))
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyRequestID, reqID)))
 	}
 }
 
-// withLogging logs each request with structured logging and adds security headers.
+// withAuth authenticates the request and puts the resulting token (possibly
+// nil) in the context. The request ID is already there — see withRequestID.
+//
+// Authentication never fails here: an unauthenticated request carries a nil
+// token and every handler refuses it through requireAuth, which is also what
+// lets a public-read bucket answer without credentials.
+func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, _ := h.auth.Authenticate(r)
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyToken, token)))
+	}
+}
+
+// withLogging logs each request with structured logging and adds security
+// headers. It must stay INSIDE withRequestID: the ID it logs is the one that
+// travelled to the client, and it can only read it from a context an outer
+// middleware installed.
 func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -73,10 +101,22 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: 200}
 		next(sw, r)
+		// remote_ip is the key the pre-auth rate limiter buckets by, so
+		// without it a 429 names no one and JAY_TRUST_PROXY_HEADERS cannot be
+		// verified from the outside. It is derived exactly like the limiter
+		// derives it, from the same function, so the log cannot disagree with
+		// the decision.
+		//
+		// The token is deliberately NOT logged: withAuth resolves it further
+		// down the chain, into a context this middleware never sees, and the
+		// only way to hoist it back out is the shared mutable pointer the
+		// request-ID fix just removed. An identity in the log is not worth
+		// re-introducing the bug the log line is here to expose.
 		h.log.Info("request",
 			slog.String("request_id", requestIDFromContext(r.Context())),
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
+			slog.String("remote_ip", clientIP(r, h.trustProxyHeaders)),
 			slog.Int("status", sw.status),
 			slog.Duration("duration", time.Since(start)),
 		)

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"net/http"
 
 	"github.com/ivangsm/jay/auth"
@@ -19,7 +18,8 @@ import (
 // on work that did not happen is the failure this repo exists to avoid, so
 // until there is a decoder the mode is refused.
 //
-// Why here, ahead of every other middleware except the IP rate limiter:
+// Why here, ahead of every other middleware except request ID, logging and the
+// IP rate limiter:
 //
 //   - Nothing is written. The refusal happens before authentication, before
 //     dispatch and before any handler opens a temp file, so a rejected upload
@@ -43,14 +43,12 @@ func (h *Handler) withUnframedBody(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// This middleware runs before withRequestIDAndAuth, so the error
-		// response would otherwise carry an empty RequestId.
-		reqID := generateRequestID()
-		w.Header().Set("x-amz-request-id", reqID)
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyRequestID, reqID))
-
+		// The ID comes from withRequestID, the outermost middleware, so this
+		// refusal reports the same one the client reads in x-amz-request-id
+		// and the same one the access log line carries. This middleware used
+		// to mint its own because the ID was generated further down the chain.
 		h.log.Warn("rejected aws-chunked request body",
-			"request_id", reqID,
+			"request_id", requestIDFromContext(r.Context()),
 			"method", r.Method,
 			"path", r.URL.Path,
 			"indicator", hdr,
