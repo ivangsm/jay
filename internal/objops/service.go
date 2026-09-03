@@ -212,6 +212,15 @@ type PutOptions struct {
 	// UserMetadata holds x-amz-meta-* headers (HTTP) or a decoded metadata map
 	// (native proto). Keys should already be lower-cased and sanitized.
 	UserMetadata map[string]string
+
+	// Checksum verifies what the client declared about the bytes it is
+	// sending. The transport builds it (see NewChecksumVerifier) because the
+	// declaration arrives in transport-specific headers, and a malformed one
+	// has to be refused before the body is read at all.
+	//
+	// nil means the client declared nothing — which is what the native
+	// protocol always passes, since it carries no client digest.
+	Checksum *ChecksumVerifier
 }
 
 // PutResult is returned by PutObject so both transports can produce the same
@@ -223,6 +232,12 @@ type PutResult struct {
 // PutObject writes body to the store, commits metadata, and returns the new
 // object. On overwrite the previous version's physical file is GC'd. On
 // metadata commit failure the freshly-written file is cleaned up.
+//
+// An upload that is over the size ceiling, or whose bytes do not hash to the
+// digest the client declared (opts.Checksum), is refused before the store
+// renames the temp file into place: nothing is written and no metadata is
+// committed. Answering 200 to a client that asked jay to verify its bytes, and
+// verifying nothing, is the defect this path exists to prevent.
 //
 // The caller is responsible for setting Content-Length / Content-Type headers
 // on HTTP responses — PutObject only fills *meta.Object and returns it.
@@ -261,21 +276,38 @@ func (s *Service) PutObject(
 		src = io.LimitReader(src, maxSize+1)
 	}
 
-	teeBody := io.TeeReader(src, md5Hash)
+	// Every hasher sees the same single pass: the store's SHA-256, the ETag's
+	// MD5, and whatever else the client asked to have checked. The body is
+	// never buffered and never read twice.
+	teeBody := opts.Checksum.Wrap(io.TeeReader(src, md5Hash))
 
-	checksum, size, locationRef, err := s.store.WriteObject(bucket.ID, objectID, teeBody)
-	if err != nil {
-		s.log.Error("objops: write object", "err", err, "bucket", bucketName, "key", key)
-		return nil, err
+	// The two ways an upload can be refused after its bytes have been read —
+	// too big, or a digest that does not match what the client declared — both
+	// run here, between the fsync and the rename. A refusal therefore leaves no
+	// file under buckets/ and no metadata, rather than writing an object and
+	// deleting it afterwards.
+	var seenSize int64
+	verify := func(sha256Hex string, size int64) error {
+		seenSize = size
+		if maxSize > 0 && size > maxSize {
+			return ErrObjectTooLarge
+		}
+		return opts.Checksum.Verify(sha256Hex, hex.EncodeToString(md5Hash.Sum(nil)))
 	}
 
-	if maxSize > 0 && size > maxSize {
-		// Never commit metadata for an over-sized object — drop the bytes we
-		// just wrote so a rejected upload cannot fill the disk.
-		s.store.Cleanup(locationRef)
-		s.log.Warn("objops: object exceeds max size",
-			"bucket", bucketName, "key", key, "size", size, "max", maxSize)
-		return nil, ErrObjectTooLarge
+	checksum, size, locationRef, err := s.store.WriteObjectVerified(bucket.ID, objectID, teeBody, verify)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrObjectTooLarge):
+			s.log.Warn("objops: object exceeds max size",
+				"bucket", bucketName, "key", key, "size", seenSize, "max", maxSize)
+		case errors.Is(err, ErrBadDigest), errors.Is(err, ErrInvalidDigest):
+			s.log.Warn("objops: client checksum mismatch, nothing written",
+				"err", err, "bucket", bucketName, "key", key)
+		default:
+			s.log.Error("objops: write object", "err", err, "bucket", bucketName, "key", key)
+		}
+		return nil, err
 	}
 
 	etag := hex.EncodeToString(md5Hash.Sum(nil))

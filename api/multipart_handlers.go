@@ -16,6 +16,7 @@ import (
 
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/internal/jsonx"
+	"github.com/ivangsm/jay/internal/objops"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -113,6 +114,20 @@ func (h *Handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// S3 lets the client name here the algorithm every part will carry. jay
+	// does not need to remember it — each part is verified against the digest
+	// it declares — but an algorithm jay cannot compute has to be refused now
+	// rather than after the client has uploaded a gigabyte of parts. The AWS
+	// CLI sends CRC64NVME on every multipart it starts.
+	if declared := strings.TrimSpace(r.Header.Get(checksumAlgorithmHeader)); declared != "" {
+		if _, ok := objops.ParseChecksumAlgorithm(declared); !ok {
+			writeS3Error(w, r, http.StatusBadRequest, s3ErrInvalidRequest,
+				"Invalid checksum declaration: unknown checksum algorithm "+declared,
+				"/"+bucketName+"/"+objectKey)
+			return
+		}
+	}
+
 	uploadID := uuid.New().String()
 
 	contentType := r.Header.Get("Content-Type")
@@ -151,8 +166,19 @@ func (h *Handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Req
 }
 
 // handleUploadPart handles PUT /<bucket>/<key>?uploadId=X&partNumber=N
+//
+// A part carries its own client-declared checksum and is verified exactly like
+// a whole object: a part accepted with a digest nobody checked corrupts the
+// assembled object just as thoroughly, and by then the client has an ETag and a
+// 200 for every part it sent. The AWS CLI declares a CRC64NVME on every part.
 func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucketName, objectKey, uploadID string) {
 	token, ok := h.requireAuth(r, w, meta.ActionMultipartUpload, bucketName, objectKey)
+	if !ok {
+		return
+	}
+
+	resource := "/" + bucketName + "/" + objectKey
+	verifier, ok := h.checksumVerifierFor(w, r, resource)
 	if !ok {
 		return
 	}
@@ -192,21 +218,36 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 	}
 
 	md5Hash := md5.New()
-	body := io.TeeReader(src, md5Hash)
+	body := verifier.Wrap(io.TeeReader(src, md5Hash))
 
-	checksum, size, locationRef, err := h.store.WritePart(uploadID, partNumber, body)
-	if err != nil {
-		h.log.Error("write part", "err", err, "upload", uploadID, "part", partNumber)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to write part", "/"+bucketName+"/"+objectKey)
-		return
+	// Both refusals — over the ceiling, or a digest that does not describe the
+	// bytes — run between the fsync and the rename, so a rejected part never
+	// takes the place of the part it is retrying. See store.WriteVerifier.
+	var seenSize int64
+	verify := func(sha256Hex string, size int64) error {
+		seenSize = size
+		if maxSize > 0 && size > maxSize {
+			return objops.ErrObjectTooLarge
+		}
+		return verifier.Verify(sha256Hex, hex.EncodeToString(md5Hash.Sum(nil)))
 	}
 
-	if maxSize > 0 && size > maxSize {
-		h.store.Cleanup(locationRef)
-		h.log.Warn("upload part exceeds max size",
-			"upload", uploadID, "part", partNumber, "size", size, "max", maxSize)
-		writeS3Error(w, r, http.StatusBadRequest, s3ErrEntityTooLarge,
-			"Your proposed upload exceeds the maximum allowed object size", "/"+bucketName+"/"+objectKey)
+	checksum, size, locationRef, err := h.store.WritePartVerified(uploadID, partNumber, body, verify)
+	if err != nil {
+		switch {
+		case errors.Is(err, objops.ErrObjectTooLarge):
+			h.log.Warn("upload part exceeds max size",
+				"upload", uploadID, "part", partNumber, "size", seenSize, "max", maxSize)
+			writeS3Error(w, r, http.StatusBadRequest, s3ErrEntityTooLarge,
+				"Your proposed upload exceeds the maximum allowed object size", resource)
+		case errors.Is(err, objops.ErrBadDigest):
+			h.log.Warn("upload part checksum mismatch, nothing written",
+				"err", err, "upload", uploadID, "part", partNumber)
+			h.writeChecksumError(w, r, err, resource)
+		default:
+			h.log.Error("write part", "err", err, "upload", uploadID, "part", partNumber)
+			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to write part", resource)
+		}
 		return
 	}
 
@@ -229,6 +270,7 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 	}
 
 	w.Header().Set("ETag", formatETag(etag))
+	setDeclaredChecksumHeader(w, verifier)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -250,6 +292,23 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	}
 	if token == nil || existing.InitiatedBy != token.AccountID {
 		writeS3Error(w, r, http.StatusForbidden, S3ErrAccessDenied, "Access denied", "/"+bucketName+"/"+objectKey)
+		return
+	}
+
+	// A checksum declared here describes the ASSEMBLED object, and S3 computes
+	// it by composing the part digests rather than by hashing the result. jay
+	// does not implement that composition, and accepting the header would mean
+	// answering 200 to a verification that never happened — the exact defect
+	// PND-0189 removed from PutObject. 501, the same answer every other
+	// unimplemented S3 feature gets here. No measured client sends it: the AWS
+	// CLI's CompleteMultipartUpload carries part numbers and ETags only.
+	for _, candidate := range checksumValueHeaders {
+		if strings.TrimSpace(r.Header.Get(candidate.header)) == "" {
+			continue
+		}
+		writeS3Error(w, r, http.StatusNotImplemented, S3ErrNotImplemented,
+			"Whole-object checksum verification on CompleteMultipartUpload is not implemented; "+
+				"jay verifies each part instead", "/"+bucketName+"/"+objectKey)
 		return
 	}
 

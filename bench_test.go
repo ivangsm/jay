@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ivangsm/jay/admin"
 	jayapi "github.com/ivangsm/jay/api"
@@ -57,6 +58,22 @@ var objectSizes = []struct {
 
 var concurrencyLevels = []int{1, 4, 16}
 
+// benchHTTPClient gives the S3 benchmarks the connection reuse a real S3 client
+// gets. Go's default transport keeps only 2 idle connections per host, so a
+// 16-way parallel benchmark closes 14 of every 16 connections, spends most of
+// its time in TCP handshakes and eventually exhausts the ephemeral port range
+// (macOS fails with "can't assign requested address"). That measures the dial
+// path, not the server, and it understates HTTP against the native client,
+// which pools connections by design. Sizing the pool above the highest
+// concurrency level keeps the comparison about the server.
+var benchHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 256,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // setupS3Bench creates an S3 HTTP test server for benchmarks.
 func setupS3Bench(b *testing.B) *benchS3Env {
 	b.Helper()
@@ -95,7 +112,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	req, _ := http.NewRequest(http.MethodPost, adminSrv.URL+"/_jay/accounts", strings.NewReader(acctBody))
 	req.Header.Set("Authorization", "Bearer test-admin")
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := benchHTTPClient.Do(req)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -113,7 +130,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	req, _ = http.NewRequest(http.MethodPost, adminSrv.URL+"/_jay/tokens", strings.NewReader(tokenBody))
 	req.Header.Set("Authorization", "Bearer test-admin")
 	req.Header.Set("Content-Type", "application/json")
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = benchHTTPClient.Do(req)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -132,7 +149,7 @@ func setupS3Bench(b *testing.B) *benchS3Env {
 	// Create benchmark bucket
 	req, _ = http.NewRequest(http.MethodPut, s3Srv.URL+"/benchbucket", nil)
 	req.Header.Set("Authorization", authHeader)
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = benchHTTPClient.Do(req)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -244,7 +261,7 @@ func BenchmarkS3PutObject(b *testing.B) {
 				key := fmt.Sprintf("/benchbucket/obj-put-%d", i)
 				req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 				req.Header.Set("Authorization", env.auth)
-				resp, err := http.DefaultClient.Do(req)
+				resp, err := benchHTTPClient.Do(req)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -266,7 +283,7 @@ func BenchmarkS3GetObject(b *testing.B) {
 		key := "/benchbucket/obj-get-" + sz.name
 		req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 		req.Header.Set("Authorization", env.auth)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := benchHTTPClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -278,7 +295,7 @@ func BenchmarkS3GetObject(b *testing.B) {
 			for b.Loop() {
 				req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+key, nil)
 				req.Header.Set("Authorization", env.auth)
-				resp, err := http.DefaultClient.Do(req)
+				resp, err := benchHTTPClient.Do(req)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -299,7 +316,7 @@ func BenchmarkS3HeadObject(b *testing.B) {
 	key := "/benchbucket/obj-head"
 	req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 	req.Header.Set("Authorization", env.auth)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := benchHTTPClient.Do(req)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -309,7 +326,7 @@ func BenchmarkS3HeadObject(b *testing.B) {
 	for b.Loop() {
 		req, _ := http.NewRequest(http.MethodHead, env.s3Server.URL+key, nil)
 		req.Header.Set("Authorization", env.auth)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := benchHTTPClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -332,7 +349,7 @@ func BenchmarkS3DeleteObject(b *testing.B) {
 		key := fmt.Sprintf("/benchbucket/obj-del-%d", i)
 		req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 		req.Header.Set("Authorization", env.auth)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := benchHTTPClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -341,7 +358,7 @@ func BenchmarkS3DeleteObject(b *testing.B) {
 
 		req, _ = http.NewRequest(http.MethodDelete, env.s3Server.URL+key, nil)
 		req.Header.Set("Authorization", env.auth)
-		resp, err = http.DefaultClient.Do(req)
+		resp, err = benchHTTPClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -357,7 +374,7 @@ func BenchmarkS3ListObjects(b *testing.B) {
 		key := fmt.Sprintf("/benchbucket/list-obj-%03d", i)
 		req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, strings.NewReader("x"))
 		req.Header.Set("Authorization", env.auth)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := benchHTTPClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -368,7 +385,7 @@ func BenchmarkS3ListObjects(b *testing.B) {
 	for b.Loop() {
 		req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+"/benchbucket?list-type=2", nil)
 		req.Header.Set("Authorization", env.auth)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := benchHTTPClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -399,7 +416,7 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 		// Initiate
 		req, _ := http.NewRequest(http.MethodPost, env.s3Server.URL+key+"?uploads", nil)
 		req.Header.Set("Authorization", env.auth)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := benchHTTPClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -417,7 +434,7 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 			url := fmt.Sprintf("%s%s?partNumber=%d&uploadId=%s", env.s3Server.URL, key, p+1, uploadID)
 			req, _ := http.NewRequest(http.MethodPut, url, bytes.NewReader(parts[p]))
 			req.Header.Set("Authorization", env.auth)
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := benchHTTPClient.Do(req)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -435,7 +452,7 @@ func BenchmarkS3MultipartUpload(b *testing.B) {
 
 		req, _ = http.NewRequest(http.MethodPost, fmt.Sprintf("%s%s?uploadId=%s", env.s3Server.URL, key, uploadID), strings.NewReader(xmlParts.String()))
 		req.Header.Set("Authorization", env.auth)
-		resp, err = http.DefaultClient.Do(req)
+		resp, err = benchHTTPClient.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -468,7 +485,7 @@ func BenchmarkS3PutObjectConcurrent(b *testing.B) {
 						key := fmt.Sprintf("/benchbucket/conc-put-%d", n)
 						req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 						req.Header.Set("Authorization", env.auth)
-						resp, err := http.DefaultClient.Do(req)
+						resp, err := benchHTTPClient.Do(req)
 						if err != nil {
 							b.Fatal(err)
 						}
@@ -490,7 +507,7 @@ func BenchmarkS3GetObjectConcurrent(b *testing.B) {
 			key := fmt.Sprintf("/benchbucket/conc-get-%s-%d", sz.name, j)
 			req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
 			req.Header.Set("Authorization", env.auth)
-			resp, _ := http.DefaultClient.Do(req)
+			resp, _ := benchHTTPClient.Do(req)
 			_ = resp.Body.Close()
 		}
 
@@ -506,7 +523,7 @@ func BenchmarkS3GetObjectConcurrent(b *testing.B) {
 						key := fmt.Sprintf("/benchbucket/conc-get-%s-%d", sz.name, n%16)
 						req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+key, nil)
 						req.Header.Set("Authorization", env.auth)
-						resp, err := http.DefaultClient.Do(req)
+						resp, err := benchHTTPClient.Do(req)
 						if err != nil {
 							b.Fatal(err)
 						}

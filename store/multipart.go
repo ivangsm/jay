@@ -22,7 +22,20 @@ func PartPath(uploadID string, partNumber int) string {
 
 // WritePart writes a multipart part to disk with fsync.
 // Returns the SHA-256 checksum, size, and location ref.
+//
+// Equivalent to WritePartVerified with no verifier.
 func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (checksum string, size int64, locationRef string, err error) {
+	return s.WritePartVerified(uploadID, partNumber, body, nil)
+}
+
+// WritePartVerified behaves like WritePart but calls verify (when non-nil)
+// between the fsync and the rename. See WriteVerifier.
+//
+// Aborting before the rename matters more here than it does for a whole object:
+// the part path is derived from the part number, so a re-upload of part N lands
+// on the file part N already occupies. Refusing after the rename would have
+// destroyed the previously accepted part while its metadata still pointed at it.
+func (s *Store) WritePartVerified(uploadID string, partNumber int, body io.Reader, verify WriteVerifier) (checksum string, size int64, locationRef string, err error) {
 	locationRef = PartPath(uploadID, partNumber)
 	finalPath, err := s.SafePath(locationRef)
 	if err != nil {
@@ -63,6 +76,14 @@ func (s *Store) WritePart(uploadID string, partNumber int, body io.Reader) (chec
 	}
 
 	checksum = hex.EncodeToString(h.Sum(nil))
+
+	// Refuse before the rename: the final part path may already hold a part
+	// that was accepted, and this one has not earned the right to replace it.
+	if verify != nil {
+		if err = verify(checksum, size); err != nil {
+			return "", 0, "", err
+		}
+	}
 
 	// Atomic rename directly from the .writing temp to the final part path.
 	if err = os.Rename(tmpPath, finalPath); err != nil {

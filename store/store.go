@@ -102,15 +102,40 @@ func (s *Store) absPath(locationRef string) string {
 	return filepath.Join(s.dataDir, locationRef)
 }
 
+// WriteVerifier is the last chance to refuse a write. It runs after the bytes
+// are on disk and fsynced, and BEFORE the temp file is renamed into the object
+// tree — so returning an error leaves nothing behind: the deferred cleanup
+// removes the temp file, no path under buckets/ is ever created, and the caller
+// never gets a locationRef to commit metadata for.
+//
+// It is given the SHA-256 (hex) and the size of what actually arrived. Any
+// other digest the caller wanted (an ETag's MD5, a client-declared CRC) has
+// already been fed by the same reader, so it can be checked here too.
+//
+// The alternative — verifying after WriteObject returns and deleting the object
+// file — leaves a real object on disk for the duration, and a crash inside that
+// window hands recovery/ an orphan to quarantine over an upload that was
+// refused. This hook exists so that window does not exist.
+type WriteVerifier func(sha256Hex string, size int64) error
+
 // WriteObject streams body to a temp file, computes SHA-256, then atomically
 // moves it to its final location. Returns checksum, size, and locationRef.
+//
+// Equivalent to WriteObjectVerified with no verifier.
+func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum string, size int64, locationRef string, err error) {
+	return s.WriteObjectVerified(bucketID, objectID, body, nil)
+}
+
+// WriteObjectVerified behaves like WriteObject but calls verify (when non-nil)
+// between the fsync and the rename. See WriteVerifier.
 //
 // The sequence ensures durability:
 //  1. Write to temp file (.writing suffix so GC can identify in-flight writes)
 //  2. fsync temp file
-//  3. Rename directly to final path
-//  4. fsync parent directory
-func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum string, size int64, locationRef string, err error) {
+//  3. verify — an error here aborts, and nothing reaches the object tree
+//  4. Rename directly to final path
+//  5. fsync parent directory
+func (s *Store) WriteObjectVerified(bucketID, objectID string, body io.Reader, verify WriteVerifier) (checksum string, size int64, locationRef string, err error) {
 	// Create temp file in same filesystem for atomic rename.
 	// The .writing suffix signals to GC that this file is actively being written.
 	tmpFile, err := os.CreateTemp(filepath.Join(s.dataDir, "tmp"), "jay-upload-*.writing")
@@ -145,6 +170,15 @@ func (s *Store) WriteObject(bucketID, objectID string, body io.Reader) (checksum
 	}
 
 	checksum = hex.EncodeToString(h.Sum(nil))
+
+	// Refuse before the rename, not after: at this point the bytes are still a
+	// temp file nothing points at, and the deferred cleanup above removes it.
+	if verify != nil {
+		if err = verify(checksum, size); err != nil {
+			return "", 0, "", err
+		}
+	}
+
 	locationRef = ObjectPath(bucketID, objectID)
 	finalPath := s.absPath(locationRef)
 

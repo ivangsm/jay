@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -647,5 +648,94 @@ func TestObjectExists_False(t *testing.T) {
 	obj := &meta.Object{LocationRef: "buckets/bkt/objects/aa/bb/aabbccdd11223344"}
 	if s.ObjectExists(obj) {
 		t.Error("ObjectExists = true, want false for non-existent object")
+	}
+}
+
+// --- WriteObjectVerified / WritePartVerified ---
+
+// countFiles counts every regular file under the store's data dir.
+func countFiles(t *testing.T, s *Store) int {
+	t.Helper()
+	n := 0
+	err := filepath.Walk(s.DataDir(), func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	return n
+}
+
+// A refused write must leave the store exactly as it found it — no object under
+// buckets/, and no temp file either. The temp file matters: it is what a
+// verifier running AFTER the rename would have turned into a real object for
+// the duration, and what a crash in that window hands recovery/ to quarantine.
+func TestWriteObjectVerified_AbortsBeforeRename(t *testing.T) {
+	s := newTestStore(t)
+	before := countFiles(t, s)
+
+	sentinel := errors.New("refused")
+	_, _, _, err := s.WriteObjectVerified("bucket1", "abcdef1234567890", strings.NewReader("payload"),
+		func(string, int64) error { return sentinel })
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("want the verifier's error back, got %v", err)
+	}
+	if got := countFiles(t, s); got != before {
+		t.Fatalf("a refused write left %d file(s) behind", got-before)
+	}
+}
+
+// The verifier sees what actually arrived, not what the caller hoped for.
+func TestWriteObjectVerified_ReceivesTheRealDigestAndSize(t *testing.T) {
+	s := newTestStore(t)
+	data := []byte("verify me")
+
+	var gotSum string
+	var gotSize int64
+	checksum, size, _, err := s.WriteObjectVerified("bucket1", "abcdef1234567890", bytes.NewReader(data),
+		func(sha256Hex string, n int64) error {
+			gotSum, gotSize = sha256Hex, n
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("WriteObjectVerified: %v", err)
+	}
+	if gotSum != sha256Hex(data) || gotSum != checksum {
+		t.Fatalf("verifier saw %q, want %q", gotSum, sha256Hex(data))
+	}
+	if gotSize != int64(len(data)) || gotSize != size {
+		t.Fatalf("verifier saw size %d, want %d", gotSize, len(data))
+	}
+}
+
+// A refused part must not replace the part already sitting at its path: the
+// path is derived from the part number, so a retry aims at an existing file.
+func TestWritePartVerified_RefusedRetryKeepsTheAcceptedPart(t *testing.T) {
+	s := newTestStore(t)
+
+	_, _, loc, err := s.WritePart("upload-1", 1, strings.NewReader("good part"))
+	if err != nil {
+		t.Fatalf("WritePart: %v", err)
+	}
+	path := filepath.Join(s.DataDir(), loc)
+
+	sentinel := errors.New("refused")
+	if _, _, _, err := s.WritePartVerified("upload-1", 1, strings.NewReader("bad part"),
+		func(string, int64) error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("want the verifier's error back, got %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the accepted part is gone: %v", err)
+	}
+	if string(got) != "good part" {
+		t.Fatalf("the accepted part was overwritten: %q", got)
 	}
 }

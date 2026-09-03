@@ -64,8 +64,19 @@ func (h *Handler) mapObjopsErr(w http.ResponseWriter, r *http.Request, err error
 // the authorize → write → commit path. Preserves the existing response
 // headers: ETag (quoted per S3), x-amz-checksum-sha256 (base64, see
 // setChecksumHeader), 200 OK.
+//
+// A Content-MD5 or x-amz-checksum-* the client sends is verified against the
+// bytes that arrive, and a mismatch answers 400 with nothing written — see
+// objops.PutObject. The declaration is parsed before the body is read so a
+// malformed one never opens a temp file.
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	token, ok := h.requireAuth(r, w, meta.ActionObjectPut, bucketName, objectKey)
+	if !ok {
+		return
+	}
+
+	resource := "/" + bucketName + "/" + objectKey
+	verifier, ok := h.checksumVerifierFor(w, r, resource)
 	if !ok {
 		return
 	}
@@ -87,16 +98,19 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		r.Context(), token,
 		bucketName, objectKey, contentType,
 		r.Body,
-		objops.PutOptions{UserMetadata: userMeta},
+		objops.PutOptions{UserMetadata: userMeta, Checksum: verifier},
 		h.buildIdentity(r, meta.ActionObjectPut),
 	)
 	if err != nil {
+		if h.writeChecksumError(w, r, err, resource) {
+			return
+		}
 		if h.mapObjopsErr(w, r, err, bucketName, objectKey) {
 			return
 		}
 		h.log.Error("put object", "err", err, "bucket", bucketName, "key", objectKey)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-			"Failed to store object", "/"+bucketName+"/"+objectKey)
+			"Failed to store object", resource)
 		return
 	}
 
@@ -107,6 +121,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 
 	w.Header().Set("ETag", formatETag(obj.ETag))
 	setChecksumHeader(w, obj.ChecksumSHA256)
+	setDeclaredChecksumHeader(w, verifier)
 	w.WriteHeader(http.StatusOK)
 }
 
