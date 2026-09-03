@@ -221,6 +221,20 @@ type PutOptions struct {
 	// nil means the client declared nothing — which is what the native
 	// protocol always passes, since it carries no client digest.
 	Checksum *ChecksumVerifier
+
+	// SkipETag skips computing the MD5 ETag for this upload when true.
+	// ChecksumSHA256 is always computed regardless — this only drops the
+	// second, S3-only hash. Only honored when Checksum is nil: a caller that
+	// declared a checksum to verify keeps getting MD5 computed in case that
+	// verification needs it, since correctness of a check the caller
+	// explicitly asked for outranks the optimization.
+	//
+	// The S3 HTTP handler never sets this — S3 clients expect a real ETag.
+	// It exists for the native protocol, which never promised S3 ETag
+	// semantics and, for a caller that doesn't use the ETag field at all,
+	// pays for a hash (MD5, no hardware acceleration on most CPUs) that costs
+	// more than the SHA-256 jay computes anyway for its own integrity check.
+	SkipETag bool
 }
 
 // PutResult is returned by PutObject so both transports can produce the same
@@ -259,9 +273,18 @@ func (s *Service) PutObject(
 
 	objectID := uuid.New().String()
 
-	md5Hash := md5Pool.Get().(hash.Hash)
-	md5Hash.Reset()
-	defer md5Pool.Put(md5Hash)
+	// SkipETag drops the MD5 pass entirely (pool Get/Reset/Sum all cost
+	// something) when nothing needs it: only the S3 handler's ETag response
+	// field and Checksum's own MD5 verification (Content-MD5) ever consume
+	// it, and the second one only applies when the caller actually declared
+	// a checksum to verify.
+	computeMD5 := !opts.SkipETag || opts.Checksum != nil
+	var md5Hash hash.Hash
+	if computeMD5 {
+		md5Hash = md5Pool.Get().(hash.Hash)
+		md5Hash.Reset()
+		defer md5Pool.Put(md5Hash)
+	}
 
 	var src io.Reader = emptyReader{}
 	if body != nil {
@@ -277,9 +300,13 @@ func (s *Service) PutObject(
 	}
 
 	// Every hasher sees the same single pass: the store's SHA-256, the ETag's
-	// MD5, and whatever else the client asked to have checked. The body is
-	// never buffered and never read twice.
-	teeBody := opts.Checksum.Wrap(io.TeeReader(src, md5Hash))
+	// MD5 (when computed), and whatever else the client asked to have
+	// checked. The body is never buffered and never read twice.
+	teeSrc := src
+	if md5Hash != nil {
+		teeSrc = io.TeeReader(src, md5Hash)
+	}
+	teeBody := opts.Checksum.Wrap(teeSrc)
 
 	// The two ways an upload can be refused after its bytes have been read —
 	// too big, or a digest that does not match what the client declared — both
@@ -292,7 +319,11 @@ func (s *Service) PutObject(
 		if maxSize > 0 && size > maxSize {
 			return ErrObjectTooLarge
 		}
-		return opts.Checksum.Verify(sha256Hex, hex.EncodeToString(md5Hash.Sum(nil)))
+		var md5Hex string
+		if md5Hash != nil {
+			md5Hex = hex.EncodeToString(md5Hash.Sum(nil))
+		}
+		return opts.Checksum.Verify(sha256Hex, md5Hex)
 	}
 
 	checksum, size, locationRef, err := s.store.WriteObjectVerified(bucket.ID, objectID, teeBody, verify)
@@ -310,7 +341,10 @@ func (s *Service) PutObject(
 		return nil, err
 	}
 
-	etag := hex.EncodeToString(md5Hash.Sum(nil))
+	var etag string
+	if md5Hash != nil {
+		etag = hex.EncodeToString(md5Hash.Sum(nil))
+	}
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}

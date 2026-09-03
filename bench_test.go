@@ -476,22 +476,41 @@ func BenchmarkS3PutObjectConcurrent(b *testing.B) {
 		for _, conc := range concurrencyLevels {
 			b.Run(fmt.Sprintf("%s/conc%d", sz.name, conc), func(b *testing.B) {
 				b.SetBytes(sz.size)
-				b.SetParallelism(conc)
 				var counter atomic.Int64
 				b.ResetTimer()
-				b.RunParallel(func(pb *testing.PB) {
-					for pb.Next() {
-						n := counter.Add(1)
-						key := fmt.Sprintf("/benchbucket/conc-put-%d", n)
-						req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
-						req.Header.Set("Authorization", env.auth)
-						resp, err := benchHTTPClient.Do(req)
-						if err != nil {
-							b.Fatal(err)
+
+				// conc real goroutines, not b.SetParallelism(conc)'s
+				// conc*GOMAXPROCS: that scales with the host's core count, so
+				// the same "conc1/4/16" label would mean a different amount of
+				// real parallelism depending on the machine, and would not be
+				// comparable to the native benchmarks below, which already use
+				// a literal goroutine count.
+				var wg sync.WaitGroup
+				iterCh := make(chan struct{}, b.N)
+				for range b.N {
+					iterCh <- struct{}{}
+				}
+				close(iterCh)
+
+				for range conc {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						for range iterCh {
+							n := counter.Add(1)
+							key := fmt.Sprintf("/benchbucket/conc-put-%d", n)
+							req, _ := http.NewRequest(http.MethodPut, env.s3Server.URL+key, bytes.NewReader(data))
+							req.Header.Set("Authorization", env.auth)
+							resp, err := benchHTTPClient.Do(req)
+							if err != nil {
+								b.Error(err)
+								return
+							}
+							_ = resp.Body.Close()
 						}
-						_ = resp.Body.Close()
-					}
-				})
+					}()
+				}
+				wg.Wait()
 			})
 		}
 	}
@@ -514,23 +533,36 @@ func BenchmarkS3GetObjectConcurrent(b *testing.B) {
 		for _, conc := range concurrencyLevels {
 			b.Run(fmt.Sprintf("%s/conc%d", sz.name, conc), func(b *testing.B) {
 				b.SetBytes(sz.size)
-				b.SetParallelism(conc)
 				var counter atomic.Int64
 				b.ResetTimer()
-				b.RunParallel(func(pb *testing.PB) {
-					for pb.Next() {
-						n := counter.Add(1)
-						key := fmt.Sprintf("/benchbucket/conc-get-%s-%d", sz.name, n%16)
-						req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+key, nil)
-						req.Header.Set("Authorization", env.auth)
-						resp, err := benchHTTPClient.Do(req)
-						if err != nil {
-							b.Fatal(err)
+
+				var wg sync.WaitGroup
+				iterCh := make(chan struct{}, b.N)
+				for range b.N {
+					iterCh <- struct{}{}
+				}
+				close(iterCh)
+
+				for range conc {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						for range iterCh {
+							n := counter.Add(1)
+							key := fmt.Sprintf("/benchbucket/conc-get-%s-%d", sz.name, n%16)
+							req, _ := http.NewRequest(http.MethodGet, env.s3Server.URL+key, nil)
+							req.Header.Set("Authorization", env.auth)
+							resp, err := benchHTTPClient.Do(req)
+							if err != nil {
+								b.Error(err)
+								return
+							}
+							_, _ = io.Copy(io.Discard, resp.Body)
+							_ = resp.Body.Close()
 						}
-						_, _ = io.Copy(io.Discard, resp.Body)
-						_ = resp.Body.Close()
-					}
-				})
+					}()
+				}
+				wg.Wait()
 			})
 		}
 	}
@@ -553,6 +585,34 @@ func BenchmarkNativePutObject(b *testing.B) {
 				key := fmt.Sprintf("obj-put-%d", i)
 				_, err := env.client.PutObject("benchbucket", key,
 					bytes.NewReader(data), sz.size, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				i++
+			}
+		})
+	}
+}
+
+// BenchmarkNativePutObjectSkipETag mirrors BenchmarkNativePutObject with
+// SkipETag set — the configuration a native-protocol-only caller like falco
+// actually uses, since it never reads PutResult.ETag. Compare against
+// BenchmarkS3PutObject, not BenchmarkNativePutObject: the latter still pays
+// for the MD5 ETag jay's S3 handler can never skip, so it measures the
+// protocol-framing difference alone, not what a real native caller gets.
+func BenchmarkNativePutObjectSkipETag(b *testing.B) {
+	env := setupNativeBench(b)
+
+	for _, sz := range objectSizes {
+		data := makeData(sz.size)
+		b.Run(sz.name, func(b *testing.B) {
+			b.SetBytes(sz.size)
+			b.ResetTimer()
+			i := 0
+			for b.Loop() {
+				key := fmt.Sprintf("obj-put-skipetag-%d", i)
+				_, err := env.client.PutObject("benchbucket", key,
+					bytes.NewReader(data), sz.size, &client.PutOptions{SkipETag: true})
 				if err != nil {
 					b.Fatal(err)
 				}

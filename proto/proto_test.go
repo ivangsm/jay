@@ -721,7 +721,7 @@ func TestEncoder_StringTooLarge(t *testing.T) {
 	if _, err := proto.EncodeBucketKey("bucket", huge); !errors.Is(err, proto.ErrFieldTooLarge) {
 		t.Errorf("proto.EncodeBucketKey with oversized key: got %v, want proto.ErrFieldTooLarge", err)
 	}
-	if _, err := proto.EncodePutObjectRequest("bucket", "key", "text/plain", map[string]string{"x": huge}); !errors.Is(err, proto.ErrFieldTooLarge) {
+	if _, err := proto.EncodePutObjectRequest("bucket", "key", "text/plain", map[string]string{"x": huge}, false); !errors.Is(err, proto.ErrFieldTooLarge) {
 		t.Errorf("proto.EncodePutObjectRequest with oversized metadata value: got %v, want proto.ErrFieldTooLarge", err)
 	}
 	if _, err := proto.EncodeObjectInfo("text/plain", 1, "etag", "sum", "now", map[string]string{"x": huge}); !errors.Is(err, proto.ErrFieldTooLarge) {
@@ -740,8 +740,55 @@ func TestEncoder_CollectionTooLarge(t *testing.T) {
 	for i := range math.MaxUint16 + 1 {
 		md[strconv.Itoa(i)] = "v"
 	}
-	if _, err := proto.EncodePutObjectRequest("bucket", "key", "", md); !errors.Is(err, proto.ErrFieldTooLarge) {
+	if _, err := proto.EncodePutObjectRequest("bucket", "key", "", md, false); !errors.Is(err, proto.ErrFieldTooLarge) {
 		t.Errorf("proto.EncodePutObjectRequest with %d metadata entries: got %v, want proto.ErrFieldTooLarge", len(md), err)
+	}
+}
+
+// DecodePutObjectRequest must accept a message encoded before skipETag
+// existed on the wire — the trailing field is optional, not required, so an
+// older client's request cannot start failing on a newer server.
+func TestDecodePutObjectRequest_PreSkipETagWireFormat(t *testing.T) {
+	// Hand-build a request the same way EncodePutObjectRequest did before the
+	// skipETag field was added: bucket, key, contentType, metadata, and
+	// nothing else.
+	e := proto.NewEncoder(nil)
+	e.String("bucket")
+	e.String("key")
+	e.String("text/plain")
+	e.StringMap(nil)
+	old := e.Bytes()
+	if err := e.Err(); err != nil {
+		t.Fatalf("build legacy request: %v", err)
+	}
+
+	bucket, key, contentType, _, skipETag, err := proto.DecodePutObjectRequest(old)
+	if err != nil {
+		t.Fatalf("DecodePutObjectRequest on pre-skipETag wire format: %v", err)
+	}
+	if bucket != "bucket" || key != "key" || contentType != "text/plain" {
+		t.Fatalf("unexpected decode: bucket=%q key=%q contentType=%q", bucket, key, contentType)
+	}
+	if skipETag {
+		t.Fatal("expected skipETag to default to false when absent from the wire")
+	}
+}
+
+// EncodePutObjectRequest/DecodePutObjectRequest must round-trip skipETag in
+// both directions.
+func TestEncodeDecodePutObjectRequest_SkipETag(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		data, err := proto.EncodePutObjectRequest("bucket", "key", "text/plain", nil, want)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		_, _, _, _, got, err := proto.DecodePutObjectRequest(data)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got != want {
+			t.Fatalf("skipETag round-trip: want %v, got %v", want, got)
+		}
 	}
 }
 

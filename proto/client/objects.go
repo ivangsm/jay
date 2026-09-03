@@ -11,6 +11,15 @@ import (
 type PutOptions struct {
 	ContentType string
 	Metadata    map[string]string
+
+	// SkipETag asks jay to skip computing the MD5 ETag for this upload.
+	// ChecksumSHA256 on the returned PutResult is unaffected — jay always
+	// computes that one. Only set this when nothing reads PutResult.ETag:
+	// jay's S3 HTTP API always returns a real ETag regardless of this field,
+	// since that surface's clients expect one; this only saves the native
+	// protocol's own MD5 pass, which profiling showed costs more CPU per
+	// upload than the SHA-256 checksum jay computes either way.
+	SkipETag bool
 }
 
 // PutResult contains the result of a PutObject operation.
@@ -40,12 +49,14 @@ type GetResult struct {
 func (c *Client) PutObject(bucket, key string, data io.Reader, size int64, opts *PutOptions) (*PutResult, error) {
 	var contentType string
 	var metadata map[string]string
+	var skipETag bool
 	if opts != nil {
 		contentType = opts.ContentType
 		metadata = opts.Metadata
+		skipETag = opts.SkipETag
 	}
 
-	meta, err := proto.EncodePutObjectRequest(bucket, key, contentType, metadata)
+	meta, err := proto.EncodePutObjectRequest(bucket, key, contentType, metadata, skipETag)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}

@@ -374,6 +374,28 @@ func TestPutObject_NoOptions(t *testing.T) {
 	}
 }
 
+func TestPutObject_SkipETag(t *testing.T) {
+	env := setup(t)
+
+	if _, err := env.client.CreateBucket("put-bucket-skip"); err != nil {
+		t.Fatal(err)
+	}
+
+	content := []byte("skip my etag")
+	result, err := env.client.PutObject("put-bucket-skip", "hello.txt",
+		bytes.NewReader(content), int64(len(content)),
+		&PutOptions{ContentType: "text/plain", SkipETag: true})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if result.ETag != "" {
+		t.Fatalf("expected empty ETag with SkipETag, got %q", result.ETag)
+	}
+	if result.ChecksumSHA256 == "" {
+		t.Fatal("expected non-empty ChecksumSHA256 even with SkipETag")
+	}
+}
+
 func TestGetObject_Success(t *testing.T) {
 	env := setup(t)
 

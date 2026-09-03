@@ -32,7 +32,7 @@ func mapObjopsStatus(err error) (status byte, msg, code string, handled bool) {
 // frame data MUST be drained (up to MaxDrainSize) so the connection stays
 // in a readable state for the next request.
 func (h *connHandler) handlePutObject(req *request) error {
-	bucket, key, contentType, metadata, err := DecodePutObjectRequest(req.meta)
+	bucket, key, contentType, metadata, skipETag, err := DecodePutObjectRequest(req.meta)
 	if err != nil {
 		if derr := drainData(req); derr != nil {
 			return derr
@@ -54,7 +54,7 @@ func (h *connHandler) handlePutObject(req *request) error {
 		context.TODO(), h.token,
 		bucket, key, contentType,
 		req.data,
-		objops.PutOptions{UserMetadata: metadata},
+		objops.PutOptions{UserMetadata: metadata, SkipETag: skipETag},
 		h.identity(meta.ActionObjectPut),
 	)
 	if err != nil {

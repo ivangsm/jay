@@ -172,6 +172,12 @@ func NewDecoder(buf []byte) *Decoder {
 // Err returns the first error hit while decoding, if any.
 func (d *Decoder) Err() error { return d.err }
 
+// HasMore reports whether there are unread bytes left in the buffer. Decoders
+// for messages with a field added after the wire format shipped use this to
+// read that field only when it is actually present, instead of treating an
+// older, shorter message as a decode error.
+func (d *Decoder) HasMore() bool { return d.err == nil && d.off < len(d.buf) }
+
 func (d *Decoder) String() string {
 	if d.err != nil {
 		return ""
@@ -346,9 +352,10 @@ func DecodeBucket(data []byte) (string, error) {
 	return s, d.Err()
 }
 
-// EncodePutObjectRequest encodes a PutObject request.
-func EncodePutObjectRequest(bucket, key, contentType string, metadata map[string]string) ([]byte, error) {
-	n := 2 + len(bucket) + 2 + len(key) + 2 + len(contentType) + 2
+// EncodePutObjectRequest encodes a PutObject request. skipETag asks the server
+// to skip computing the MD5 ETag for this upload (see DecodePutObjectRequest).
+func EncodePutObjectRequest(bucket, key, contentType string, metadata map[string]string, skipETag bool) ([]byte, error) {
+	n := 2 + len(bucket) + 2 + len(key) + 2 + len(contentType) + 2 + 1
 	for k, v := range metadata {
 		n += 4 + len(k) + len(v)
 	}
@@ -357,17 +364,28 @@ func EncodePutObjectRequest(bucket, key, contentType string, metadata map[string
 	e.String(key)
 	e.String(contentType)
 	e.StringMap(metadata)
+	e.Bool(skipETag)
 	return e.Bytes(), e.Err()
 }
 
 // DecodePutObjectRequest decodes a PutObject request.
-func DecodePutObjectRequest(data []byte) (bucket, key, contentType string, metadata map[string]string, err error) {
+//
+// skipETag is trailing and optional on the wire: a request encoded by a
+// client that predates this field simply ends after metadata, and HasMore
+// reports false, so skipETag decodes to false — the same "always compute the
+// ETag" behavior every client got before this field existed. A newer client
+// talking to an older server that doesn't call this decoder's skipETag path
+// at all is equally safe: the trailing byte is just never read.
+func DecodePutObjectRequest(data []byte) (bucket, key, contentType string, metadata map[string]string, skipETag bool, err error) {
 	d := NewDecoder(data)
 	bucket = d.String()
 	key = d.String()
 	contentType = d.String()
 	metadata = d.StringMap()
-	return bucket, key, contentType, metadata, d.Err()
+	if d.HasMore() {
+		skipETag = d.Bool()
+	}
+	return bucket, key, contentType, metadata, skipETag, d.Err()
 }
 
 // EncodePutResponse encodes a PutObject/UploadPart response.
