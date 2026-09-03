@@ -137,7 +137,7 @@ c.PutObject(ctx, "media", "photo.jpg", r, size)</code></pre>
           background pass, where it costs nothing on the hot path.
         </p>
         <table class="bench">
-          <caption>Median of 5 runs on an Apple M4. Ratios transfer; absolute numbers are a laptop's.</caption>
+          <caption>Measured on a 16-thread Ryzen 7 desktop. Ratios transfer; absolute numbers are this machine's.</caption>
           <thead>
             <tr>
               <th scope="col">Operation</th>
@@ -147,18 +147,22 @@ c.PutObject(ctx, "media", "photo.jpg", r, size)</code></pre>
             </tr>
           </thead>
           <tbody>
-            <tr><th scope="row">GetObject, 10 MB</th><td>6.6 GB/s</td><td>8.5 GB/s</td><td class="ratio">1.28&times;</td></tr>
-            <tr><th scope="row">GetObject, 1 KB</th><td>70.9 &micro;s</td><td>43.2 &micro;s</td><td class="ratio">1.64&times;</td></tr>
-            <tr><th scope="row">HeadObject</th><td>51.7 &micro;s</td><td>27.7 &micro;s</td><td class="ratio">1.87&times;</td></tr>
-            <tr><th scope="row">GetObject 1 MB, 16 in flight</th><td>109.1 &micro;s</td><td>55.6 &micro;s</td><td class="ratio">1.96&times;</td></tr>
-            <tr class="tie"><th scope="row">PutObject, 1 MB</th><td>21.5 ms</td><td>22.2 ms</td><td class="ratio">no gain</td></tr>
+            <tr><th scope="row">GetObject, 10 MB</th><td>5.5 GB/s</td><td>7.5 GB/s</td><td class="ratio">1.36&times;</td></tr>
+            <tr><th scope="row">GetObject, 1 KB</th><td>81.3 &micro;s</td><td>38.9 &micro;s</td><td class="ratio">2.09&times;</td></tr>
+            <tr><th scope="row">HeadObject</th><td>59.8 &micro;s</td><td>27.0 &micro;s</td><td class="ratio">2.21&times;</td></tr>
+            <tr><th scope="row">GetObject 1 KB, 16 in flight</th><td>26.3 &micro;s</td><td>5.0 &micro;s</td><td class="ratio">5.23&times;</td></tr>
+            <tr><th scope="row">PutObject, 10 MB (<code>SkipETag</code>)</th><td>23.0 ms</td><td>10.8 ms</td><td class="ratio">2.13&times;</td></tr>
           </tbody>
         </table>
         <p class="band-foot">
-          That last row is not a rounding error. A write is two <code>fsync</code>
-          calls, and 20 ms of waiting for the disk swamps whatever the wire format
-          costs — so the native protocol does not make sequential writes faster,
-          and this page is not going to pretend it does.
+          Writes get the same treatment: <code>PutOptions.SkipETag</code> drops
+          the MD5 checksum S3 is required to compute but the native protocol
+          isn't — MD5 has no hardware acceleration on this CPU, and costs
+          roughly twice what the SHA-256 Jay always computes does. Skip it and
+          native wins at every size measured, with the margin <em>growing</em>
+          instead of shrinking as objects get bigger — up to 5.2&times; with 16
+          requests in flight, because a smaller fixed cost per connection gets
+          paid more often as concurrency rises.
           <a href={`${base}internals/performance/`}>The full table, and how to reproduce it</a>.
         </p>
       </section>
