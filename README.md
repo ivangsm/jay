@@ -7,815 +7,127 @@
 [![Release](https://img.shields.io/github/v/release/ivangsm/jay?sort=semver)](https://github.com/ivangsm/jay/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ivangsm/jay/blob/main/LICENSE)
 
-S3-compatible object storage server with a native binary protocol, written in Go.
+S3-compatible object storage with a native binary protocol, written in Go.
 
-Jay provides dual API access: an S3-compatible HTTP API and a high-performance native binary protocol for Go clients. It uses bbolt for metadata, atomic file writes with SHA-256 checksums, and includes background integrity scrubbing, garbage collection, and automated backups.
+Metadata lives in one bbolt file, object bytes live on the filesystem, and the
+whole state of the server is one directory. There is no database to provision,
+no broker to point it at and no cache to warm — four direct dependencies and one
+static binary.
 
-"S3-compatible" here means a specific, measured list rather than a boast. The
-[Supported Operations](#supported-operations) table is the whole surface;
-everything else answers `501`. The one client limitation worth knowing before
-you start is that **minio-go clients (`mc`, `warp`) cannot upload over plain
-HTTP** — see [aws-chunked uploads](#aws-chunked-streaming-uploads-are-not-supported).
-What the claim rests on is [`scripts/conformance.sh`](#conformance), which
-drives a throwaway jay with the real aws-cli, `mc` and `warp` on every CI run.
+Two protocols share the same storage and the same authorization layer: an
+**S3-compatible HTTP API**, so the AWS CLI and the AWS SDKs work unchanged, and a
+**binary protocol** with a Go client for callers that would rather not pay for
+HTTP framing, XML and a per-request signature.
 
-## Features
+**📖 Documentation: <https://ivangsm.github.io/jay/>**
 
-- **S3-compatible HTTP API** -- the AWS CLI and the AWS SDKs work end to end, up and down, single-part and multipart. Clients that upload with SigV4 *streaming* signatures (`aws-chunked` framing) are refused with `501 NotImplemented` on the upload only -- in practice that is minio-go (`mc`, `warp`) over plain HTTP, see [aws-chunked uploads](#aws-chunked-streaming-uploads-are-not-supported)
-- **Native binary protocol** -- efficient Go client with connection pooling
-- **Built-in CLI** -- `jay cp/ls/rm/sync` over the native protocol, no aws-cli needed
-- **Multipart uploads** -- S3-compatible, up to 10,000 parts (this is `CreateMultipartUpload`/`UploadPart`, not the `aws-chunked` body framing below)
-- **Presigned URLs** -- two forms: standard SigV4 query-string URLs that boto3, the AWS SDKs, minio-go and `aws s3 presign` produce, plus Jay's own `X-Jay-*` HMAC form
-- **Range requests** -- partial object reads (`bytes=0-499`, suffix, open-ended)
-- **CopyObject** -- server-side copy between buckets
-- **Bucket policies** -- prefix-based allow/deny rules with IP conditions
-- **Token authentication** -- scoped by actions, buckets, and key prefixes
-- **AWS SigV4** -- both the `Authorization` header form and the query-string (presigned URL) form
-- **Integrity scrubbing** -- incremental SHA-256 verification (cursor-based, resumes across ticks)
-- **Quarantine** -- automatic isolation of corrupted objects
-- **Rate limiting** -- per-token token bucket with configurable rate/burst
-- **TLS** -- optional HTTPS for S3 and admin APIs
-- **Health checks** -- liveness and readiness probes
-- **Metrics** -- JSON endpoint with operation counters and byte totals
-- **Backups** -- hourly metadata snapshots with automatic pruning
+---
 
 ## Install
 
-### Docker
-
 ```bash
+# Docker
 docker run -d --name jay \
   -p 9000:9000 -p 127.0.0.1:9001:9001 \
   -v jay_data:/data \
   -e JAY_ADMIN_TOKEN=$(openssl rand -base64 32) \
   -e JAY_SIGNING_SECRET=$(openssl rand -base64 32) \
   ghcr.io/ivangsm/jay:latest
-```
 
-Images are published for `linux/amd64` and `linux/arm64`. Tags follow the
-releases: `latest`, `0.8`, `0.8.2`.
-
-### Docker Compose
-
-```bash
-curl -O https://raw.githubusercontent.com/ivangsm/jay/main/docker-compose.yml
-export JAY_ADMIN_TOKEN=$(openssl rand -base64 32)
-export JAY_SIGNING_SECRET=$(openssl rand -base64 32)
-docker compose up -d
-```
-
-### go install
-
-```bash
+# Go
 go install github.com/ivangsm/jay@latest
 go install github.com/ivangsm/jay/cmd/jay-admin@latest
 go install github.com/ivangsm/jay/cmd/jay-config@latest
 go install github.com/ivangsm/jay/cmd/jay-rekey@latest
+
+# Source
+git clone https://github.com/ivangsm/jay.git && cd jay && go build -o jay .
 ```
 
-### Prebuilt binaries
+Prebuilt archives for `linux/amd64`, `linux/arm64` and `darwin/arm64` are on the
+[releases page](https://github.com/ivangsm/jay/releases); each contains the
+server plus the three auxiliary CLIs. There is no Windows build.
 
-Each [release](https://github.com/ivangsm/jay/releases) ships one archive per
-platform (`linux/amd64`, `linux/arm64`, `darwin/arm64`) containing the server
-plus the three auxiliary CLIs, and a `checksums.txt`.
+Full options: [Install](https://ivangsm.github.io/jay/install/).
 
-### Build from source
+## Quickstart
+
+Both secrets are required and must be at least 32 characters. Jay refuses to
+start without them.
 
 ```bash
-git clone https://github.com/ivangsm/jay.git && cd jay
-go build -o jay .
+export JAY_ADMIN_TOKEN=$(openssl rand -base64 32)
+export JAY_SIGNING_SECRET=$(openssl rand -base64 32)
+./jay &
+
+ACCOUNT=$(curl -fsS -X POST http://localhost:9001/_jay/accounts \
+  -H "Authorization: Bearer $JAY_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"myapp"}' | jq -r .account_id)
+
+curl -fsS -X POST http://localhost:9001/_jay/tokens \
+  -H "Authorization: Bearer $JAY_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"account_id\":\"$ACCOUNT\",\"name\":\"deploy\",
+       \"allowed_actions\":[\"bucket:write-meta\",\"object:put\",\"object:get\",\"object:list\"]}"
 ```
 
-## Running
+Then point the AWS CLI at `http://localhost:9000` with `token_id` as the access
+key and the secret as the secret key.
 
-Both secrets are **required** and must be at least 32 characters. Jay refuses
-to start without them -- there is no default:
+Step by step: [Quickstart](https://ivangsm.github.io/jay/quickstart/).
 
-```bash
-JAY_ADMIN_TOKEN=$(openssl rand -base64 32) \
-JAY_SIGNING_SECRET=$(openssl rand -base64 32) \
-./jay
-```
+## Ports
 
-Jay listens on three ports:
-- `:9000` -- S3-compatible API
-- `:9001` -- Admin API + health checks
-- `:4444` -- Native binary protocol
+| Port | Purpose | Exposure |
+|---|---|---|
+| `:9000` | S3-compatible API | The only one meant for untrusted networks |
+| `:9001` | Admin API and health probes | Internal — it creates accounts and tokens |
+| `:4444` | Native binary protocol | Internal — the token secret travels in the clear |
 
-Only `:9000` is meant to face untrusted networks. The admin API creates
-accounts and tokens, and the native protocol carries the token secret in the
-clear, so keep both on an internal network. A deployment that does not use the
-native protocol can turn its listener off entirely with an empty
-`JAY_NATIVE_ADDR` (or `native_addr: ""` in YAML); the startup line then reports
-`"native":"disabled"`.
+Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
 
-## Command-line client
+## Documentation
 
-The same binary is the client. Any subcommand talks to a running jay over the
-native binary protocol; with no subcommand, `jay` starts the server.
-
-```bash
-export JAY_TOKEN_ID=<token_id>
-export JAY_TOKEN_SECRET=<token-secret>
-export JAY_NATIVE_ADDR=localhost:4444
-
-jay bucket mb images
-jay cp ./photo.webp jay://images/users/123.webp
-jay ls -l jay://images/users/
-jay sync ./assets jay://images/assets
-jay rm -r jay://images/old/
-```
-
-| Command | What it does |
-|---------|--------------|
-| `jay bucket ls` / `mb NAME` / `rb NAME` | List, create or delete buckets |
-| `jay ls [-r] [-l] jay://B[/PREFIX]` | List objects; `-r` descends, `-l` adds size, checksum and type |
-| `jay cp [-r] SRC DST` | Copy to, from, or between buckets |
-| `jay rm [-r] jay://B/KEY` | Delete an object, or everything under a prefix |
-| `jay sync SRC DST` | Mirror a directory to or from a bucket |
-| `jay version` | Print the build version |
-
-Locations are either local paths or `jay://BUCKET/KEY` URIs. Credentials come
-from `JAY_TOKEN_ID` / `JAY_TOKEN_SECRET` (or `client.token_id` /
-`client.token_secret` in the YAML config), and every command also accepts
-`--addr`, `--token-id` and `--token-secret`.
-
-Three behaviours worth knowing:
-
-- **`sync` compares SHA-256, not timestamps.** Jay stores a checksum for every
-  object, so an unchanged file is skipped because its contents match — not
-  because its mtime looks old.
-- **Uploads over 64 MiB are split into multipart automatically**, and a failure
-  aborts the upload server-side instead of leaving orphan parts behind.
-- **A partial failure exits non-zero.** `cp -r` and `sync` keep going after a
-  failed file, print which ones failed, and end with a count — a transfer that
-  skipped half its files never reports success.
-
-## Configuration
-
-Jay accepts configuration from environment variables, a YAML config file, or both. When both are provided, **env vars win** and every conflict is logged at `WARN` level.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JAY_CONFIG_FILE` | *(optional)* | Path to a YAML config file. Can also be set via `--config-file` flag (flag takes precedence) |
-| `JAY_DATA_DIR` | `./data` | Data directory for objects and metadata |
-| `JAY_LISTEN_ADDR` | `:9000` | S3 API listen address |
-| `JAY_ADMIN_ADDR` | `:9001` | Admin API listen address |
-| `JAY_NATIVE_ADDR` | `:4444` | Native protocol listen address; **empty disables the native listener** (from the environment and from YAML alike) |
-| `JAY_ADMIN_TOKEN` | *(required)* | Bearer token for admin API; must be at least 32 characters |
-| `JAY_SIGNING_SECRET` | *(required)* | AES-GCM key for presigned URLs and token secrets; must be at least 32 characters |
-| `JAY_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
-| `JAY_TLS_CERT` | *(optional)* | Path to TLS certificate file |
-| `JAY_TLS_KEY` | *(optional)* | Path to TLS private key file |
-| `JAY_RATE_LIMIT` | `100` | Requests/sec per token (`0` disables rate limiting) |
-| `JAY_RATE_BURST` | `200` | Rate limit burst size |
-| `JAY_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` headers |
-| `JAY_SCRUB_INTERVAL_HOURS` | `6` | Scrubber interval |
-| `JAY_SCRUB_BYTES_PER_SEC` | `52428800` | Scrubber read throttle (0 = unlimited) |
-| `JAY_SCRUB_MAX_PER_RUN` | `100` | Max objects visited per bucket per scrub tick |
-| `JAY_BACKUP_DIR` | `<data_dir>/backups` | Where hourly bbolt snapshots are written; point at a separate volume for real DR |
-| `JAY_MIN_FREE_BYTES` | `524288000` (500 MiB) | Readiness fails below this free space on the data filesystem (`0` disables) |
-| `JAY_MAX_OBJECT_SIZE` | `5368709120` (5 GiB) | Largest accepted object body and multipart part (`0` disables) |
-| `JAY_SEED_TOKEN_ACCOUNT` | *(optional)* | Idempotent account+token seed; all three seed vars must be set together |
-| `JAY_SEED_TOKEN_ID` | *(optional)* | Seed token ID |
-| `JAY_SEED_TOKEN_SECRET` | *(optional)* | Seed token secret (bcrypt-hashed before persisting) |
-| `JAY_TOKEN_ID` | *(optional)* | Token ID used by the `jay` subcommands; the server ignores it |
-| `JAY_TOKEN_SECRET` | *(optional)* | Token secret used by the `jay` subcommands |
-
-### YAML Configuration File
-
-Point jay at a YAML file via `--config-file path/to/config.yml` or `JAY_CONFIG_FILE=path/to/config.yml`:
-
-```yaml
-# config.yml
-data_dir: ./data
-listen_addr: ":9000"
-admin_addr: ":9001"
-native_addr: ":4444"
-
-# Secrets can reference env vars via ${VAR} interpolation.
-# This lets you commit config.yml to git while keeping secrets in .env.
-admin_token: ${JAY_ADMIN_TOKEN}
-signing_secret: ${JAY_SIGNING_SECRET}
-
-log_level: info
-rate_limit: 100
-rate_burst: 200
-trust_proxy_headers: false
-
-# Optional ${VAR:-default} syntax provides a fallback.
-tls_cert: ${JAY_TLS_CERT:-}
-tls_key: ${JAY_TLS_KEY:-}
-
-scrub:
-  interval_hours: 6
-  bytes_per_sec: 52428800
-  max_per_run: 100
-
-backup:
-  dir: ${JAY_BACKUP_DIR:-}
-min_free_bytes: 524288000
-max_object_size: 5368709120
-
-seed_token:
-  account: ${JAY_SEED_TOKEN_ACCOUNT:-}
-  id: ${JAY_SEED_TOKEN_ID:-}
-  secret: ${JAY_SEED_TOKEN_SECRET:-}
-
-# Credentials for the `jay` subcommands. The server never reads these.
-client:
-  token_id: ${JAY_TOKEN_ID:-}
-  token_secret: ${JAY_TOKEN_SECRET:-}
-```
-
-Rules:
-
-- **Precedence:** env var > YAML > hardcoded default. A conflict (both set to different values) logs `WARN` at startup but doesn't fail.
-- **An empty value means "not configured"** — `key: ""` in YAML and `JAY_KEY=""` in the environment are both discarded and the default stands. That is what keeps a template whose variable is unset (`listen_addr: ${JAY_LISTEN_ADDR}`, or a compose file passing the variable straight through) from moving the data directory or serving on port 80. The one exception is `native_addr`, whose empty value is the documented off switch for the native listener. When discarding an empty value actually overrides something, it is logged at `WARN`; when the key would have been empty anyway (`tls_cert`, `backup.dir`, `seed_token.*`, `client.*` above), it is not.
-- **Interpolation:** `${VAR}` and `${VAR:-default}` are resolved against `os.Getenv` on string values only. If neither is set, the value ends up empty (which then triggers the normal secret-length fail-fast if it's `admin_token` or `signing_secret`).
-- **Mixing sources:** perfectly fine to put non-sensitive config in YAML and keep secrets in env vars — interpolation is the bridge.
-
-### `jay-config` CLI
-
-`jay-config` ships in the release archives and in the container image.
-
-```bash
-# YAML → .env (writes to stdout if --output omitted)
-jay-config yaml-to-env --input config.yml --output .env
-
-# .env → YAML
-jay-config env-to-yaml --input .env --output config.yml
-
-# Validate YAML config (checks required secrets, seed-token atomicity, value ranges)
-jay-config validate --input config.yml
-```
-
-`${VAR}` interpolation is preserved literally during conversion — the tool never resolves env vars, only moves keys between formats.
-
-## Seed Token
-
-Jay can create an account and token at startup from environment variables, so a fresh deployment doesn't require a manual admin API call before clients can authenticate.
-
-### Variables
-
-| Variable | Purpose |
+| | |
 |---|---|
-| `JAY_SEED_TOKEN_ACCOUNT` | Name of the account to create (e.g. `falco`) |
-| `JAY_SEED_TOKEN_ID` | Deterministic token ID used by the client (e.g. `falco-native`) |
-| `JAY_SEED_TOKEN_SECRET` | Plaintext secret; bcrypt-hashed before storage |
+| [What Jay is](https://ivangsm.github.io/jay/what-jay-is/) | Scope, and what it deliberately does not do |
+| [Configuration](https://ivangsm.github.io/jay/reference/configuration/) | Every `JAY_*` variable, the YAML file, precedence |
+| [Authentication](https://ivangsm.github.io/jay/reference/authentication/) | Accounts, tokens, scopes, SigV4, presigned URLs, bucket policies |
+| [S3 compatibility](https://ivangsm.github.io/jay/reference/s3-compatibility/) | The complete operation list and what answers `501` |
+| [Native protocol](https://ivangsm.github.io/jay/reference/native-protocol/) | Frame layout, opcodes, the Go client |
+| [Deploying Jay](https://ivangsm.github.io/jay/guides/deployment/) | TLS, reverse proxies, disk, backups |
+| [Performance](https://ivangsm.github.io/jay/internals/performance/) | Measured benchmarks and the design behind them |
+| [Architecture](https://ivangsm.github.io/jay/internals/architecture/) | The write path, recovery, scrubbing, GC, backups |
+| [Limits](https://ivangsm.github.io/jay/internals/limits/) | No versioning, no replication, no events |
 
-### Rules
+## One compatibility caveat
 
-- **All three set** → Jay creates the account (idempotent by name) and the token (idempotent by ID) with wildcard actions (`"*"`). The same creds can be used against either the S3 or the native protocol.
-- **All three empty** → seed is skipped. Use this mode if you prefer to bootstrap tokens via the admin API.
-- **One or two set** → Jay **refuses to start** with an error. This prevents partially-configured deployments.
+minio-go clients (`mc`, `warp`) **cannot upload over plain HTTP**. They sign
+non-TLS uploads with SigV4's streaming mode, which frames the body in
+`aws-chunked`, and Jay refuses that framing with `501` rather than storing the
+frames as if they were your file. Over HTTPS the same clients work completely.
 
-### Idempotence and rotation
+aws-cli, the AWS SDKs and boto3 work over both.
+[The full explanation](https://ivangsm.github.io/jay/reference/s3-compatibility/).
 
-On every restart, Jay:
-- Looks up the account by name; if it exists, reuses its ID.
-- Looks up the token by ID. If the stored bcrypt hash matches `JAY_SEED_TOKEN_SECRET`, Jay logs `seed: token already present, reusing` and moves on.
-- **If the hash does NOT match**, Jay logs a WARN (`seed: token exists but secret does not match env; refusing to overwrite`) and **keeps the old secret**. Jay never silently overwrites a token.
-
-To rotate the seed secret:
-1. Either change `JAY_SEED_TOKEN_ID` to a new value (the old token stays active; revoke it manually), **or**
-2. Use the admin API to revoke the old token (`DELETE /_jay/tokens/{id}`) first, then set the new `JAY_SEED_TOKEN_SECRET` and restart.
-
-### Example
-
-```bash
-export JAY_SEED_TOKEN_ACCOUNT=myapp
-export JAY_SEED_TOKEN_ID=myapp-primary
-export JAY_SEED_TOKEN_SECRET=$(openssl rand -base64 32)
-./jay
-```
-
-On first boot you'll see:
-```
-seed: account created name=myapp account_id=...
-seed: token created token_id=myapp-primary
-```
-
-On second boot:
-```
-seed: account exists, reusing
-seed: token already present, reusing
-```
-
-## Authentication
-
-### Create an Account and Token
+## Development
 
 ```bash
-# Create account
-curl -X POST http://localhost:9001/_jay/accounts \
-  -H "Authorization: Bearer $JAY_ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "myapp"}'
-# Returns: {"account_id": "...", "name": "myapp", ...}
-
-# Create token
-curl -X POST http://localhost:9001/_jay/tokens \
-  -H "Authorization: Bearer $JAY_ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"account_id": "ACCOUNT_ID", "name": "deploy-token"}'
-# Returns: {"token_id": "...", "secret": "..."}
+make check        # fmt + vet + lint + test + build — the commit gate
+make conformance  # S3 conformance against real aws-cli, mc and warp
 ```
 
-### Using Tokens
+`make check` proves Jay agrees with itself. `make conformance` proves it agrees
+with clients it did not write — and a run where every client group was skipped
+exits non-zero with `NOTHING WAS PROVEN`, because a green exit that tested
+nothing is the failure mode this project cares about most.
 
-**Bearer token:**
-```
-Authorization: Bearer <token_id>:<secret>
-```
-
-**AWS SigV4:** Use `token_id` as the access key and the token secret as the secret key. Jay validates the request timestamp and verifies the SigV4 HMAC signature. Both SigV4 forms work: the `Authorization` header and the query-string form used by presigned URLs (see [Presigned URLs](#presigned-urls)).
-
-The region is not configured server-side. Jay reads it back out of `X-Amz-Credential`, so any region works as long as the client signs and sends the same one; `us-east-1` is a safe default.
-
-### Token Scoping
-
-Tokens can be scoped to specific actions, buckets, and key prefixes:
-
-```json
-{
-  "account_id": "...",
-  "name": "readonly",
-  "allowed_actions": ["object:get", "object:list"],
-  "bucket_scope": ["public-assets"],
-  "prefix_scope": ["images/"]
-}
-```
-
-Available actions: `bucket:list`, `bucket:read-meta`, `bucket:write-meta`, `object:get`, `object:put`, `object:delete`, `object:list`, `multipart:create`, `multipart:upload-part`, `multipart:complete`, `multipart:abort`.
-
-## S3 API
-
-### Supported Operations
-
-| Operation | Method | Path |
-|-----------|--------|------|
-| ListBuckets | `GET /` | |
-| CreateBucket | `PUT /<bucket>` | |
-| HeadBucket | `HEAD /<bucket>` | |
-| DeleteBucket | `DELETE /<bucket>` | |
-| GetBucketLocation | `GET /<bucket>?location` | Always the empty `<LocationConstraint/>` (us-east-1) |
-| ListObjectsV2 | `GET /<bucket>?list-type=2` | |
-| DeleteObjects | `POST /<bucket>?delete` | Batch delete, up to 1000 keys |
-| PutObject | `PUT /<bucket>/<key>` | Verifies `Content-MD5` and `x-amz-checksum-*` when sent — see [Checksums](#checksums) |
-| GetObject | `GET /<bucket>/<key>` | |
-| HeadObject | `HEAD /<bucket>/<key>` | |
-| DeleteObject | `DELETE /<bucket>/<key>` | |
-| CopyObject | `PUT /<bucket>/<key>` | `x-amz-copy-source` header |
-| CreateMultipartUpload | `POST /<bucket>/<key>?uploads` | `x-amz-checksum-algorithm` is refused if jay cannot compute it, rather than ignored |
-| UploadPart | `PUT /<bucket>/<key>?uploadId=X&partNumber=N` | Same digest verification as `PutObject` |
-| CompleteMultipartUpload | `POST /<bucket>/<key>?uploadId=X` | A whole-object `x-amz-checksum-*` answers `501`; the parts are what get verified |
-| AbortMultipartUpload | `DELETE /<bucket>/<key>?uploadId=X` | |
-| ListParts | `GET /<bucket>/<key>?uploadId=X` | |
-| ListMultipartUploads | `GET /<bucket>?uploads` | `prefix`, `delimiter`, `key-marker`, `upload-id-marker`, `max-uploads`, `encoding-type` |
-
-Everything else S3 defines — versioning, ACL, tagging, lifecycle, CORS, policy,
-encryption, object lock, `GetObjectAttributes`, `SelectObjectContent` — answers
-**501 Not Implemented**, never a misleading 200.
-
-#### `aws-chunked` streaming uploads are not supported
-
-SigV4 has a streaming mode: the client declares
-`x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (or one of the
-`STREAMING-*-TRAILER` variants) and sends the body wrapped in `aws-chunked`
-framing — `<hex-size>;chunk-signature=<sig>\r\n<data>\r\n`, repeated until a
-zero-length chunk. `Content-Length` then counts the framing and the real length
-travels in `x-amz-decoded-content-length`.
-
-**Jay has no decoder for that framing, so it refuses the mode**: any request
-carrying it answers `501 NotImplemented` and writes nothing — no object, no
-metadata, no temp file. The refusal happens before authentication, so it costs
-the same on every entry point that takes a body (`PutObject`, `UploadPart`,
-`CompleteMultipartUpload`, `DeleteObjects`, `CreateBucket`) and under every
-credential form (Bearer, SigV4 header, both presigned styles). All three
-announcements are treated as framing, because a client may send any of them:
-`x-amz-content-sha256: STREAMING-*`, `x-amz-decoded-content-length`, and
-`Content-Encoding: aws-chunked`.
-
-Refusing is not the ideal answer; it is the honest one. Jay used to *recognise*
-the mode — SigV4 skipped the payload check for `STREAMING-*` — and then store
-the body verbatim. A 15-byte file uploaded with `mc` became a 187-byte object
-whose content began `f;chunk-signature=…`, answered `200`, and carried an ETag
-and a SHA-256 computed over the corrupted bytes. Nothing could detect it
-afterwards: the scrubber verified the object against its own bad digest and
-reported it healthy forever.
-
-What this means per client:
-
-| Client | Status |
-|---|---|
-| **AWS CLI** (`aws s3` / `aws s3api`), AWS SDKs, boto3 | Fully working, up and down, single-part and multipart, with or without `--checksum-algorithm`. They send a real payload hash |
-| **minio-go** over plain HTTP — `mc`, `warp` | **Uploads fail** with `501`: minio-go signs a non-TLS `PutObject` with the streaming signature, so it frames the body. Downloads, listings, `stat`, presigned URLs and deletes work normally |
-| **minio-go over HTTPS** — same `mc`, same `warp` | **Fully working**, uploads included. minio-go only reaches for the streaming signature when the connection is not secure, so over TLS it sends an unframed body. Measured with `mc` and with `warp mixed` (PUT/GET/DELETE/STAT), zero errors |
-| **Presigned URLs** (both styles) | Working. A presigned `PUT` that adds the framing is refused like any other |
-| **Jay's own CLI and native protocol** | Unaffected — the native protocol has no SigV4 and no framing |
-
-So the practical workaround, if you must use `mc` or another minio-go client
-for uploads, is to [put jay behind TLS](#configuration) rather than to wait for
-the decoder. Implementing the decoder (and verifying the chained chunk
-signatures) is tracked separately; until it lands, the mode stays refused
-rather than silently accepted.
-
-#### Checksums
-
-Every object carries a SHA-256 digest, computed while the bytes are written.
-`PutObject`, `GetObject` and `HeadObject` return it as `x-amz-checksum-sha256`,
-**base64 of the raw digest**, which is what S3 defines and what the AWS CLI
-verifies on every download. Internally the digest is kept hex-encoded — that is
-what the scrubber compares, what the native protocol carries and what
-`jay ls -l` prints; base64 exists only on the HTTP edge.
-
-A ranged `GET` (`206 Partial Content`) carries **no** checksum header. The
-digest covers the whole object, so a client verifying it against a slice would
-reject a perfectly good transfer — which is every download the AWS CLI splits
-above its 8 MiB threshold.
-
-##### The checksum the client declares is verified
-
-Sending `Content-MD5` or `x-amz-checksum-*` on an upload is not decoration: it
-is the client asking *"prove that what reached you is what I sent"*. On
-`PutObject` and `UploadPart` jay hashes the body as it writes it and compares:
-
-| What arrives | Answer |
-|---|---|
-| A digest that matches the bytes | `200`, and the response carries the digest for the algorithm that was **asked about** |
-| A digest that does not match | `400 BadDigest`, and **nothing is written** |
-| A malformed `Content-MD5` | `400 InvalidDigest` |
-| A malformed `x-amz-checksum-*`, two of them at once, or one that disagrees with `x-amz-sdk-checksum-algorithm` | `400 InvalidRequest` |
-| An algorithm jay cannot compute | `400 InvalidRequest`, never a `200` carrying some other algorithm |
-
-The five algorithms S3 defines for object payloads — **CRC32, CRC32C,
-CRC64NVME, SHA1 and SHA256** — are all implemented, so no declared digest is
-ever ignored. CRC64NVME matters more than it looks: it is what the AWS CLI
-declares on **every** upload it makes, single-part and per part.
-
-"Nothing is written" is the load-bearing half, and it is verified against the
-data directory rather than against the response: the check runs between the
-`fsync` and the `rename`, so a refused upload never becomes a file under
-`buckets/`, never leaves a temp file, and never commits metadata. The same is
-true of a refused part — and because a part's path is derived from its number,
-refusing before the rename is also what keeps a bad retry from destroying the
-part that was already accepted.
-
-Two things jay deliberately does **not** do:
-
-- **`CompleteMultipartUpload` refuses a whole-object checksum with `501`.** S3
-  composes that value from the part digests; jay does not implement the
-  composition, and accepting the header would be answering `200` to a
-  verification that never happened. Each part is verified instead. No client
-  measured against jay sends it.
-- **The extra digest is not persisted.** A `PutObject` that declares CRC32 gets
-  its CRC32 back in that response, but only the SHA-256 is stored, so a later
-  `GetObject`/`HeadObject` reports `x-amz-checksum-sha256` and nothing else.
-
-Until 2026-09-02 none of this was true: a `PUT` carrying a deliberately wrong
-`x-amz-checksum-sha256` answered `200`, stored the object, and echoed back the
-digest jay had computed itself. `x-amz-checksum-algorithm` was ignored outright.
-
-#### DeleteObjects
-
-Every key of the request comes back in `<Deleted>` or in `<Error>`, never
-omitted: a key that could not be deleted has to be visible to the caller, or a
-partial delete reads as a success. `<Quiet>true</Quiet>` suppresses the
-successes only — the errors are always reported.
-
-The token's actions, bucket scope and prefix scope, and the bucket policy, are
-evaluated **per key**. A key outside the caller's reach is an `<Error>` with
-`AccessDenied`, not a delete.
-
-Request-level limits, each of which refuses the whole batch rather than applying
-part of it:
-
-| Limit | Behaviour |
-|---|---|
-| More than 1000 keys | `400 MalformedXML` |
-| Body over 4 MiB | `400 MaxMessageLengthExceeded` |
-| Malformed or empty `<Delete>` | `400 MalformedXML` |
-| `<VersionId>` on an entry | Per-key `<Error>` with `NotImplemented` — jay has no versioning, and deleting the live object instead would not be the operation asked for |
-
-`Content-MD5` is **verified when sent, and not required** — the same rule
-uploads follow (see [Checksums](#checksums)). SigV4 already covers the body
-through `x-amz-content-sha256`, and the bearer and presigned paths cannot
-produce the header, so demanding it would reject working clients; a header that
-does not match the body answers `400 BadDigest`.
-
-#### ListMultipartUploads
-
-Scoped to the caller's account and to the token's prefix scope: an upload id
-from another account is unusable to this token anyway (every part, complete and
-abort authorizes against the initiator), so listing it would only disclose
-object keys.
-
-### AWS CLI Usage
+The documentation site lives in [`site/`](site/) and is built with Astro
+Starlight:
 
 ```bash
-# Configure AWS CLI
-aws configure set aws_access_key_id <token_id>
-aws configure set aws_secret_access_key <token-secret>
-aws configure set default.region us-east-1
-
-# Basic operations
-aws --endpoint-url http://localhost:9000 s3 mb s3://mybucket
-aws --endpoint-url http://localhost:9000 s3 cp file.txt s3://mybucket/
-aws --endpoint-url http://localhost:9000 s3 ls s3://mybucket/
-aws --endpoint-url http://localhost:9000 s3 cp s3://mybucket/file.txt ./downloaded.txt
-aws --endpoint-url http://localhost:9000 s3 sync ./local-dir s3://mybucket/prefix/
-aws --endpoint-url http://localhost:9000 s3 rm --recursive s3://mybucket/prefix/
-aws --endpoint-url http://localhost:9000 s3 rb --force s3://mybucket
-
-# Batch delete and the bucket-level multipart listing
-aws --endpoint-url http://localhost:9000 s3api delete-objects --bucket mybucket \
-    --delete 'Objects=[{Key=a.txt},{Key=b.txt}]'
-aws --endpoint-url http://localhost:9000 s3api list-multipart-uploads --bucket mybucket
-aws --endpoint-url http://localhost:9000 s3api get-bucket-location --bucket mybucket
+cd site && bun install && bun run dev
 ```
 
-### Conformance
+## License
 
-Everything this page claims about S3 compatibility is checked by
-[`scripts/conformance.sh`](scripts/conformance.sh), which runs on every CI
-build. It boots two throwaway jays (one plain HTTP, one TLS, both on random
-high ports, both deleted on exit) and drives them with clients jay did not
-write:
-
-```bash
-scripts/conformance.sh                # run whatever is installed
-scripts/conformance.sh --require-all  # a missing client fails the run (CI)
-scripts/conformance.sh --keep         # keep the work dir and the server logs
-```
-
-| Client | What it exercises |
-|---|---|
-| **aws-cli** (botocore) | `mb`/`rb --force`, `cp` up and down, `sync`, `rm --recursive`, `ListObjectsV2` with prefix and delimiter, multipart upload and ranged download of a 12 MiB object, `presign` (including an expired URL), `GetBucketLocation`, `ListMultipartUploads`, `DeleteObjects` whole and partial, a `501` sub-resource, and that `--checksum-algorithm` answers with the algorithm it asked for — all five of them |
-| **curl** (the `integrity` group) | That a *deliberately wrong* digest is refused and writes nothing — which no correct client will ever send, so it has to be forged by hand. Asserted against the data directory, not the response, plus a control that a correct digest is still accepted |
-| **aws-cli, second account** | That a token of account B can neither list, read, write, delete nor batch-delete inside a bucket of account A — each asserted against A's own view of the bucket, not against B's error message |
-| **mc** (minio-go) over HTTP | Listing, `stat`, `get`, bucket create/delete, `rm`, a presigned URL minted by minio-go, and that an upload is refused with `501` leaving nothing behind |
-| **mc** over HTTPS | That the same client uploads fine over TLS, small and 12 MiB, byte for byte |
-| **warp** (minio-go) | That `warp put` over HTTP is refused and writes nothing, and that `warp mixed` over TLS runs PUT/GET/DELETE/STAT with zero errors |
-
-Three things about how it reports:
-
-- **`SKIP` is not `PASS`.** A missing client skips its group and says so; a run
-  where every *client* group skipped exits `2` with `NOTHING WAS PROVEN`,
-  because a green exit that tested nothing is the failure mode this repo cares
-  about most. The `integrity` group runs on curl alone and is deliberately left
-  out of that count: it proves jay refuses a forged digest, not that jay
-  interoperates with anything.
-- **Every check asserts an effect** — bytes on the wire, an object present or
-  absent, a status code — never a confirmation message. `aws s3 cp --quiet`
-  hides its own failure line, so the checks read the exit code and then ask the
-  server what actually happened.
-- **The known limitations are asserted, not tolerated.** The `mc` and `warp`
-  upload refusals are checks that pass *because* the answer is `501` and
-  nothing was written. If the `aws-chunked` decoder ever lands, they go red on
-  purpose, so nobody can ship it without updating this page.
-
-## Native Protocol
-
-Jay's native binary protocol uses a compact frame format for high-throughput scenarios.
-
-### Go Client
-
-```go
-import "github.com/ivangsm/jay/proto/client"
-
-// Connect
-c, err := client.Dial("localhost:4444", tokenID, secret, 4)
-if err != nil {
-    log.Fatal(err)
-}
-defer c.Close()
-
-// Create bucket
-_, err = c.CreateBucket("mybucket")
-
-// Upload object
-result, err := c.PutObject("mybucket", "hello.txt",
-    strings.NewReader("hello world"), 11, nil)
-
-// Download object
-obj, err := c.GetObject("mybucket", "hello.txt")
-data, _ := io.ReadAll(obj.Body)
-obj.Body.Close()
-
-// Multipart upload
-uploadID, _ := c.CreateMultipartUpload("mybucket", "large.bin", nil)
-etag1, _ := c.UploadPart("mybucket", "large.bin", uploadID, 1, part1Reader, part1Size)
-etag2, _ := c.UploadPart("mybucket", "large.bin", uploadID, 2, part2Reader, part2Size)
-c.CompleteMultipartUpload("mybucket", "large.bin", uploadID, []client.CompletePart{
-    {PartNumber: 1, ETag: etag1},
-    {PartNumber: 2, ETag: etag2},
-})
-
-// List objects
-list, _ := c.ListObjects("mybucket", &client.ListOptions{Prefix: "photos/"})
-```
-
-## Admin API
-
-All endpoints require `Authorization: Bearer <JAY_ADMIN_TOKEN>`.
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/_jay/accounts` | POST | Create account |
-| `/_jay/tokens` | POST | Create token |
-| `/_jay/tokens` | GET | List tokens |
-| `/_jay/tokens/{id}` | DELETE | Revoke token |
-| `/_jay/metrics` | GET | Server metrics |
-| `/_jay/presign` | POST | Generate presigned URL |
-| `/_jay/quarantine` | GET | List quarantined objects |
-| `/_jay/quarantine/revalidate` | POST | Revalidate quarantined object |
-| `/_jay/quarantine` | DELETE | Purge quarantined objects |
-
-### CLI Admin Tool
-
-`jay-admin` ships in the release archives and in the container image.
-
-```bash
-export JAY_ADMIN_TOKEN=my-secret-admin-token
-
-jay-admin create-account -name myapp
-jay-admin create-token -account ACCOUNT_ID -name deploy
-jay-admin list-tokens
-jay-admin revoke-token -id TOKEN_ID
-jay-admin metrics
-jay-admin presign -bucket mybucket -key file.txt -token-id TOKEN_ID
-jay-admin presign -bucket mybucket -key file.txt -token-id TOKEN_ID -style aws -host s3.example.com
-jay-admin quarantine-list
-jay-admin quarantine-purge
-```
-
-## Presigned URLs
-
-A presigned URL grants one operation on one key for a limited time, with no
-authorization header. Jay accepts two forms.
-
-### SigV4 (standard)
-
-Anything that speaks S3 can mint one — boto3's `generate_presigned_url`,
-`aws s3 presign`, minio-go's `PresignedGetObject`, the AWS SDK presigners —
-using `token_id` as the access key and the token secret as the secret key. Jay
-verifies `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
-`X-Amz-SignedHeaders` and `X-Amz-Signature` against the same canonical request
-it uses for header authentication.
-
-```python
-import boto3
-s3 = boto3.client(
-    "s3",
-    endpoint_url="http://localhost:9000",
-    aws_access_key_id="TOKEN_ID",
-    aws_secret_access_key="TOKEN_SECRET",
-    region_name="us-east-1",
-)
-url = s3.generate_presigned_url(
-    "get_object",
-    Params={"Bucket": "mybucket", "Key": "secret-file.txt"},
-    ExpiresIn=3600,
-)
-```
-
-Rules Jay enforces on every such URL:
-
-- `X-Amz-Expires` is mandatory and capped at 7 days, AWS's own limit. There is
-  no such thing as a presigned URL without a deadline.
-- `X-Amz-Date` must be within 15 minutes of server time in the future, and the
-  URL is dead once signing time + `X-Amz-Expires` has passed.
-- `host` must be among the `SignedHeaders`, so a URL minted for one endpoint
-  cannot be replayed against another.
-- The signature covers the method, the path and every query parameter except
-  `X-Amz-Signature` itself.
-- The URL can never do more than the token that signed it: actions, bucket
-  scope, prefix scope and bucket policies are all still applied.
-
-### Jay's own form
-
-`X-Jay-Token`, `X-Jay-Expires` and `X-Jay-Signature`, HMAC'd with
-`JAY_SIGNING_SECRET`. It predates SigV4 support and is still the default of the
-admin endpoint.
-
-### Minting one from the admin API
-
-```bash
-curl -X POST http://localhost:9001/_jay/presign \
-  -H "Authorization: Bearer $JAY_ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "token_id": "TOKEN_ID",
-    "method": "GET",
-    "bucket": "mybucket",
-    "key": "secret-file.txt",
-    "expires_seconds": 3600,
-    "style": "aws",
-    "host": "s3.example.com"
-  }'
-# {"url": "http://s3.example.com/mybucket/secret-file.txt?X-Amz-Algorithm=...", "style": "aws"}
-```
-
-| Field | Default | Notes |
-|-------|---------|-------|
-| `style` | `"jay"` | `"aws"` emits SigV4; `"jay"` emits `X-Jay-*` |
-| `host` | `JAY_LISTEN_ADDR` | Required for `"aws"` when the listen address has no hostname (`:9000`), because the SigV4 signature covers the host |
-| `region` | `"us-east-1"` | `"aws"` only |
-| `expires_seconds` | `3600` | A number, not a string; capped at 604800 (7 days) |
-
-`style` defaults to `"jay"` so existing callers keep getting what they got
-before. New integrations should ask for `"aws"`.
-
-## Bucket Policies
-
-Set JSON policies on buckets to control access by token, prefix, and IP:
-
-```json
-{
-  "version": "2024-01-01",
-  "statements": [
-    {
-      "effect": "allow",
-      "actions": ["object:get", "object:list"],
-      "prefixes": ["public/"],
-      "subjects": ["*"],
-      "conditions": {
-        "ip_whitelist": ["10.0.0.0/8"]
-      }
-    },
-    {
-      "effect": "deny",
-      "actions": ["*"],
-      "prefixes": ["secret/"],
-      "subjects": ["*"]
-    }
-  ]
-}
-```
-
-Deny statements always take precedence over allow.
-
-### Who a policy applies to
-
-A token can only reach the buckets of the account that issued it. That is the
-default and it holds for **every** operation — objects, listings, multipart and
-bucket metadata alike — no matter how wide the token's actions or how empty its
-scopes. A bucket that says nothing about a stranger says no.
-
-Three things open a bucket to an account that does not own it, and nothing else:
-
-| | What it grants |
-|---|---|
-| `bucket_scope` on the token | Everything the token's actions allow, on the named buckets. Set through the admin API, so it is the operator delegating, not the bucket |
-| `visibility: public-read` | `object:get` and `object:list`, to anyone — including callers with no credentials at all. Never writes |
-| An `allow` statement in the bucket policy | Exactly the actions, prefixes and IP ranges the statement names, to the subjects it names |
-
-An `allow` statement only ever **grants**. It cannot narrow what the owner may
-do, and it cannot widen what the caller's token was issued for: the token's own
-actions, bucket scope and prefix scope are checked first and a policy never
-overrides them. A `deny` is evaluated after the grant and wins over it.
-
-> An allow with `"actions": ["*"]` and `"subjects": ["*"]` and no `prefixes`
-> hands the whole bucket to every authenticated token of every account,
-> `DeleteBucket` included. Name the actions and the prefixes.
-
-**There is no endpoint that installs a policy yet.** `PutBucketPolicy` answers
-501 and the admin API has no route for it, so a policy can only be put in place
-by writing the bucket record directly. The evaluation described here is real and
-tested; the way to configure it is not built.
-
-## Monitoring
-
-**Health checks** (on admin port, no auth required):
-- `GET /health/live` -- liveness probe (always 200)
-- `GET /health/ready` -- readiness probe (200 after startup recovery)
-
-**Access log:** every request writes one JSON line -- `request_id`, method,
-path, `remote_ip` (the key the pre-auth rate limiter buckets by, so a `429` can
-be attributed), status, duration. The `request_id` is the same value the response carries
-in `x-amz-request-id` and the same one inside the `<RequestId>` of an error
-document, on every path including rejections, so an ID quoted in a bug report
-finds its request:
-
-```bash
-grep '"request_id":"cc7a373fb33f4963"' jay.log
-```
-
-**Metrics:**
-```bash
-curl http://localhost:9001/_jay/metrics \
-  -H "Authorization: Bearer $JAY_ADMIN_TOKEN"
-```
-
-Returns JSON with counters for PutObject, GetObject, DeleteObject, HeadObject, ListObjects, CreateBucket, DeleteBucket, AuthFailures, ChecksumFailures, BytesUploaded, BytesDownloaded, ObjectsQuarantined, and UptimeSeconds.
-
-## Architecture
-
-- **Metadata**: bbolt embedded key-value store (single-file, ACID)
-- **Object storage**: Atomic writes (temp file, fsync, rename, fsync dir) with 2-level sharded directory layout
-- **Checksums**: SHA-256 computed on every write; a digest the client declares (`Content-MD5`, `x-amz-checksum-*`) is verified in that same pass, before the temp file is renamed into place. Reads are not re-hashed (integrity is the scrubber's job)
-- **Scrubber**: Background goroutine, every `JAY_SCRUB_INTERVAL_HOURS`; each tick verifies up to `JAY_SCRUB_MAX_PER_RUN` objects per bucket, resuming from a per-bucket cursor until the whole bucket has been covered
-- **GC**: Cleans temp files and empty dirs every 15 minutes, and reclaims multipart uploads abandoned for >24h
-- **Backup**: Hourly metadata snapshots, verified after write (corrupt snapshots are deleted), keeps 24, prunes after 7 days
-- **Recovery**: On startup, reconciles metadata and physical files, quarantines inconsistencies
+MIT © Iván Salazar

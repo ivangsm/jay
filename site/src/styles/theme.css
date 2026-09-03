@@ -1,0 +1,79 @@
+/*
+ * Jay's palette comes from the mascot: a Go gopher with a jay's wing. Deep
+ * navy carries real chroma instead of a tinted near-black, so the two blues
+ * sit on the same hue family rather than floating on grey.
+ */
+:root {
+	--jay-navy: #071a33;
+	--jay-navy-2: #0c2445;
+	--jay-blue: #2e7de9;
+	--jay-blue-bright: #4a90f0;
+	--jay-sky: #7fc4e8;
+	--jay-tan: #ebca9a;
+	--jay-paper: #f2f6fb;
+
+	--sl-font: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+	--sl-font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Dark is Starlight's default root. */
+:root {
+	--sl-color-accent-low: #10305c;
+	--sl-color-accent: #2f6fc9;
+	--sl-color-accent-high: #b9d7fb;
+	--sl-color-white: #f2f6fb;
+	--sl-color-gray-1: #dde6f2;
+	--sl-color-gray-2: #b6c4d6;
+	--sl-color-gray-3: #7d8ea6;
+	--sl-color-gray-4: #4a5c74;
+	--sl-color-gray-5: #2b3b52;
+	--sl-color-gray-6: #16263d;
+	--sl-color-black: #071a33;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #d3e3fb;
+	--sl-color-accent: #1a5cbe;
+	--sl-color-accent-high: #10305c;
+	--sl-color-white: #071a33;
+	--sl-color-gray-1: #16263d;
+	--sl-color-gray-2: #2b3b52;
+	--sl-color-gray-3: #566a85;
+	--sl-color-gray-4: #8296ae;
+	--sl-color-gray-5: #ccd8e6;
+	--sl-color-gray-6: #e6edf6;
+	--sl-color-gray-7: #f2f6fb;
+	--sl-color-black: #ffffff;
+}
+
+/* Tables carry most of the reference content, so they get real attention. */
+.sl-markdown-content table {
+	font-size: 0.875rem;
+	border-collapse: collapse;
+	width: 100%;
+}
+.sl-markdown-content th {
+	font-weight: 600;
+	text-align: left;
+	border-bottom: 2px solid var(--sl-color-gray-5);
+	padding: 0.5rem 0.75rem 0.5rem 0;
+}
+.sl-markdown-content td {
+	border-bottom: 1px solid var(--sl-color-gray-6);
+	padding: 0.5rem 0.75rem 0.5rem 0;
+	vertical-align: top;
+}
+.sl-markdown-content tbody tr:hover {
+	background: var(--sl-color-gray-6);
+}
+.sl-markdown-content :not(pre) > code {
+	font-size: 0.9em;
+	border: 1px solid var(--sl-color-gray-5);
+	border-radius: 2px;
+}
+
+/* The site title should read as the wordmark, not as generic UI text. */
+.site-title span {
+	font-weight: 600;
+	letter-spacing: -0.02em;
+}
