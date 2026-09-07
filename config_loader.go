@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -152,7 +153,7 @@ func bindings() []yamlKeyBinding {
 		bindString("tls_cert", "JAY_TLS_CERT", func(c *Config) *string { return &c.TLSCert }),
 		bindString("tls_key", "JAY_TLS_KEY", func(c *Config) *string { return &c.TLSKey }),
 		bindFloat("rate_limit", "JAY_RATE_LIMIT", func(c *Config) *float64 { return &c.RateLimit }),
-		bindInt("rate_burst", "JAY_RATE_BURST", func(c *Config) *int { return &c.RateBurst }),
+		bindPositiveInt("rate_burst", "JAY_RATE_BURST", func(c *Config) *int { return &c.RateBurst }),
 		bindBool("trust_proxy_headers", "JAY_TRUST_PROXY_HEADERS", func(c *Config) *bool { return &c.TrustProxyHeaders }),
 
 		bindScrubIntervalHours(),
@@ -316,7 +317,15 @@ func bindFloat(path, env string, ptr func(*Config) *float64) yamlKeyBinding {
 	}
 }
 
-func bindInt(path, env string, ptr func(*Config) *int) yamlKeyBinding {
+// bindPositiveInt binds an int key that has no meaning at or below zero.
+//
+// The range check is not decoration. Its only user is rate_burst, and
+// `rate.NewLimiter` with a burst of zero or less rejects EVERY request: a
+// `rate_burst: -1` typo used to be accepted in silence and turned the rate
+// limiter into a total outage. The upper bound exists because `int` is not
+// int64 on every platform, so the YAML value has to be proven to fit before
+// the conversion rather than after it.
+func bindPositiveInt(path, env string, ptr func(*Config) *int) yamlKeyBinding {
 	return yamlKeyBinding{
 		path:   path,
 		envVar: env,
@@ -325,16 +334,19 @@ func bindInt(path, env string, ptr func(*Config) *int) yamlKeyBinding {
 			if err != nil {
 				return "", false, err
 			}
+			if n <= 0 || n > math.MaxInt32 {
+				return "", false, fmt.Errorf("must be between 1 and %d, got %d", math.MaxInt32, n)
+			}
 			*ptr(cfg) = int(n)
 			return strconv.FormatInt(n, 10), true, nil
 		},
 		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
-			parsed, err := strconv.Atoi(value)
-			if err != nil {
+			parsed, err := strconv.ParseInt(value, 10, 32)
+			if err != nil || parsed <= 0 {
 				log.Error("invalid "+env+", keeping previous value", "value", value, "err", err)
 				return true
 			}
-			*ptr(cfg) = parsed
+			*ptr(cfg) = int(parsed)
 			return true
 		},
 	}
@@ -431,20 +443,20 @@ func bindScrubMaxPerRun() yamlKeyBinding {
 			if err != nil {
 				return "", false, err
 			}
-			if n <= 0 {
-				log.Error("invalid scrub.max_per_run in YAML (must be > 0), ignoring", "value", n)
+			if n <= 0 || n > math.MaxInt32 {
+				log.Error("invalid scrub.max_per_run in YAML (must be between 1 and 2147483647), ignoring", "value", n)
 				return "", false, nil
 			}
 			cfg.ScrubMaxPerRun = int(n)
 			return strconv.FormatInt(n, 10), true, nil
 		},
 		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
-			parsed, err := strconv.Atoi(value)
+			parsed, err := strconv.ParseInt(value, 10, 32)
 			if err != nil || parsed <= 0 {
 				log.Error("invalid "+env+", keeping previous value", "value", value, "err", err)
 				return true
 			}
-			cfg.ScrubMaxPerRun = parsed
+			cfg.ScrubMaxPerRun = int(parsed)
 			return true
 		},
 	}

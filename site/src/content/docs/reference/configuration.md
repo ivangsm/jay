@@ -22,7 +22,7 @@ both set the same key, **the environment wins** and the conflict is logged at
 | `JAY_TLS_CERT` | *(optional)* | Path to a TLS certificate |
 | `JAY_TLS_KEY` | *(optional)* | Path to a TLS private key |
 | `JAY_RATE_LIMIT` | `100` | Requests/sec per token (`0` disables) |
-| `JAY_RATE_BURST` | `200` | Rate limit burst size |
+| `JAY_RATE_BURST` | `200` | Rate limit burst size; must be at least `1` — a burst of `0` rejects every request, so turn the limiter off with `JAY_RATE_LIMIT=0` instead |
 | `JAY_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` |
 | `JAY_SCRUB_INTERVAL_HOURS` | `6` | Scrubber interval |
 | `JAY_SCRUB_BYTES_PER_SEC` | `52428800` | Scrubber read throttle (`0` = unlimited) |

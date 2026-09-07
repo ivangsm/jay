@@ -783,3 +783,52 @@ func TestLoadConfigFromSources_IgnoredEmptyIsReportedOnBothDoors(t *testing.T) {
 		t.Errorf("expected a warning for the ignored YAML key, got: %s", bufYAML.String())
 	}
 }
+
+// A burst of zero or less is not a small burst: rate.NewLimiter rejects every
+// request with it, so the value has to stop the boot instead of turning the
+// rate limiter into a total outage.
+func TestLoadConfigFromSources_NonPositiveRateBurstYAMLRejected(t *testing.T) {
+	clearJAYEnv(t)
+	for _, body := range []string{"rate_burst: 0\n", "rate_burst: -1\n"} {
+		path := filepath.Join(t.TempDir(), "jay.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write yaml: %v", err)
+		}
+		log, _ := captureLogger()
+		if _, err := LoadConfigFromSources(path, log); err == nil {
+			t.Errorf("%q was accepted; want a boot failure", strings.TrimSpace(body))
+		}
+	}
+}
+
+// An out-of-range value must not be truncated into a valid-looking one.
+func TestLoadConfigFromSources_OversizedRateBurstYAMLRejected(t *testing.T) {
+	clearJAYEnv(t)
+	path := filepath.Join(t.TempDir(), "jay.yaml")
+	if err := os.WriteFile(path, []byte("rate_burst: 4294967296\n"), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	log, _ := captureLogger()
+	if _, err := LoadConfigFromSources(path, log); err == nil {
+		t.Error("rate_burst: 4294967296 was accepted; want a boot failure")
+	}
+}
+
+// The env door keeps the loader's policy for bad values: log and hold the
+// previous value, which here is the default burst — never a burst <= 0.
+func TestLoadConfigFromSources_NonPositiveRateBurstEnvKeepsDefault(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_RATE_BURST", "-1")
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.RateBurst != defaultConfig().RateBurst {
+		t.Errorf("RateBurst = %d, want the default %d", cfg.RateBurst, defaultConfig().RateBurst)
+	}
+	if !strings.Contains(buf.String(), "invalid JAY_RATE_BURST") {
+		t.Errorf("expected an invalid-value error in the log, got: %s", buf.String())
+	}
+}
