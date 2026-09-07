@@ -2,6 +2,7 @@ package meta
 
 import (
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -201,5 +202,46 @@ func TestBucketStats_NonexistentBucket(t *testing.T) {
 	}
 	if count != 0 || size != 0 {
 		t.Fatalf("expected 0/0, got %d/%d", count, size)
+	}
+}
+
+// UpdateBucketVisibility is the last line of defence for the one string that
+// decides whether strangers — and anonymous callers — can read a bucket. An
+// unrecognised value reads as "not public-read" everywhere it is compared, so
+// storing it would look like a change that took effect and behave like none.
+func TestUpdateBucketVisibility(t *testing.T) {
+	db := openBucketsTestDB(t)
+	b := &Bucket{ID: uuid.New().String(), Name: "vis", Status: "active"}
+	if err := db.CreateBucket(b); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	if got, _ := db.GetBucket("vis"); got.Visibility != VisibilityPrivate {
+		t.Fatalf("a new bucket is %q, want %q", got.Visibility, VisibilityPrivate)
+	}
+
+	if err := db.UpdateBucketVisibility("vis", VisibilityPublicRead); err != nil {
+		t.Fatalf("set public-read: %v", err)
+	}
+	got, err := db.GetBucket("vis")
+	if err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	if got.Visibility != VisibilityPublicRead {
+		t.Fatalf("visibility = %q, want %q", got.Visibility, VisibilityPublicRead)
+	}
+
+	if err := db.UpdateBucketVisibility("vis", "public-write"); !errors.Is(err, ErrInvalidVisibility) {
+		t.Fatalf("want ErrInvalidVisibility, got %v", err)
+	}
+	after, err := db.GetBucket("vis")
+	if err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	if after.Visibility != VisibilityPublicRead {
+		t.Fatalf("a refused value changed the record: %q", after.Visibility)
+	}
+
+	if err := db.UpdateBucketVisibility("no-such-bucket", VisibilityPrivate); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("want ErrBucketNotFound, got %v", err)
 	}
 }

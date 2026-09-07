@@ -40,7 +40,7 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 		ID:             uuid.New().String(),
 		Name:           bucketName,
 		OwnerAccountID: accountID,
-		Visibility:     "private",
+		Visibility:     meta.VisibilityPrivate,
 		Status:         "active",
 	}
 

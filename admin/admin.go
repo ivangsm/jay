@@ -214,6 +214,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleRevalidate(w, r)
 	case path == "/quarantine" && r.Method == http.MethodDelete:
 		h.handlePurge(w, r)
+	case strings.HasPrefix(path, "/buckets/"):
+		h.routeBucket(w, r, path)
+	default:
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+	}
+}
+
+// routeBucket dispatches the bucket-configuration surface: the policy and the
+// visibility, which are the two things that decide who can reach a bucket and
+// which had no endpoint at all until PND-0187. See admin/buckets.go for why
+// they live here rather than on the S3 port.
+func (h *Handler) routeBucket(w http.ResponseWriter, r *http.Request, path string) {
+	name, sub, ok := bucketRoute(path)
+	if !ok {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	switch {
+	case sub == "" && r.Method == http.MethodGet:
+		h.handleGetBucket(w, r, name)
+	case sub == "policy" && r.Method == http.MethodPut:
+		h.handlePutBucketPolicy(w, r, name)
+	case sub == "policy" && r.Method == http.MethodDelete:
+		h.handleDeleteBucketPolicy(w, r, name)
+	case sub == "visibility" && r.Method == http.MethodPut:
+		h.handlePutBucketVisibility(w, r, name)
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}

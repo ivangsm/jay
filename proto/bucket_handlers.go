@@ -32,7 +32,7 @@ func (h *connHandler) handleCreateBucket(req *request) error {
 		ID:             uuid.New().String(),
 		Name:           bucket,
 		OwnerAccountID: h.token.AccountID,
-		Visibility:     "private",
+		Visibility:     meta.VisibilityPrivate,
 		Status:         "active",
 	}
 

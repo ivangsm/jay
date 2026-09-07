@@ -79,6 +79,14 @@ done:
 		err = quarantineRevalidate(addr, token, cmdArgs)
 	case "quarantine-purge":
 		err = quarantinePurge(addr, token)
+	case "get-bucket":
+		err = getBucket(addr, token, cmdArgs)
+	case "set-bucket-policy":
+		err = setBucketPolicy(addr, token, cmdArgs)
+	case "delete-bucket-policy":
+		err = deleteBucketPolicy(addr, token, cmdArgs)
+	case "set-bucket-visibility":
+		err = setBucketVisibility(addr, token, cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", cmd)
 		usage()
@@ -115,7 +123,14 @@ Commands:
                   JAY_LISTEN_ADDR carries a hostname
   quarantine-list                                       List quarantined objects
   quarantine-revalidate -bucket-id <id> -key <key>      Revalidate object
-  quarantine-purge                                      Purge all quarantined`)
+  quarantine-purge                                      Purge all quarantined
+  get-bucket      -bucket <name>                        Show visibility and policy
+  set-bucket-policy -bucket <name> -file <path|->       Install a bucket policy
+                  reads the policy document from a file,
+                  or from stdin with "-"
+  delete-bucket-policy -bucket <name>                   Remove the bucket policy
+  set-bucket-visibility -bucket <name> \
+                  -visibility private|public-read       Open or close anonymous reads`)
 }
 
 func envOr(key, fallback string) string {
@@ -146,6 +161,31 @@ func doRequest(method, url, token string, body any) ([]byte, int, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	data, err := io.ReadAll(resp.Body)
+	return data, resp.StatusCode, err
+}
+
+// doRawRequest sends body as-is instead of marshalling a Go value into it.
+//
+// It exists for the bucket policy, whose body IS the document the operator
+// wrote. Passing it through the JSON encoder would re-emit it — reordered keys,
+// re-escaped strings — so the bytes the server validates would not be the bytes
+// in the file, and a reported error would point at a line number that is not
+// there.
+func doRawRequest(method, url, token string, body []byte) ([]byte, int, error) {
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

@@ -1,9 +1,100 @@
 package auth
 
 import (
+	"errors"
+	"fmt"
 	"net"
+	"slices"
 	"strings"
+
+	"github.com/ivangsm/jay/meta"
 )
+
+// ErrInvalidPolicy is what ValidatePolicy wraps. Callers map it to a 400: every
+// case it covers is something the sender wrote, not something jay failed at.
+var ErrInvalidPolicy = errors.New("auth: invalid bucket policy")
+
+// The two effects a statement can carry. matchesEffect lowercases before
+// comparing, so the document may spell them in any case.
+const (
+	effectAllow = "allow"
+	effectDeny  = "deny"
+)
+
+// ValidatePolicy refuses a document the evaluator could not act on as written.
+//
+// This runs where the policy ENTERS, not where it is evaluated, and that is the
+// whole point: every rule below describes something that silently does nothing
+// at evaluation time, which is the worst possible failure for an access-control
+// document. A policy that is stored and never matches looks installed —
+// `GET /_jay/buckets/{name}` shows it, the operator moves on — and the access it
+// was supposed to grant or deny simply never happens.
+//
+// The three that bite hardest:
+//
+//   - A misspelt action ("object:read") matches nothing, ever. The deny that
+//     was meant to close a prefix leaves it open.
+//   - An empty subjects list matches nothing either, because matchesSubject
+//     iterates and returns false on an empty slice. The statement is inert.
+//   - An unparsable CIDR is worse than inert, and in the dangerous direction:
+//     Compile skips the ones that do not parse, and matchesIPConditionNets
+//     treats an EMPTY network list as "any IP". So `"ip_whitelist": ["10.0.0/8"]`
+//     — one dot short — turns a statement scoped to an internal range into one
+//     that matches the entire internet.
+func ValidatePolicy(policy *BucketPolicy) error {
+	if policy == nil {
+		return fmt.Errorf("%w: no document", ErrInvalidPolicy)
+	}
+	if len(policy.Statements) == 0 {
+		return fmt.Errorf("%w: no statements — a policy that grants and denies "+
+			"nothing is a no-op; remove the policy instead", ErrInvalidPolicy)
+	}
+	for i, stmt := range policy.Statements {
+		if err := validateStatement(i, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateStatement(i int, stmt PolicyStatement) error {
+	switch strings.ToLower(strings.TrimSpace(stmt.Effect)) {
+	case effectAllow, effectDeny:
+	default:
+		return fmt.Errorf("%w: statement %d: effect must be %q or %q, got %q",
+			ErrInvalidPolicy, i, effectAllow, effectDeny, stmt.Effect)
+	}
+
+	if len(stmt.Actions) == 0 {
+		return fmt.Errorf("%w: statement %d: actions is empty, so the statement "+
+			"can never match", ErrInvalidPolicy, i)
+	}
+	for _, action := range stmt.Actions {
+		if action == "*" || slices.Contains(meta.AllActions, action) {
+			continue
+		}
+		return fmt.Errorf("%w: statement %d: %q is not one of %v (or \"*\")",
+			ErrInvalidPolicy, i, action, meta.AllActions)
+	}
+
+	if len(stmt.Subjects) == 0 {
+		return fmt.Errorf("%w: statement %d: subjects is empty, so the statement "+
+			"can never match; use [\"*\"] for every authenticated token",
+			ErrInvalidPolicy, i)
+	}
+
+	if stmt.Conditions == nil {
+		return nil
+	}
+	for _, cidr := range stmt.Conditions.IPWhitelist {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("%w: statement %d: %q is not a CIDR range — an "+
+				"unparsable one is dropped and an empty whitelist matches every "+
+				"address", ErrInvalidPolicy, i, cidr)
+		}
+	}
+	return nil
+}
 
 // BucketPolicy defines prefix-based access rules for a bucket.
 type BucketPolicy struct {
@@ -52,7 +143,7 @@ func (p *BucketPolicy) Compile() {
 // EvaluatePolicyDeny checks policy deny statements against the request context.
 // Returns true if any deny statement matches (access should be refused).
 func EvaluatePolicyDeny(policy *BucketPolicy, tokenID, action, objectKey, clientIP string) bool {
-	return matchesEffect(policy, "deny", tokenID, action, objectKey, clientIP)
+	return matchesEffect(policy, effectDeny, tokenID, action, objectKey, clientIP)
 }
 
 // EvaluatePolicyAllow reports whether an allow statement grants the request.
@@ -63,7 +154,7 @@ func EvaluatePolicyDeny(policy *BucketPolicy, tokenID, action, objectKey, client
 // one. It never narrows what the owner may do, and it never beats a deny: deny
 // is evaluated afterwards, on the same statement set, and wins.
 func EvaluatePolicyAllow(policy *BucketPolicy, tokenID, action, objectKey, clientIP string) bool {
-	return matchesEffect(policy, "allow", tokenID, action, objectKey, clientIP)
+	return matchesEffect(policy, effectAllow, tokenID, action, objectKey, clientIP)
 }
 
 // matchesEffect reports whether any statement with the given effect matches the

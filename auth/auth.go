@@ -359,7 +359,7 @@ func AuthorizeBucketAccess(token *meta.Token, bucket *meta.Bucket, action, objec
 	if authorizeBucketOwnership(token, bucket) == nil {
 		return nil
 	}
-	if bucket.Visibility == "public-read" &&
+	if bucket.Visibility == meta.VisibilityPublicRead &&
 		(action == meta.ActionObjectGet || action == meta.ActionObjectList) {
 		return nil
 	}
@@ -408,7 +408,7 @@ func (a *Auth) IsPublicRead(bucketName string) bool {
 	if err != nil {
 		return false
 	}
-	return b.Visibility == "public-read"
+	return b.Visibility == meta.VisibilityPublicRead
 }
 
 // HashSecret hashes a secret for storage using bcrypt.

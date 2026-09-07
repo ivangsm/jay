@@ -23,7 +23,29 @@ var (
 	ErrBucketNotEmpty      = errors.New("bucket is not empty")
 	ErrBucketLimitExceeded = errors.New("account bucket limit exceeded")
 	ErrInvalidBucketPolicy = errors.New("bucket policy is not valid JSON")
+	ErrInvalidVisibility   = errors.New("bucket visibility must be private or public-read")
 )
+
+// The two visibilities jay implements.
+//
+// They are constants because the string is a decision, not a label: "public-read"
+// is what auth.AuthorizeBucketAccess compares against to let a stranger — and an
+// anonymous caller — read objects. A typo in a literal somewhere would not fail,
+// it would silently mean "private", which is why the setter validates against
+// ValidVisibility instead of writing whatever it was handed.
+const (
+	// VisibilityPrivate is the default: only the owning account, a token
+	// explicitly scoped to the bucket, or an allow statement in its policy.
+	VisibilityPrivate = "private"
+	// VisibilityPublicRead grants object:get and object:list to everyone,
+	// credentials included or not. Never writes.
+	VisibilityPublicRead = "public-read"
+)
+
+// ValidVisibility reports whether v is a visibility jay implements.
+func ValidVisibility(v string) bool {
+	return v == VisibilityPrivate || v == VisibilityPublicRead
+}
 
 // bucketStatsEntry is the 16-byte layout of a maintained counter:
 //
@@ -135,7 +157,7 @@ func (db *DB) CreateBucket(b *Bucket) error {
 		b.Status = "active"
 	}
 	if b.Visibility == "" {
-		b.Visibility = "private"
+		b.Visibility = VisibilityPrivate
 	}
 
 	return db.bolt.Update(func(tx *bolt.Tx) error {
@@ -386,6 +408,22 @@ func (db *DB) UpdateBucketPolicy(name string, policy jsontext.Value) error {
 	}
 	return db.updateRecord(bucketBuckets, name, ErrBucketNotFound, func(b *Bucket) error {
 		b.PolicyJSON = policy
+		return nil
+	})
+}
+
+// UpdateBucketVisibility switches a bucket between private and public-read.
+//
+// Anything else is refused rather than stored: an unrecognised value reads as
+// "not public-read" everywhere it is compared, so writing it would look like a
+// change that took effect and behave like no change at all. CreateBucket leaves
+// every bucket private, and this is the only way out of that.
+func (db *DB) UpdateBucketVisibility(name, visibility string) error {
+	if !ValidVisibility(visibility) {
+		return fmt.Errorf("meta: %w, got %q", ErrInvalidVisibility, visibility)
+	}
+	return db.updateRecord(bucketBuckets, name, ErrBucketNotFound, func(b *Bucket) error {
+		b.Visibility = visibility
 		return nil
 	})
 }
