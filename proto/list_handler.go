@@ -2,6 +2,7 @@ package proto
 
 import (
 	"errors"
+	"time"
 
 	"github.com/ivangsm/jay/meta"
 )
@@ -48,8 +49,15 @@ func (h *connHandler) handleListObjects(req *request) error {
 			Size:           obj.SizeBytes,
 			ETag:           obj.ETag,
 			ChecksumSHA256: obj.ChecksumSHA256,
-			LastModified:   obj.UpdatedAt.Format("2006-01-02T15:04:05Z"),
-			ContentType:    obj.ContentType,
+			// Same formatting as HeadObject and GetObject. This used to be the
+			// literal layout "2006-01-02T15:04:05Z", which is not a timezone
+			// specifier: it stamps a "Z" on whatever zone the value carries.
+			// Identical output today because meta stores UTC, but it meant one
+			// object reported its mtime two different ways depending on how it
+			// was fetched, and the wrong one would have claimed UTC while
+			// printing local time.
+			LastModified: obj.UpdatedAt.UTC().Format(time.RFC3339),
+			ContentType:  obj.ContentType,
 		}
 	}
 
