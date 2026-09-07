@@ -440,6 +440,23 @@ func startDataListeners(
 
 	nativeServer := jayproto.NewServer(db, st, au, log, metrics, int(cfg.RateLimit), cfg.RateBurst)
 	nativeServer.SetMaxObjectSize(cfg.MaxObjectSize)
+
+	nativeTLS, err := nativeTLSConfig(cfg)
+	if err != nil {
+		// Refusing to start is the point. The native handshake sends the token
+		// secret in the clear, so a half-configured TLS pair that fell back to
+		// plaintext would publish the credential of every client that connects
+		// while looking, from the outside, exactly like a working server.
+		log.Error("native TLS is misconfigured", "err", err)
+		abortStartup(shutdownAdmin, func(ctx context.Context) error { return shutdownS3(ctx) })
+	}
+	if nativeTLS != nil {
+		nativeServer.SetTLSConfig(nativeTLS)
+	} else {
+		log.Warn("native protocol is serving in the clear",
+			"detail", "the handshake sends token_id:secret unencrypted; keep this listener on a private network or set JAY_NATIVE_TLS_CERT and JAY_NATIVE_TLS_KEY")
+	}
+
 	shutdownNative, err = nativeServer.ListenAndServe(cfg.NativeAddr)
 	if err != nil {
 		log.Error("failed to start native server", "err", err)

@@ -7,15 +7,27 @@ import (
 )
 
 type Config struct {
-	DataDir           string
-	ListenAddr        string
-	AdminAddr         string
-	NativeAddr        string
-	AdminToken        string
-	LogLevel          string
-	SigningSecret     string
-	TLSCert           string
-	TLSKey            string
+	DataDir       string
+	ListenAddr    string
+	AdminAddr     string
+	NativeAddr    string
+	AdminToken    string
+	LogLevel      string
+	SigningSecret string
+	TLSCert       string
+	TLSKey        string
+
+	// Native protocol TLS. Deliberately NOT defaulted to TLSCert/TLSKey: the
+	// native handshake sends the token secret in the clear, so whether that
+	// transport is encrypted has to be an explicit decision. Inheriting the S3
+	// certificate would mean enabling TLS on the S3 port silently changed the
+	// native transport and broke every client already speaking to it in the
+	// clear — a transport switch as a side effect of an unrelated setting.
+	//
+	// Both or neither: one without the other aborts startup rather than
+	// quietly serving in the clear.
+	NativeTLSCert     string  // JAY_NATIVE_TLS_CERT / native_tls_cert
+	NativeTLSKey      string  // JAY_NATIVE_TLS_KEY / native_tls_key
 	RateLimit         float64 // requests per second per token (0 = disabled)
 	RateBurst         int     // burst size
 	SeedTokenAccount  string  // JAY_SEED_TOKEN_ACCOUNT

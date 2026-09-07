@@ -152,6 +152,8 @@ func bindings() []yamlKeyBinding {
 		bindString("log_level", "JAY_LOG_LEVEL", func(c *Config) *string { return &c.LogLevel }),
 		bindString("tls_cert", "JAY_TLS_CERT", func(c *Config) *string { return &c.TLSCert }),
 		bindString("tls_key", "JAY_TLS_KEY", func(c *Config) *string { return &c.TLSKey }),
+		bindString("native_tls_cert", "JAY_NATIVE_TLS_CERT", func(c *Config) *string { return &c.NativeTLSCert }),
+		bindString("native_tls_key", "JAY_NATIVE_TLS_KEY", func(c *Config) *string { return &c.NativeTLSKey }),
 		bindFloat("rate_limit", "JAY_RATE_LIMIT", func(c *Config) *float64 { return &c.RateLimit }),
 		bindPositiveInt("rate_burst", "JAY_RATE_BURST", func(c *Config) *int { return &c.RateBurst }),
 		bindBool("trust_proxy_headers", "JAY_TRUST_PROXY_HEADERS", func(c *Config) *bool { return &c.TrustProxyHeaders }),

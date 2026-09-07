@@ -26,6 +26,8 @@ var fieldSpecs = []fieldSpec{
 	{yamlKey: "log_level", yamlPath: []string{"log_level"}, envKey: "JAY_LOG_LEVEL", kind: typeString},
 	{yamlKey: "tls_cert", yamlPath: []string{"tls_cert"}, envKey: "JAY_TLS_CERT", kind: typeString},
 	{yamlKey: "tls_key", yamlPath: []string{"tls_key"}, envKey: "JAY_TLS_KEY", kind: typeString},
+	{yamlKey: "native_tls_cert", yamlPath: []string{"native_tls_cert"}, envKey: "JAY_NATIVE_TLS_CERT", kind: typeString},
+	{yamlKey: "native_tls_key", yamlPath: []string{"native_tls_key"}, envKey: "JAY_NATIVE_TLS_KEY", kind: typeString},
 	{yamlKey: "rate_limit", yamlPath: []string{"rate_limit"}, envKey: "JAY_RATE_LIMIT", kind: typeFloat},
 	{yamlKey: "rate_burst", yamlPath: []string{"rate_burst"}, envKey: "JAY_RATE_BURST", kind: typeInt},
 	{yamlKey: "trust_proxy_headers", yamlPath: []string{"trust_proxy_headers"}, envKey: "JAY_TRUST_PROXY_HEADERS", kind: typeBool},

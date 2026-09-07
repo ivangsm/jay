@@ -9,7 +9,7 @@ description: TLS, reverse proxies, disk, backups and what to expose.
 |---|---|---|
 | S3 API | `:9000` | Whatever needs to store objects, including the public internet if that is your design |
 | Admin API | `:9001` | Nothing outside your network. It creates accounts and tokens |
-| Native protocol | `:4444` | Nothing outside your network. The handshake carries the token secret in the clear |
+| Native protocol | `:4444` | Nothing outside your network, unless you give it TLS — the handshake carries the token secret in the clear by default |
 
 If you do not use the native protocol, disable its listener entirely by setting
 `JAY_NATIVE_ADDR` to an empty value. The startup line then reports
@@ -24,8 +24,19 @@ JAY_TLS_CERT=/etc/jay/fullchain.pem
 JAY_TLS_KEY=/etc/jay/privkey.pem
 ```
 
-This covers the S3 and admin listeners. The native protocol is always plaintext
-and belongs on an internal network.
+This covers the S3 and admin listeners. **The native protocol has its own pair**
+and is not covered by the one above:
+
+```bash
+JAY_NATIVE_TLS_CERT=/etc/jay/native-fullchain.pem
+JAY_NATIVE_TLS_KEY=/etc/jay/native-privkey.pem
+```
+
+They are separate so that turning on TLS for S3 cannot silently change the
+native transport and break clients already speaking to it in the clear. Setting
+one half of either pair without the other aborts startup rather than serving in
+the clear. Left unset, the native listener stays plaintext and belongs on an
+internal network — Jay says so in a startup warning.
 
 **Enable TLS if you use `mc` or `warp`.** minio-go signs plaintext uploads with
 SigV4's streaming mode, which Jay refuses; over TLS the same clients upload

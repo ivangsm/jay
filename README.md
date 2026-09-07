@@ -81,7 +81,7 @@ Step by step: [Quickstart](https://ivangsm.github.io/jay/quickstart/).
 |---|---|---|
 | `:9000` | S3-compatible API | The only one meant for untrusted networks |
 | `:9001` | Admin API and health probes | Internal — it creates accounts and tokens |
-| `:4444` | Native binary protocol | Internal — the token secret travels in the clear |
+| `:4444` | Native binary protocol | Internal by default — the token secret travels in the clear unless `JAY_NATIVE_TLS_CERT`/`_KEY` are set |
 
 Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
 

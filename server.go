@@ -2,12 +2,45 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"time"
 )
+
+// nativeTLSConfig builds the TLS config for the native listener, or nil when
+// the transport is meant to stay in the clear.
+//
+// Supplying one half of the pair is an error, never a fallback to plaintext.
+// The native handshake sends "token_id:secret" unencrypted, so an operator who
+// typed only JAY_NATIVE_TLS_CERT and got a working-looking server would be
+// publishing the credential of every client that connects. This is the config
+// case where degrading quietly is worse than not starting.
+func nativeTLSConfig(cfg Config) (*tls.Config, error) {
+	switch {
+	case cfg.NativeTLSCert == "" && cfg.NativeTLSKey == "":
+		return nil, nil
+	case cfg.NativeTLSCert == "":
+		return nil, errors.New("native_tls_key is set without native_tls_cert")
+	case cfg.NativeTLSKey == "":
+		return nil, errors.New("native_tls_cert is set without native_tls_key")
+	}
+
+	cert, err := tls.LoadX509KeyPair(cfg.NativeTLSCert, cfg.NativeTLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("load native TLS key pair: %w", err)
+	}
+	// Loaded here rather than through the listener so a bad path or an
+	// unreadable key fails at startup, not on the first client to connect.
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
 
 // startServer starts an HTTP server and returns a shutdown function.
 // If certFile and keyFile are non-empty, it starts with TLS.
@@ -20,8 +53,8 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: handler,
-		// ReadTimeout cubre headers + body, y un PUT de 5 GiB necesita esos 5
-		// minutes. ReadHeaderTimeout bounds the header phase separately:
+		// ReadTimeout covers headers plus body, and a 5 GiB PUT needs those
+		// five minutes. ReadHeaderTimeout bounds the header phase separately:
 		// without it, a slowloris dribbling one header byte at a time held the
 		// connection for the full five minutes.
 		ReadHeaderTimeout: 20 * time.Second,
