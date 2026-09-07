@@ -178,6 +178,48 @@ func (d *Decoder) Err() error { return d.err }
 // older, shorter message as a decode error.
 func (d *Decoder) HasMore() bool { return d.err == nil && d.off < len(d.buf) }
 
+// remaining reports how many unread bytes are left in the buffer.
+func (d *Decoder) remaining() int { return len(d.buf) - d.off }
+
+// Minimum on-wire size of one element, used to sanity-check a count before
+// allocating for it. A string is its 2-byte length prefix at minimum, an
+// int32 is 4 bytes, an int64 is 8.
+const (
+	minWireString = 2
+	minWireInt32  = 4
+	minWireInt64  = 8
+)
+
+// count reads a uint16 element count and validates it against the bytes that
+// are actually left, given the smallest possible encoding of one element.
+//
+// Without that check, a count was believed on sight: two bytes of hostile
+// input made the decoder allocate for 65535 elements before discovering there
+// was nothing behind them. On a ListObjects response that is 5.7 MB of
+// allocation bought with 2 bytes — an amplification of roughly 2.9 million to
+// one, reachable by any peer that can answer a request. The count still has to
+// be read to stay on the wire format; what changed is that it is no longer
+// trusted before it is spent.
+//
+// minElemSize must be at least 1; every caller passes one of the minWire*
+// constants or a sum of them.
+func (d *Decoder) count(minElemSize int) int {
+	if d.err != nil {
+		return 0
+	}
+	if d.off+2 > len(d.buf) {
+		d.err = errShortBuffer
+		return 0
+	}
+	n := int(binary.BigEndian.Uint16(d.buf[d.off:]))
+	d.off += 2
+	if n > 0 && n > d.remaining()/minElemSize {
+		d.err = errShortBuffer
+		return 0
+	}
+	return n
+}
+
 func (d *Decoder) String() string {
 	if d.err != nil {
 		return ""
@@ -239,18 +281,10 @@ func (d *Decoder) Bool() bool {
 	return v
 }
 
-// StringMap reads a string map.
+// StringMap reads a string map. An entry is two strings, so 4 bytes minimum.
 func (d *Decoder) StringMap() map[string]string {
-	if d.err != nil {
-		return nil
-	}
-	if d.off+2 > len(d.buf) {
-		d.err = errShortBuffer
-		return nil
-	}
-	n := int(binary.BigEndian.Uint16(d.buf[d.off:]))
-	d.off += 2
-	if n == 0 {
+	n := d.count(2 * minWireString)
+	if d.err != nil || n == 0 {
 		return nil
 	}
 	m := make(map[string]string, n)
@@ -267,16 +301,8 @@ func (d *Decoder) StringMap() map[string]string {
 
 // Strings reads a string slice.
 func (d *Decoder) Strings() []string {
-	if d.err != nil {
-		return nil
-	}
-	if d.off+2 > len(d.buf) {
-		d.err = errShortBuffer
-		return nil
-	}
-	n := int(binary.BigEndian.Uint16(d.buf[d.off:]))
-	d.off += 2
-	if n == 0 {
+	n := d.count(minWireString)
+	if d.err != nil || n == 0 {
 		return nil
 	}
 	ss := make([]string, n)
@@ -291,16 +317,8 @@ func (d *Decoder) Strings() []string {
 
 // Ints reads an int slice.
 func (d *Decoder) Ints() []int {
-	if d.err != nil {
-		return nil
-	}
-	if d.off+2 > len(d.buf) {
-		d.err = errShortBuffer
-		return nil
-	}
-	n := int(binary.BigEndian.Uint16(d.buf[d.off:]))
-	d.off += 2
-	if n == 0 {
+	n := d.count(minWireInt32)
+	if d.err != nil || n == 0 {
 		return nil
 	}
 	ii := make([]int, n)
@@ -536,11 +554,12 @@ func EncodeListObjectsResponse(objects []ListObjectEntry, commonPrefixes []strin
 // DecodeListObjectsResponse decodes a ListObjects response.
 func DecodeListObjectsResponse(data []byte) (objects []ListObjectEntry, commonPrefixes []string, isTruncated bool, nextStartAfter string, err error) {
 	d := NewDecoder(data)
-	if d.off+2 > len(d.buf) {
-		return nil, nil, false, "", errShortBuffer
+	// An entry is key + size + etag + checksum + last_modified + content_type:
+	// five strings and an int64, so 18 bytes even when every string is empty.
+	count := d.count(5*minWireString + minWireInt64)
+	if d.err != nil {
+		return nil, nil, false, "", d.err
 	}
-	count := int(binary.BigEndian.Uint16(d.buf[d.off:]))
-	d.off += 2
 	objects = make([]ListObjectEntry, count)
 	for i := range count {
 		objects[i].Key = d.String()
@@ -679,11 +698,11 @@ func EncodeListPartsResponse(parts []PartInfoEntry) ([]byte, error) {
 // DecodeListPartsResponse decodes a ListParts response.
 func DecodeListPartsResponse(data []byte) ([]PartInfoEntry, error) {
 	d := NewDecoder(data)
-	if d.off+2 > len(d.buf) {
-		return nil, errShortBuffer
+	// An entry is part_number + size + etag + checksum: 16 bytes minimum.
+	count := d.count(minWireInt32 + minWireInt64 + 2*minWireString)
+	if d.err != nil {
+		return nil, d.err
 	}
-	count := int(binary.BigEndian.Uint16(d.buf[d.off:]))
-	d.off += 2
 	parts := make([]PartInfoEntry, count)
 	for i := range count {
 		parts[i].PartNumber = int(d.Int32())
@@ -712,11 +731,11 @@ func EncodeBucketList(names []string, createdAts []string) ([]byte, error) {
 // DecodeBucketList decodes a list of buckets.
 func DecodeBucketList(data []byte) (names []string, createdAts []string, err error) {
 	d := NewDecoder(data)
-	if d.off+2 > len(d.buf) {
-		return nil, nil, errShortBuffer
+	// An entry is name + created_at: two strings, 4 bytes minimum.
+	count := d.count(2 * minWireString)
+	if d.err != nil {
+		return nil, nil, d.err
 	}
-	count := int(binary.BigEndian.Uint16(d.buf[d.off:]))
-	d.off += 2
 	names = make([]string, count)
 	createdAts = make([]string, count)
 	for i := range count {
