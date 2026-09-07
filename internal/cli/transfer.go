@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ivangsm/jay/proto/client"
 )
@@ -177,6 +178,21 @@ func remoteCopy(c *client.Client, src, dst Location, progress io.Writer) error {
 // baseName returns the last segment of a key, for display.
 func baseName(key string) string {
 	return filepath.Base(key)
+}
+
+// localTarget joins rel under root and refuses a result that lands outside it.
+//
+// Object keys are opaque bytes: "../../.ssh/authorized_keys" is a legal key in
+// S3 and in jay, so joining one straight onto a download destination turns
+// `jay sync` into a write anywhere the caller can write. The destination
+// itself is the user's choice and stays allowed.
+func localTarget(root, rel string) (string, error) {
+	target := filepath.Join(root, filepath.FromSlash(rel))
+	cleanRoot := filepath.Clean(root)
+	if target != cleanRoot && !strings.HasPrefix(target, cleanRoot+string(filepath.Separator)) {
+		return "", fmt.Errorf("key %q escapes the destination directory %s", rel, root)
+	}
+	return target, nil
 }
 
 // isDir reports whether path is an existing directory. A path that cannot be

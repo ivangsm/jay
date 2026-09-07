@@ -256,3 +256,30 @@ func TestRecursiveOperationsDoNotTouchSiblingPrefixes(t *testing.T) {
 		}
 	})
 }
+
+// A stored key can contain "..", and joining it onto the destination would
+// write above the directory the user named. The assertion is the absence of
+// the file on disk, not the message the command printed.
+func TestSyncDownloadRefusesKeyEscapingDestination(t *testing.T) {
+	env := newTestEnv(t)
+	env.mustRun(t, "bucket", "mb", "assets")
+	env.putObject(t, "assets", "site/a.txt", []byte("fine"))
+	env.putObject(t, "assets", "site/../../escaped.txt", []byte("escaped"))
+
+	out := env.path("restored", "deep")
+	code := env.run("sync", "jay://assets/site", out)
+
+	escaped := env.path("escaped.txt")
+	if _, err := os.Stat(escaped); err == nil {
+		t.Fatalf("sync wrote %s, outside the destination %s", escaped, out)
+	}
+	if code == 0 {
+		t.Errorf("sync exited 0 after skipping a key it could not place\nstderr: %s", env.stderr)
+	}
+	// The legitimate key still had to land: one hostile key is not a reason to
+	// abandon the rest of the tree.
+	got, err := os.ReadFile(filepath.Join(out, "a.txt")) //nolint:gosec // path built by the test
+	if err != nil || string(got) != "fine" {
+		t.Errorf("a.txt = %q, %v; want %q", got, err, "fine")
+	}
+}

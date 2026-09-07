@@ -216,7 +216,12 @@ func mirrorDown(opts Options, c *client.Client, src, dst Location, mode transfer
 	runParallel(parallel, len(keys), func(i int) {
 		key := keys[i]
 		rel := strings.TrimPrefix(key, DirPrefix(src.Key))
-		target := filepath.Join(dst.Path, filepath.FromSlash(rel))
+		target, err := localTarget(dst.Path, rel)
+		if err != nil {
+			tally.failed.Add(1)
+			printf(opts.errOut(), "skip %s: %v\n", key, err)
+			return
+		}
 
 		if mode == modeSync {
 			same, err := localMatches(target, index[key])

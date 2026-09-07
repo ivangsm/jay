@@ -174,3 +174,19 @@ func (e *testEnv) keys(t *testing.T, bucket string) []string {
 	}
 	return out
 }
+
+// putObject stores a key directly through the client, bypassing the CLI's own
+// key building. Keys are opaque bytes on the wire, so this is how a bucket
+// ends up holding one no local command would have produced.
+func (e *testEnv) putObject(t *testing.T, bucket, key string, data []byte) {
+	t.Helper()
+	c, err := e.opts.dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if _, err := c.PutObject(bucket, key, bytes.NewReader(data), int64(len(data)), nil); err != nil {
+		t.Fatalf("put %s/%s: %v", bucket, key, err)
+	}
+}
