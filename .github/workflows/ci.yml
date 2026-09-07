@@ -117,3 +117,46 @@ jobs:
 
       - name: Run the conformance suite
         run: scripts/conformance.sh --require-all
+
+  # Also a separate job, and for the same reason as conformance: fuzzing is
+  # open-ended work that would turn a 10-second unit cycle into a minutes-long
+  # one. The seed corpus still runs inside `go test ./...` — f.Add cases
+  # execute as ordinary tests — so a regression in a known-bad input is caught
+  # on every push. This job is what looks for the NEXT one.
+  #
+  # The targets parse bytes straight off a socket, and ReadHandshake and
+  # ReadHeader do it BEFORE authentication: anything that can reach the native
+  # port can drive them. A crash there is reachable by an unauthenticated peer.
+  fuzz:
+    name: Fuzz the wire decoder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+          cache: true
+
+      # One target per invocation: `go test -fuzz` accepts a single pattern.
+      # Sequential rather than a matrix because each run is a minute and the
+      # matrix overhead would exceed the work.
+      - name: Fuzz
+        run: |
+          set -euo pipefail
+          for target in FuzzDecoder FuzzDecodeMessages FuzzReadHandshake FuzzReadHeader FuzzRoundTrip; do
+            echo "::group::$target"
+            go test ./proto/ -run "^${target}\$" -fuzz "^${target}\$" -fuzztime 60s
+            echo "::endgroup::"
+          done
+
+      # A failing input is written to proto/testdata/fuzz/<target>/. Without
+      # this the job reports a crash whose reproducer lives only on a runner
+      # that is about to be destroyed.
+      - name: Upload failing corpus
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: proto/testdata/fuzz/
+          if-no-files-found: ignore
