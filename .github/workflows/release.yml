@@ -9,13 +9,34 @@ permissions:
   contents: read
 
 jobs:
+  guard:
+    name: Tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A tag pushed from dev (or any other branch) must not publish. This is
+      # what actually happened for v0.14.0: tagged straight on dev, and the
+      # workflow built and shipped binaries + an image before anyone noticed
+      # main never got the merge. `main` is the only branch that gets to cut
+      # a release; verifying it here is the one check that fails closed even
+      # if a tag lands on the wrong branch again.
+      - name: Require tag commit to be an ancestor of main
+        run: |
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on main. Merge dev -> main first, then tag main." >&2
+            exit 1
+          fi
+
   binaries:
     name: Binaries
     runs-on: ubuntu-latest
     # The GitHub release is what announces the image, so it is published only
     # after the image has been built, smoke tested and pushed. A release whose
     # `docker pull` line points at nothing is a broken promise.
-    needs: image
+    needs: [guard, image]
     permissions:
       contents: write
     steps:
@@ -40,6 +61,7 @@ jobs:
   image:
     name: Image
     runs-on: ubuntu-latest
+    needs: guard
     permissions:
       contents: read
       packages: write
