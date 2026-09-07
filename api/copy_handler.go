@@ -12,6 +12,7 @@ import (
 
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/internal/jsonx"
+	"github.com/ivangsm/jay/internal/objops"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -63,6 +64,21 @@ func (h *Handler) denyCopyPolicy(w http.ResponseWriter, r *http.Request, bucket 
 func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBucket, dstKey string) {
 	_, ok := h.requireAuth(r, w, meta.ActionObjectPut, dstBucket, dstKey)
 	if !ok {
+		return
+	}
+
+	// What the client asked for is read before anything is copied: an algorithm
+	// jay cannot compute has to be refused with nothing written, the same rule
+	// PutObject follows. The AWS CLI only sends the header when someone passes
+	// --checksum-algorithm, so this whole branch is dormant on the default path.
+	checksumReq, cerr := copyChecksumRequest(r)
+	if cerr != nil {
+		h.writeChecksumError(w, r, cerr, "/"+dstBucket+"/"+dstKey)
+		return
+	}
+	digester, cerr := objops.NewChecksumVerifier(checksumReq)
+	if cerr != nil {
+		h.writeChecksumError(w, r, cerr, "/"+dstBucket+"/"+dstKey)
 		return
 	}
 
@@ -161,11 +177,30 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 	defer func() { _ = srcFile.Close() }()
 
 	newObjectID := uuid.New().String()
-	checksum, size, locationRef, err := h.store.WriteObject(dstBucketMeta.ID, newObjectID, srcFile)
+	// digester.Wrap is a no-op unless an algorithm was named, and when one was
+	// it hashes in the SAME pass that writes the bytes: nothing is buffered and
+	// nothing is read twice.
+	checksum, size, locationRef, err := h.store.WriteObject(dstBucketMeta.ID, newObjectID, digester.Wrap(srcFile))
 	if err != nil {
 		h.log.Error("copy: write dest", "err", err)
 		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
 			"Failed to write copy", "/"+dstBucket+"/"+dstKey)
+		return
+	}
+
+	// The requested digest has to exist before the copy is committed. Answering
+	// 200 without it is the defect PND-0194 names; answering 500 after the
+	// metadata is in bbolt would report a failure for a copy that landed. Here
+	// nothing is committed yet, so the rollback is one file removal.
+	checksumValue, err := copyChecksumValue(digester, checksumReq.Algorithm, checksum)
+	if err != nil {
+		h.log.Error("copy: cannot produce the requested checksum",
+			"err", err, "algorithm", string(checksumReq.Algorithm))
+		if delErr := h.store.DeleteObject(locationRef); delErr != nil {
+			h.log.Error("copy: rollback delete after checksum failure", "err", delErr, "location", locationRef)
+		}
+		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+			"Failed to compute the requested checksum", "/"+dstBucket+"/"+dstKey)
 		return
 	}
 
@@ -200,9 +235,19 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 		}
 	}
 
-	writeXML(w, r, http.StatusOK, CopyObjectResult{
+	result := CopyObjectResult{
 		XMLNS:        s3Namespace,
 		LastModified: formatS3Time(now),
 		ETag:         formatETag(newObj.ETag),
-	})
+	}
+	if checksumValue != "" {
+		// The copy is already committed, so this cannot refuse the request any
+		// more. It can only fail if an algorithm exists that CopyObjectResult
+		// has no element for, which the closed set in objops rules out — the
+		// error is logged rather than swallowed so that day is not silent.
+		if err := result.SetChecksum(checksumReq.Algorithm, checksumValue); err != nil {
+			h.log.Error("copy: checksum has no response element", "err", err)
+		}
+	}
+	writeXML(w, r, http.StatusOK, result)
 }

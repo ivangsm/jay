@@ -33,14 +33,31 @@ const checksumHeader = "x-amz-checksum-sha256"
 // header to the bytes it returns, so a 206 must not carry the full-object
 // digest — see handleGetObject.
 func setChecksumHeader(w http.ResponseWriter, hexDigest string) {
+	if value := checksumBase64(hexDigest); value != "" {
+		w.Header().Set(checksumHeader, value)
+	}
+}
+
+// checksumBase64 re-encodes a stored hex SHA-256 as the base64 S3 speaks, and
+// is the ONE place that conversion happens on the HTTP edge.
+//
+// It is a function of its own only because two surfaces need it: the
+// x-amz-checksum-sha256 header on GET/HEAD/PUT, and the <ChecksumSHA256>
+// element CopyObject returns in its XML. A second hex→base64 hop somewhere
+// else is how the two would eventually disagree.
+//
+// An input that is not a well-formed SHA-256 yields "" and therefore no
+// checksum at all. An unverifiable digest is worse than none: the client would
+// reject bytes that are in fact correct.
+func checksumBase64(hexDigest string) string {
 	if hexDigest == "" {
-		return
+		return ""
 	}
 	raw, err := hex.DecodeString(hexDigest)
 	if err != nil || len(raw) != sha256.Size {
-		return
+		return ""
 	}
-	w.Header().Set(checksumHeader, base64.StdEncoding.EncodeToString(raw))
+	return base64.StdEncoding.EncodeToString(raw)
 }
 
 // ── Client-declared checksums (inbound) ───────────────────────────────────
@@ -89,6 +106,17 @@ var checksumValueHeaders = []struct {
 	{"x-amz-checksum-sha256", objops.ChecksumSHA256},
 }
 
+// declaredChecksumAlgorithm returns the algorithm literal the client named and
+// the header that carried it, or ("", checksumAlgorithmHeader) when it named
+// none. The SDK spelling wins when both are present, which is the precedence
+// PutObject has always applied.
+func declaredChecksumAlgorithm(r *http.Request) (value, header string) {
+	if v := strings.TrimSpace(r.Header.Get(sdkChecksumAlgorithmHeader)); v != "" {
+		return v, sdkChecksumAlgorithmHeader
+	}
+	return strings.TrimSpace(r.Header.Get(checksumAlgorithmHeader)), checksumAlgorithmHeader
+}
+
 // parseChecksumRequest reads what the client declared about the body it is
 // about to send. It only reads headers — no digest is computed here — so it is
 // safe (and required) to call before a single byte of the body is touched.
@@ -121,10 +149,7 @@ func parseChecksumRequest(r *http.Request) (objops.ChecksumRequest, error) {
 		req.Digest = value
 	}
 
-	declared := strings.TrimSpace(r.Header.Get(sdkChecksumAlgorithmHeader))
-	if declared == "" {
-		declared = strings.TrimSpace(r.Header.Get(checksumAlgorithmHeader))
-	}
+	declared, _ := declaredChecksumAlgorithm(r)
 	if declared == "" {
 		return req, nil
 	}
@@ -193,6 +218,62 @@ func (h *Handler) writeChecksumError(w http.ResponseWriter, r *http.Request, err
 		return false
 	}
 	return true
+}
+
+// ── CopyObject ────────────────────────────────────────────────────────────
+//
+// A copy is the same family of promise as an upload, through another door. The
+// client cannot declare a digest — the bytes never left the server, so it has
+// nothing to hash — but it can name an algorithm, and until PND-0194 jay read
+// the header, computed nothing, and answered 200 with no checksum anywhere. The
+// request was attended halfway and reported as complete.
+
+// copyChecksumRequest reads the algorithm a CopyObject asked jay to compute.
+//
+// It resolves the literal with the same parser PutObject uses, so an algorithm
+// jay accepts on an upload is one it accepts on a copy, and an unknown one is
+// refused with the same 400 rather than ignored. No digest is ever read here:
+// on a copy there is none to verify.
+func copyChecksumRequest(r *http.Request) (objops.ChecksumRequest, error) {
+	declared, header := declaredChecksumAlgorithm(r)
+	if declared == "" {
+		return objops.ChecksumRequest{}, nil
+	}
+	alg, ok := objops.ParseChecksumAlgorithm(declared)
+	if !ok {
+		return objops.ChecksumRequest{}, &objops.ChecksumError{
+			Header: header,
+			Kind:   objops.ErrUnknownChecksumAlgorithm,
+			Detail: "unknown checksum algorithm " + declared,
+		}
+	}
+	return objops.ChecksumRequest{Algorithm: alg}, nil
+}
+
+// copyChecksumValue returns the base64 digest to put in <CopyObjectResult> for
+// the algorithm the client named, or ("", nil) when it named none.
+//
+// SHA-256 is the one case that does not come from the verifier: the store
+// already hashes every byte on the way to disk, so ChecksumVerifier computes
+// nothing extra for it and the value is the stored hex run through
+// checksumBase64 — the same conversion the GET header uses.
+//
+// An algorithm that was asked for and cannot be produced is an error, not an
+// empty element. The caller answers 500 *before* committing the copy, so the
+// response never claims a digest it does not have and never reports a failure
+// for a copy that landed.
+func copyChecksumValue(v *objops.ChecksumVerifier, alg objops.ChecksumAlgorithm, sha256Hex string) (string, error) {
+	if alg == "" {
+		return "", nil
+	}
+	if _, digest := v.ResponseDigest(); digest != "" {
+		return digest, nil
+	}
+	value := checksumBase64(sha256Hex)
+	if value == "" {
+		return "", errors.New("api: no digest available for " + string(alg))
+	}
+	return value, nil
 }
 
 // setDeclaredChecksumHeader echoes the digest for the algorithm the client

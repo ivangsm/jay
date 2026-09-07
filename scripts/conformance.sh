@@ -577,8 +577,35 @@ else
 		else
 			fail "put-object --checksum-algorithm $alg answers $field (PND-0189)" \
 				"got [$got_alg]: $(tail -2 "$LOGS/aws-sum-$alg.log")"
+			continue
 		fi
+
+		# The same promise through the other door (PND-0194). A copy has no
+		# digest to verify — the bytes never left the server — but the client can
+		# still ask for one, and jay used to answer 200 with none at all. The
+		# expected value is the digest put-object just returned for the SAME
+		# bytes, so a copy that hashed the wrong thing, or answered in hex where
+		# S3 wants base64, fails even though the response looks checksum-shaped.
+		copied_alg="$(aws_a s3api copy-object --bucket "$BUCKET_A" --key "copy-sum-$alg.txt" \
+			--copy-source "$BUCKET_A/sum-$alg.txt" --checksum-algorithm "$alg" \
+			--query "CopyObjectResult.$field" --output text 2>"$LOGS/aws-copysum-$alg.log")"
+		assert_eq "copy-object --checksum-algorithm $alg returns $field (PND-0194)" \
+			"$got_alg" "$copied_alg"
 	done
+
+	# An algorithm jay cannot compute is refused on a copy the way it is on an
+	# upload — and, the part that matters, nothing is copied.
+	if aws_a s3api copy-object --bucket "$BUCKET_A" --key "copy-sum-bad.txt" \
+		--copy-source "$BUCKET_A/small.txt" --checksum-algorithm SHA512 \
+		>"$LOGS/aws-copysum-bad.log" 2>&1; then
+		fail "copy-object with an unknown checksum algorithm is refused (PND-0194)" \
+			"the copy was accepted"
+	elif object_exists "$BUCKET_A" "copy-sum-bad.txt"; then
+		fail "copy-object with an unknown checksum algorithm writes nothing (PND-0194)" \
+			"copy-sum-bad.txt exists"
+	else
+		pass "copy-object with an unknown checksum algorithm is refused and writes nothing (PND-0194)"
+	fi
 
 	# --- multipart up, ranged down ----------------------------------------
 	if aws_a s3 cp "$FIX/big.bin" "s3://$BUCKET_A/big.bin" --quiet >"$LOGS/aws-put-big.log" 2>&1; then

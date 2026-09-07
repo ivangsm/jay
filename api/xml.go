@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/xml"
+	"errors"
 	"net/http"
 	"time"
+
+	"github.com/ivangsm/jay/internal/objops"
 )
 
 const s3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -140,11 +143,44 @@ type S3Part struct {
 }
 
 // CopyObjectResult is the XML response for CopyObject.
+//
+// The five checksum elements are how S3 answers a copy that carried
+// x-amz-checksum-algorithm — in the body, not in a header, because the digest
+// describes the object that was just written rather than the (empty) request.
+// At most one is ever populated: the algorithm the client named. Emitting all
+// five would answer a question nobody asked and would tie the response to
+// jay's internals instead of the request.
 type CopyObjectResult struct {
-	XMLName      xml.Name `xml:"CopyObjectResult"`
-	XMLNS        string   `xml:"xmlns,attr"`
-	LastModified string   `xml:"LastModified"`
-	ETag         string   `xml:"ETag"`
+	XMLName           xml.Name `xml:"CopyObjectResult"`
+	XMLNS             string   `xml:"xmlns,attr"`
+	LastModified      string   `xml:"LastModified"`
+	ETag              string   `xml:"ETag"`
+	ChecksumCRC32     string   `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string   `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
+	ChecksumSHA1      string   `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string   `xml:"ChecksumSHA256,omitempty"`
+}
+
+// SetChecksum places value in the element S3 defines for alg. An algorithm the
+// type has no element for is refused rather than dropped: silently returning a
+// result with no checksum is precisely the defect these fields close.
+func (c *CopyObjectResult) SetChecksum(alg objops.ChecksumAlgorithm, value string) error {
+	switch alg {
+	case objops.ChecksumCRC32:
+		c.ChecksumCRC32 = value
+	case objops.ChecksumCRC32C:
+		c.ChecksumCRC32C = value
+	case objops.ChecksumCRC64NVME:
+		c.ChecksumCRC64NVME = value
+	case objops.ChecksumSHA1:
+		c.ChecksumSHA1 = value
+	case objops.ChecksumSHA256:
+		c.ChecksumSHA256 = value
+	default:
+		return errors.New("api: CopyObjectResult has no element for checksum algorithm " + string(alg))
+	}
+	return nil
 }
 
 // writeS3Error writes an S3-compatible XML error response.
