@@ -103,8 +103,9 @@ func main() {
 	}
 
 	// Health checker (not ready until recovery completes). Beyond the ready
-	// flag it probes bbolt and free disk space on every readiness request.
-	hc := NewHealthChecker(db, cfg.DataDir, cfg.MinFreeBytes)
+	// flag it probes bbolt and free disk space on every readiness request, and
+	// it reports what this instance actually has a recovery path for.
+	hc := NewHealthChecker(db, cfg.DataDir, cfg.MinFreeBytes, describeDurability(cfg, log))
 
 	au := auth.New(db)
 	metrics := maintenance.NewMetrics()
@@ -150,7 +151,7 @@ func main() {
 	stopMaintenance := startMaintenance(cfg, db, st, log, metrics)
 	defer stopMaintenance()
 
-	backupDone, backupWG := startBackupLoop(db, cfg.BackupDir, log)
+	backupDone, backupWG := startBackupLoop(db, cfg, log)
 
 	shutdownS3, shutdownNative := startDataListeners(cfg, db, st, au, log, metrics, shutdownAdmin)
 
@@ -266,13 +267,58 @@ func setupLogging(logLevel string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 }
 
+// describeDurability answers, at startup, what this instance has a recovery
+// path for — and says the uncomfortable half out loud.
+//
+// The warning about the snapshot directory sharing a filesystem with the data
+// is the one that decides something: it is the default configuration, and it
+// means the copy dies with the original. The line about object bytes fires on
+// every boot regardless, because it is true on every boot: an operator reading
+// "metadata snapshot completed and verified" every hour and nothing else would
+// reasonably conclude their objects were covered.
+func describeDurability(cfg Config, log *slog.Logger) Durability {
+	sameFS, err := maintenance.EnsureBackupDir(cfg.DataDir, cfg.MetadataBackupDir)
+	problem := ""
+	if err != nil {
+		// Not fatal: the snapshot loop reports its own failures, and refusing to
+		// boot over a diagnostic would be worse than serving without it. But the
+		// answer degrades to the UNSAFE side, not the comfortable one — an
+		// isolation check that could not run must never come back as "isolated".
+		problem = err.Error()
+		sameFS = true
+		log.Error("durability: could not determine whether the snapshot directory is isolated",
+			"err", err, "path", cfg.MetadataBackupDir,
+			"detail", "assuming it is not, which is the safe assumption to report")
+	}
+
+	log.Info("durability: object bytes are not backed up by jay",
+		"covered", maintenance.SnapshotCovers,
+		"not_covered", maintenance.SnapshotOmits,
+		"detail", "restore procedure: https://ivangsm.github.io/jay/guides/backup-and-restore/")
+
+	if sameFS && problem == "" {
+		log.Warn("durability: metadata snapshots share a filesystem with the data they protect",
+			"data_dir", cfg.DataDir,
+			"metadata_backup_dir", cfg.MetadataBackupDir,
+			"detail", "one disk failure takes the database and every snapshot of it; set JAY_METADATA_BACKUP_DIR to a separate volume")
+	}
+
+	return Durability{
+		MetadataBackup:       "hourly verified snapshot of " + maintenance.SnapshotCovers,
+		ObjectBytesBackup:    "none — " + maintenance.SnapshotOmits,
+		MetadataBackupDir:    cfg.MetadataBackupDir,
+		SharesDataFilesystem: sameFS,
+		Problem:              problem,
+	}
+}
+
 // startBackupLoop runs hourly bbolt snapshots and prunes the old ones.
 //
 // Returns the stop channel and its WaitGroup: closing the channel only signals
 // the goroutine, and the caller has to wait for it to actually exit — an
 // in-flight Run() would otherwise race the deferred bbolt.Close.
-func startBackupLoop(db *meta.DB, backupDir string, log *slog.Logger) (chan struct{}, *sync.WaitGroup) {
-	backupMgr := maintenance.NewBackupManager(db, backupDir, log)
+func startBackupLoop(db *meta.DB, cfg Config, log *slog.Logger) (chan struct{}, *sync.WaitGroup) {
+	backupMgr := maintenance.NewBackupManager(db, cfg.MetadataBackupDir, cfg.DataDir, log)
 	done := make(chan struct{})
 
 	var wg sync.WaitGroup

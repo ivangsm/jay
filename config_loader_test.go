@@ -203,8 +203,8 @@ func TestLoadConfigFromSources_YAMLOnly(t *testing.T) {
 	if cfg.SeedTokenAccount != "falco" || cfg.SeedTokenID != "falco-native" || cfg.SeedTokenSecret != "seed-secret-value" {
 		t.Errorf("seed token mismatch: %+v", cfg)
 	}
-	if cfg.BackupDir != "/mnt/dr/jay-backups" {
-		t.Errorf("BackupDir: want /mnt/dr/jay-backups, got %q", cfg.BackupDir)
+	if cfg.MetadataBackupDir != "/mnt/dr/jay-backups" {
+		t.Errorf("MetadataBackupDir: want /mnt/dr/jay-backups, got %q", cfg.MetadataBackupDir)
 	}
 	if cfg.MinFreeBytes != 1073741824 {
 		t.Errorf("MinFreeBytes: want 1073741824, got %d", cfg.MinFreeBytes)
@@ -343,7 +343,7 @@ func TestLoadConfigFromSources_Defaults(t *testing.T) {
 	want := defaultConfig()
 	// BackupDir is a derived default resolved by LoadConfigFromSources after
 	// all overlays, so defaultConfig leaves it empty.
-	want.BackupDir = filepath.Join(want.DataDir, "backups")
+	want.MetadataBackupDir = filepath.Join(want.DataDir, "backups")
 	if cfg != want {
 		t.Errorf("defaults mismatch:\nwant %+v\ngot  %+v", want, cfg)
 	}
@@ -360,8 +360,8 @@ func TestLoadConfigFromSources_BackupDirDefaultFollowsDataDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfigFromSources: %v", err)
 	}
-	if want := filepath.Join("/env/data", "backups"); cfg.BackupDir != want {
-		t.Errorf("BackupDir: want %q, got %q", want, cfg.BackupDir)
+	if want := filepath.Join("/env/data", "backups"); cfg.MetadataBackupDir != want {
+		t.Errorf("MetadataBackupDir: want %q, got %q", want, cfg.MetadataBackupDir)
 	}
 }
 
@@ -380,8 +380,90 @@ func TestLoadConfigFromSources_BackupDirEnvOverridesYAML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfigFromSources: %v", err)
 	}
-	if cfg.BackupDir != "/env/backups" {
-		t.Errorf("BackupDir: want /env/backups, got %q", cfg.BackupDir)
+	if cfg.MetadataBackupDir != "/env/backups" {
+		t.Errorf("MetadataBackupDir: want /env/backups, got %q", cfg.MetadataBackupDir)
+	}
+}
+
+// --- the metadata_backup.dir rename ------------------------------------------
+//
+// backup.dir became metadata_backup.dir because the old name promised a copy of
+// the objects and jay only ever copied the metadata. The old spelling has to
+// keep working — a deployment that pointed JAY_BACKUP_DIR at a separate volume
+// must not silently start writing snapshots back onto the data disk — and it
+// has to say that it is the old spelling, or the rename never reaches anyone.
+
+func TestLoadConfigFromSources_MetadataBackupDirCanonicalEnv(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_METADATA_BACKUP_DIR", "/mnt/dr/snapshots")
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.MetadataBackupDir != "/mnt/dr/snapshots" {
+		t.Errorf("MetadataBackupDir: want /mnt/dr/snapshots, got %q", cfg.MetadataBackupDir)
+	}
+	if strings.Contains(buf.String(), "deprecated") {
+		t.Errorf("the canonical name must not warn: %s", buf.String())
+	}
+}
+
+func TestLoadConfigFromSources_DeprecatedBackupDirEnvStillWorksAndWarns(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_BACKUP_DIR", "/mnt/dr/snapshots")
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.MetadataBackupDir != "/mnt/dr/snapshots" {
+		t.Errorf("the old spelling must keep working: got %q", cfg.MetadataBackupDir)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "deprecated environment variable") ||
+		!strings.Contains(logged, "JAY_METADATA_BACKUP_DIR") {
+		t.Errorf("expected a deprecation warning naming the replacement, got: %s", logged)
+	}
+}
+
+func TestLoadConfigFromSources_DeprecatedBackupDirYAMLStillWorksAndWarns(t *testing.T) {
+	clearJAYEnv(t)
+
+	path := filepath.Join(t.TempDir(), "jay.yaml")
+	if err := os.WriteFile(path, []byte("backup:\n  dir: /yaml/snapshots\n"), 0o600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	log, buf := captureLogger()
+	cfg, err := LoadConfigFromSources(path, log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.MetadataBackupDir != "/yaml/snapshots" {
+		t.Errorf("the old YAML key must keep working: got %q", cfg.MetadataBackupDir)
+	}
+	if !strings.Contains(buf.String(), "deprecated YAML key") {
+		t.Errorf("expected a deprecation warning, got: %s", buf.String())
+	}
+}
+
+// With both spellings set, the canonical one wins. The ordering in bindings()
+// is what decides this, so it is asserted rather than trusted.
+func TestLoadConfigFromSources_CanonicalBackupDirBeatsDeprecated(t *testing.T) {
+	clearJAYEnv(t)
+	t.Setenv("JAY_BACKUP_DIR", "/old/snapshots")
+	t.Setenv("JAY_METADATA_BACKUP_DIR", "/new/snapshots")
+
+	log, _ := captureLogger()
+	cfg, err := LoadConfigFromSources("", log)
+	if err != nil {
+		t.Fatalf("LoadConfigFromSources: %v", err)
+	}
+	if cfg.MetadataBackupDir != "/new/snapshots" {
+		t.Errorf("MetadataBackupDir: want /new/snapshots, got %q", cfg.MetadataBackupDir)
 	}
 }
 
@@ -495,19 +577,17 @@ func TestLoadConfigFromSources_MaxObjectSizeInvalidEnvKeepsDefault(t *testing.T)
 
 // clearJAYEnv unsets every env var the config loader consumes so the test's
 // baseline is known. t.Setenv restores the original value on cleanup.
+//
+// The list comes from bindings() rather than being written out again. A
+// hand-copied one had already gone stale — JAY_NATIVE_TLS_CERT and its key were
+// missing — and a variable the suite forgets to clear makes every test that
+// asserts a default depend on the developer's shell.
 func clearJAYEnv(t *testing.T) {
 	t.Helper()
-	vars := []string{
-		"JAY_DATA_DIR", "JAY_LISTEN_ADDR", "JAY_ADMIN_ADDR", "JAY_NATIVE_ADDR",
-		"JAY_ADMIN_TOKEN", "JAY_SIGNING_SECRET", "JAY_LOG_LEVEL",
-		"JAY_TLS_CERT", "JAY_TLS_KEY",
-		"JAY_RATE_LIMIT", "JAY_RATE_BURST", "JAY_TRUST_PROXY_HEADERS",
-		"JAY_SCRUB_INTERVAL_HOURS",
-		"JAY_SCRUB_BYTES_PER_SEC", "JAY_SCRUB_MAX_PER_RUN",
-		"JAY_BACKUP_DIR", "JAY_MIN_FREE_BYTES", "JAY_MAX_OBJECT_SIZE",
-		"JAY_SEED_TOKEN_ACCOUNT", "JAY_SEED_TOKEN_ID", "JAY_SEED_TOKEN_SECRET",
-		"JAY_TOKEN_ID", "JAY_TOKEN_SECRET",
-		"JAY_CONFIG_FILE",
+	// JAY_CONFIG_FILE is read directly by main, not through a binding.
+	vars := []string{"JAY_CONFIG_FILE"}
+	for _, b := range bindings() {
+		vars = append(vars, b.envVar)
 	}
 	for _, v := range vars {
 		t.Setenv(v, "")
@@ -726,7 +806,11 @@ func TestLoadConfigFromSources_EmptySecretEnvKeepsYAMLSecret(t *testing.T) {
 func TestLoadConfigFromSources_EmptyYAMLValueOnOptionalKeysIsSilent(t *testing.T) {
 	clearJAYEnv(t)
 	path := filepath.Join(t.TempDir(), "jay.yaml")
-	body := "tls_cert: \"\"\ntls_key: \"\"\nbackup:\n  dir: \"\"\nseed_token:\n  account: \"\"\n  id: \"\"\n  secret: \"\"\nclient:\n  token_id: \"\"\n  token_secret: \"\"\n"
+	// backup.dir is in here on purpose alongside its replacement: an empty
+	// deprecated key is a template that interpolated to nothing, and warning
+	// "you used the old name" about a value that did nothing is the same noise
+	// this test exists to keep out.
+	body := "tls_cert: \"\"\ntls_key: \"\"\nbackup:\n  dir: \"\"\nmetadata_backup:\n  dir: \"\"\nseed_token:\n  account: \"\"\n  id: \"\"\n  secret: \"\"\nclient:\n  token_id: \"\"\n  token_secret: \"\"\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write yaml: %v", err)
 	}
@@ -744,7 +828,10 @@ func TestLoadConfigFromSources_EmptyYAMLValueOnOptionalKeysIsSilent(t *testing.T
 // must not warn when the key would have been empty anyway.
 func TestLoadConfigFromSources_EmptyEnvOnOptionalKeysIsSilent(t *testing.T) {
 	clearJAYEnv(t)
-	for _, v := range []string{"JAY_TLS_CERT", "JAY_TLS_KEY", "JAY_BACKUP_DIR", "JAY_TOKEN_ID"} {
+	for _, v := range []string{
+		"JAY_TLS_CERT", "JAY_TLS_KEY",
+		"JAY_BACKUP_DIR", "JAY_METADATA_BACKUP_DIR", "JAY_TOKEN_ID",
+	} {
 		t.Setenv(v, "")
 	}
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"uuid"
@@ -588,13 +589,93 @@ func TestGC_SweepOrphanMultipartDirs_KeepsRegisteredUpload(t *testing.T) {
 	}
 }
 
+// ── Snapshot isolation ────────────────────────────────────────────────────────
+//
+// The default snapshot directory is <data_dir>/backups, on the same filesystem
+// as the database it protects, so one disk failure takes both. jay cannot fix
+// that for the operator, but it must not stay quiet about it — these fix the
+// detection the startup warning and the readiness payload are built on.
+
+func TestEnsureBackupDir_CreatesDirAndReportsSharedFilesystem(t *testing.T) {
+	dataDir := t.TempDir()
+	backupDir := filepath.Join(dataDir, "backups")
+
+	same, err := EnsureBackupDir(dataDir, backupDir)
+	if err != nil {
+		t.Fatalf("EnsureBackupDir: %v", err)
+	}
+	if !same {
+		t.Error("the default layout puts snapshots on the data filesystem; that must be reported as such")
+	}
+	info, err := os.Stat(backupDir)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("backup dir not created: %v", err)
+	}
+}
+
+func TestEnsureBackupDir_CreatesNestedDir(t *testing.T) {
+	dataDir := t.TempDir()
+	backupDir := filepath.Join(t.TempDir(), "deep", "nested", "snapshots")
+
+	if _, err := EnsureBackupDir(dataDir, backupDir); err != nil {
+		t.Fatalf("EnsureBackupDir: %v", err)
+	}
+	if info, err := os.Stat(backupDir); err != nil || !info.IsDir() {
+		t.Fatalf("nested backup dir not created: %v", err)
+	}
+}
+
+func TestSameFilesystem_MissingPathIsAnError(t *testing.T) {
+	// An unmounted volume must not be reported as "isolated" by accident: the
+	// answer is unknown, and unknown is an error, not a reassuring false.
+	if _, err := SameFilesystem(t.TempDir(), filepath.Join(t.TempDir(), "never-created")); err == nil {
+		t.Error("SameFilesystem must fail when a path cannot be stat'd")
+	}
+}
+
+func TestSameFilesystem_DifferentDevicesReportFalse(t *testing.T) {
+	other := findPathOnAnotherFilesystem(t, t.TempDir())
+	same, err := SameFilesystem(t.TempDir(), other)
+	if err != nil {
+		t.Fatalf("SameFilesystem: %v", err)
+	}
+	if same {
+		t.Errorf("%s is on a different device than the temp dir but was reported as the same", other)
+	}
+}
+
+// findPathOnAnotherFilesystem returns a real directory on a different device
+// than ref, or skips the test. Mounting one is not something a unit test can
+// do portably, and a skipped test that says why beats a test that quietly
+// asserts nothing.
+func findPathOnAnotherFilesystem(t *testing.T, ref string) string {
+	t.Helper()
+
+	var refStat syscall.Stat_t
+	if err := syscall.Stat(ref, &refStat); err != nil {
+		t.Fatalf("stat %s: %v", ref, err)
+	}
+
+	for _, candidate := range []string{"/dev", "/dev/shm", "/proc", "/run", "/sys", "/System/Volumes/Data"} {
+		var st syscall.Stat_t
+		if err := syscall.Stat(candidate, &st); err != nil {
+			continue
+		}
+		if uint64(st.Dev) != uint64(refStat.Dev) {
+			return candidate
+		}
+	}
+	t.Skip("no second filesystem visible on this host to compare against")
+	return ""
+}
+
 // ── BackupManager ─────────────────────────────────────────────────────────────
 
 func TestBackup_NewBackupManager_CreatesDir(t *testing.T) {
 	db, _ := openTestDB(t)
 	backupDir := filepath.Join(t.TempDir(), "nested", "backups")
 
-	bm := NewBackupManager(db, backupDir, discardLogger())
+	bm := NewBackupManager(db, backupDir, t.TempDir(), discardLogger())
 	if bm == nil {
 		t.Fatal("NewBackupManager returned nil")
 	}
@@ -611,7 +692,7 @@ func TestBackup_NewBackupManager_CreatesDir(t *testing.T) {
 func TestBackup_Run_CreatesFile(t *testing.T) {
 	db, _ := openTestDB(t)
 	backupDir := t.TempDir()
-	bm := NewBackupManager(db, backupDir, discardLogger())
+	bm := NewBackupManager(db, backupDir, t.TempDir(), discardLogger())
 
 	path, err := bm.Run()
 	if err != nil {
@@ -630,10 +711,33 @@ func TestBackup_Run_CreatesFile(t *testing.T) {
 	}
 }
 
+// The hourly line is the one thing an operator sees about backups, every hour,
+// forever. "backup completed and verified" on its own is a durability claim
+// over everything jay stores, and jay stores object bytes it never copies. The
+// line has to carry its own scope or the log is the lie.
+func TestBackup_Run_LogLineStatesItsScope(t *testing.T) {
+	db, _ := openTestDB(t)
+	buf := &bytes.Buffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	bm := NewBackupManager(db, t.TempDir(), t.TempDir(), log)
+	if _, err := bm.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "metadata snapshot completed and verified") {
+		t.Errorf("the success line must name what it snapshotted, got: %s", logged)
+	}
+	if !strings.Contains(logged, SnapshotOmits) {
+		t.Errorf("the success line must say object bytes are not covered, got: %s", logged)
+	}
+}
+
 func TestBackup_Verify_AfterRun(t *testing.T) {
 	db, _ := openTestDB(t)
 	backupDir := t.TempDir()
-	bm := NewBackupManager(db, backupDir, discardLogger())
+	bm := NewBackupManager(db, backupDir, t.TempDir(), discardLogger())
 
 	path, err := bm.Run()
 	if err != nil {
@@ -655,7 +759,7 @@ func TestBackup_Verify_AfterRun(t *testing.T) {
 func TestBackup_VerifyAndCleanup_RemovesCorruptFile(t *testing.T) {
 	db, _ := openTestDB(t)
 	backupDir := t.TempDir()
-	bm := NewBackupManager(db, backupDir, discardLogger())
+	bm := NewBackupManager(db, backupDir, t.TempDir(), discardLogger())
 
 	// A file that is not a valid bbolt database must fail verification and be
 	// deleted so it can never be mistaken for a restorable snapshot.
@@ -664,7 +768,7 @@ func TestBackup_VerifyAndCleanup_RemovesCorruptFile(t *testing.T) {
 		t.Fatalf("write corrupt file: %v", err)
 	}
 
-	if err := bm.verifyAndCleanup(corrupt); err == nil {
+	if _, err := bm.verifyAndCleanup(corrupt); err == nil {
 		t.Error("verifyAndCleanup should fail for a corrupt backup")
 	}
 	if _, err := os.Stat(corrupt); !os.IsNotExist(err) {
@@ -675,7 +779,7 @@ func TestBackup_VerifyAndCleanup_RemovesCorruptFile(t *testing.T) {
 func TestBackup_Verify_NonExistentFile(t *testing.T) {
 	db, _ := openTestDB(t)
 	backupDir := t.TempDir()
-	bm := NewBackupManager(db, backupDir, discardLogger())
+	bm := NewBackupManager(db, backupDir, t.TempDir(), discardLogger())
 
 	_, err := bm.Verify(filepath.Join(backupDir, "nope.db"))
 	if err == nil {
@@ -686,7 +790,7 @@ func TestBackup_Verify_NonExistentFile(t *testing.T) {
 func TestBackup_Prune_RemovesOldFiles(t *testing.T) {
 	db, _ := openTestDB(t)
 	backupDir := t.TempDir()
-	bm := NewBackupManager(db, backupDir, discardLogger())
+	bm := NewBackupManager(db, backupDir, t.TempDir(), discardLogger())
 
 	// Create 5 fake backup files with old mtimes.
 	oldTime := time.Now().Add(-48 * time.Hour)
@@ -727,7 +831,7 @@ func TestBackup_Prune_RemovesOldFiles(t *testing.T) {
 func TestBackup_Prune_RespectsMinKeep(t *testing.T) {
 	db, _ := openTestDB(t)
 	backupDir := t.TempDir()
-	bm := NewBackupManager(db, backupDir, discardLogger())
+	bm := NewBackupManager(db, backupDir, t.TempDir(), discardLogger())
 
 	// Create 3 old files but minKeep=5 — should remove nothing.
 	oldTime := time.Now().Add(-48 * time.Hour)
@@ -755,7 +859,7 @@ func TestBackup_Prune_RespectsMinKeep(t *testing.T) {
 func TestBackup_Prune_RecentFilesKept(t *testing.T) {
 	db, _ := openTestDB(t)
 	backupDir := t.TempDir()
-	bm := NewBackupManager(db, backupDir, discardLogger())
+	bm := NewBackupManager(db, backupDir, t.TempDir(), discardLogger())
 
 	// Create 4 recent backup files (1 hour old — within 24h retention).
 	recentTime := time.Now().Add(-1 * time.Hour)

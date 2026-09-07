@@ -37,9 +37,17 @@ type Config struct {
 	ScrubInterval     time.Duration
 	ScrubBytesPerSec  int64
 	ScrubMaxPerRun    int
-	BackupDir         string // JAY_BACKUP_DIR / backup.dir — where hourly bbolt snapshots land; defaults to <DataDir>/backups, point it at a separate volume for real DR
-	MinFreeBytes      int64  // JAY_MIN_FREE_BYTES / min_free_bytes — readiness fails when the DataDir filesystem has less free space; 0 disables the check
-	MaxObjectSize     int64  // JAY_MAX_OBJECT_SIZE / max_object_size — largest accepted object body (and multipart part), in bytes; 0 disables the limit
+	// MetadataBackupDir is where the hourly bbolt snapshots land
+	// (JAY_METADATA_BACKUP_DIR / metadata_backup.dir; the old JAY_BACKUP_DIR /
+	// backup.dir still works and warns). It defaults to <DataDir>/backups,
+	// which is the same disk — point it at a separate volume for real DR.
+	//
+	// The name says metadata because that is all that goes there. Object bytes
+	// are never copied by jay, and "backup" without a qualifier promised a
+	// recovery path that does not exist.
+	MetadataBackupDir string
+	MinFreeBytes      int64 // JAY_MIN_FREE_BYTES / min_free_bytes — readiness fails when the DataDir filesystem has less free space; 0 disables the check
+	MaxObjectSize     int64 // JAY_MAX_OBJECT_SIZE / max_object_size — largest accepted object body (and multipart part), in bytes; 0 disables the limit
 
 	// Client credentials for the `jay` subcommands (ls, cp, rm, sync). The
 	// server itself never reads them; they live here so they go through

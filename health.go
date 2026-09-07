@@ -27,11 +27,48 @@ type HealthChecker struct {
 	// minFreeBytes is the readiness threshold for free space on the dataDir
 	// filesystem. 0 (or negative) disables the check.
 	minFreeBytes int64
+
+	// durability is what this instance actually protects, reported on every
+	// readiness response. It is fixed at construction, so the handler needs no
+	// synchronisation.
+	durability Durability
+}
+
+// Durability is the readiness probe's answer to "what of my data does this
+// instance have a recovery path for".
+//
+// It is on the probe rather than only in the documentation because the probe is
+// where an operator looks during an incident, and because a page nobody opened
+// is not a disclosure. Every field is a statement jay can back up: metadata has
+// an hourly verified snapshot, object bytes have nothing, and the snapshot
+// directory either shares a fate with the data or does not.
+type Durability struct {
+	// MetadataBackup describes the hourly snapshot in one line.
+	MetadataBackup string `json:"metadata_backup"`
+	// ObjectBytesBackup is deliberately a sentence and not a boolean: a
+	// `false` in a health payload gets read as "not enabled yet".
+	ObjectBytesBackup string `json:"object_bytes_backup"`
+	// MetadataBackupDir is where the snapshots land.
+	MetadataBackupDir string `json:"metadata_backup_dir"`
+	// SharesDataFilesystem is true when those snapshots sit on the same
+	// filesystem as the database they protect — the default, and the case where
+	// one disk failure takes both.
+	SharesDataFilesystem bool `json:"metadata_backup_shares_data_filesystem"`
+	// Problem, when non-empty, says the check above could not be run. In that
+	// case SharesDataFilesystem holds the conservative answer (true), not a
+	// measured one: an unanswerable question about whether a backup is isolated
+	// must not come back as the reassuring answer.
+	Problem string `json:"metadata_backup_dir_problem,omitempty"`
 }
 
 // NewHealthChecker creates a new HealthChecker (not ready by default).
-func NewHealthChecker(db *meta.DB, dataDir string, minFreeBytes int64) *HealthChecker {
-	return &HealthChecker{db: db, dataDir: dataDir, minFreeBytes: minFreeBytes}
+func NewHealthChecker(db *meta.DB, dataDir string, minFreeBytes int64, durability Durability) *HealthChecker {
+	return &HealthChecker{
+		db:           db,
+		dataDir:      dataDir,
+		minFreeBytes: minFreeBytes,
+		durability:   durability,
+	}
 }
 
 // SetReady marks the service as ready to accept traffic.
@@ -49,19 +86,35 @@ func (hc *HealthChecker) LivenessHandler(w http.ResponseWriter, _ *http.Request)
 	_ = jsonv2.MarshalWrite(w, map[string]string{"status": "alive"})
 }
 
+// readinessResponse is the readiness payload. Reason is present only on a 503;
+// Durability is present always, because the question it answers ("is my data
+// recoverable") does not become relevant only once something is broken.
+type readinessResponse struct {
+	Status     string     `json:"status"`
+	Reason     string     `json:"reason,omitempty"`
+	Durability Durability `json:"durability"`
+}
+
 // ReadinessHandler returns 200 if ready, 503 with a specific reason if not.
 // Beyond the startup flag it verifies that bbolt still answers a read
 // transaction and that the data filesystem has free space — a full disk or a
 // hung database must take the instance out of rotation, not keep serving 200.
+//
+// The durability block never changes the status code. Object bytes having no
+// backup is a property of jay's design, not a fault of this instance: failing
+// readiness over it would take a perfectly healthy server out of the pool
+// forever. It is reported, not enforced.
 func (hc *HealthChecker) ReadinessHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if reason := hc.readinessProblem(); reason != "" {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = jsonv2.MarshalWrite(w, map[string]string{"status": "not_ready", "reason": reason})
+		_ = jsonv2.MarshalWrite(w, readinessResponse{
+			Status: "not_ready", Reason: reason, Durability: hc.durability,
+		})
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	_ = jsonv2.MarshalWrite(w, map[string]string{"status": "ready"})
+	_ = jsonv2.MarshalWrite(w, readinessResponse{Status: "ready", Durability: hc.durability})
 }
 
 // readinessProblem returns "" when the service is ready to accept traffic, or

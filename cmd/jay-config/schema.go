@@ -36,7 +36,12 @@ var fieldSpecs = []fieldSpec{
 	{yamlKey: "scrub.bytes_per_sec", yamlPath: []string{"scrub", "bytes_per_sec"}, envKey: "JAY_SCRUB_BYTES_PER_SEC", kind: typeInt},
 	{yamlKey: "scrub.max_per_run", yamlPath: []string{"scrub", "max_per_run"}, envKey: "JAY_SCRUB_MAX_PER_RUN", kind: typeInt},
 
+	// backup.dir is the deprecated spelling of metadata_backup.dir. It stays in
+	// the schema for as long as the server keeps honouring it: dropping it here
+	// would make yaml-to-env warn "unknown YAML key" and silently discard a
+	// directory the server still reads.
 	{yamlKey: "backup.dir", yamlPath: []string{"backup", "dir"}, envKey: "JAY_BACKUP_DIR", kind: typeString},
+	{yamlKey: "metadata_backup.dir", yamlPath: []string{"metadata_backup", "dir"}, envKey: "JAY_METADATA_BACKUP_DIR", kind: typeString},
 	{yamlKey: "min_free_bytes", yamlPath: []string{"min_free_bytes"}, envKey: "JAY_MIN_FREE_BYTES", kind: typeInt},
 	{yamlKey: "max_object_size", yamlPath: []string{"max_object_size"}, envKey: "JAY_MAX_OBJECT_SIZE", kind: typeInt},
 

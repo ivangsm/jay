@@ -37,6 +37,27 @@ type yamlKeyBinding struct {
 	// emptyIsValue marks a key whose empty value is a setting, not an absence.
 	// See emptyMeansUnset for why it defaults to false.
 	emptyIsValue bool
+	// deprecatedFor names the binding that replaced this one. A binding with it
+	// set still works — it writes the same Config field — but says so at WARN
+	// on every startup that uses it. See deprecatedAlias.
+	deprecatedFor string
+}
+
+// deprecatedAlias marks a binding as the old spelling of another one.
+//
+// A renamed setting has exactly two failure modes and both are silent. Drop the
+// old name and a deployment that sets it falls back to the default without a
+// word: JAY_BACKUP_DIR pointing at a separate volume would start writing
+// snapshots back onto the data disk, and nothing would say so until the disk
+// that held both died. Keep the old name unmarked and the rename never
+// happens, because nothing ever tells anyone to move.
+//
+// So the alias keeps working and announces itself. It is ordered BEFORE the
+// canonical binding in bindings(), so when both are set the canonical value is
+// the one that survives the overlay.
+func deprecatedAlias(b yamlKeyBinding, replacement string) yamlKeyBinding {
+	b.deprecatedFor = replacement
+	return b
 }
 
 // withEmptyAsValue marks a binding whose empty value MEANS something, so the
@@ -104,11 +125,17 @@ func LoadConfigFromSources(yamlPath string, log *slog.Logger) (Config, error) {
 	//    value.
 	applyEnvOverlay(&cfg, yamlMap, log)
 
-	// 4. Resolve derived defaults. BackupDir defaults to <DataDir>/backups,
-	//    which must be computed AFTER overlays so an overridden DataDir moves
-	//    the default backup location with it.
-	if cfg.BackupDir == "" {
-		cfg.BackupDir = filepath.Join(cfg.DataDir, "backups")
+	// 4. Resolve derived defaults. MetadataBackupDir defaults to
+	//    <DataDir>/backups, which must be computed AFTER overlays so an
+	//    overridden DataDir moves the default snapshot location with it.
+	//
+	//    The directory keeps its old name on disk on purpose. Renaming it to
+	//    match the setting would leave every existing snapshot in a directory
+	//    nothing prunes and nothing restores from — an unmanaged pile that
+	//    grows forever, which is a worse outcome than a directory whose name is
+	//    one word short.
+	if cfg.MetadataBackupDir == "" {
+		cfg.MetadataBackupDir = filepath.Join(cfg.DataDir, "backups")
 	}
 
 	return cfg, nil
@@ -129,8 +156,8 @@ func defaultConfig() Config {
 		ScrubInterval:    6 * time.Hour,
 		ScrubBytesPerSec: int64(50 << 20),
 		ScrubMaxPerRun:   100,
-		// BackupDir is left empty here; LoadConfigFromSources resolves it to
-		// <DataDir>/backups after all overlays are applied.
+		// MetadataBackupDir is left empty here; LoadConfigFromSources resolves
+		// it to <DataDir>/backups after all overlays are applied.
 		MinFreeBytes:  int64(500 << 20), // 500 MiB
 		MaxObjectSize: int64(5 << 30),   // 5 GiB
 	}
@@ -162,7 +189,14 @@ func bindings() []yamlKeyBinding {
 		bindScrubBytesPerSec(),
 		bindScrubMaxPerRun(),
 
-		bindString("backup.dir", "JAY_BACKUP_DIR", func(c *Config) *string { return &c.BackupDir }),
+		// The old spelling first, the canonical one second: when a deployment
+		// sets both, the overlay applies them in this order and the canonical
+		// value is the one left standing.
+		deprecatedAlias(
+			bindString("backup.dir", "JAY_BACKUP_DIR", func(c *Config) *string { return &c.MetadataBackupDir }),
+			"metadata_backup.dir / JAY_METADATA_BACKUP_DIR",
+		),
+		bindString("metadata_backup.dir", "JAY_METADATA_BACKUP_DIR", func(c *Config) *string { return &c.MetadataBackupDir }),
 		bindMinFreeBytes(),
 		bindMaxObjectSize(),
 
@@ -194,8 +228,18 @@ func applyYAMLOverlay(cfg *Config, yamlMap map[string]any, log *slog.Logger) err
 		if _, _, err := b.applyYAML(cfg, raw, log); err != nil {
 			return fmt.Errorf("yaml key %q: %w", b.path, err)
 		}
+		warnDeprecated(b, log, "config: deprecated YAML key", "key", b.path)
 	}
 	return nil
+}
+
+// warnDeprecated announces an old spelling that was actually used. It fires
+// after the value is applied, so it only ever names a key that did something.
+func warnDeprecated(b yamlKeyBinding, log *slog.Logger, msg string, args ...any) {
+	if b.deprecatedFor == "" {
+		return
+	}
+	log.Warn(msg, append(args, "use_instead", b.deprecatedFor)...)
 }
 
 // isEmptyYAMLValue reports whether a decoded YAML value carries nothing: an
@@ -216,8 +260,8 @@ var discardLog = slog.New(slog.DiscardHandler)
 // empty one.
 //
 // The silent half matters as much as the loud half: the config file this repo
-// documents is written as `tls_cert: ${JAY_TLS_CERT:-}`, `backup.dir:
-// ${JAY_BACKUP_DIR:-}`, `seed_token.*`, `client.*` — keys that interpolate to
+// documents is written as `tls_cert: ${JAY_TLS_CERT:-}`, `metadata_backup.dir:
+// ${JAY_METADATA_BACKUP_DIR:-}`, `seed_token.*`, `client.*` — keys that interpolate to
 // an empty string on every ordinary boot and whose default is empty anyway.
 // Warning about those would put seven lines of noise in front of every
 // operator until they learned to skip config warnings, which is how the one
@@ -271,6 +315,8 @@ func applyEnvOverlay(cfg *Config, yamlMap map[string]any, log *slog.Logger) {
 			}
 		}
 		b.applyEnv(cfg, v, log)
+		warnDeprecated(b, log, "config: deprecated environment variable",
+			"key", b.path, "env_var", b.envVar)
 	}
 }
 

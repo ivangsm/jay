@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -66,7 +67,12 @@ func newTestHealthChecker(t *testing.T, minFreeBytes int64) (*HealthChecker, *me
 		t.Fatalf("open meta db: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return NewHealthChecker(db, dir, minFreeBytes), db
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	durability := describeDurability(Config{
+		DataDir:           dir,
+		MetadataBackupDir: filepath.Join(dir, "backups"),
+	}, log)
+	return NewHealthChecker(db, dir, minFreeBytes, durability), db
 }
 
 func readiness(t *testing.T, hc *HealthChecker) (int, string) {
@@ -126,6 +132,70 @@ func TestReadinessHandler_LowDiskSpaceReports503(t *testing.T) {
 	}
 	if !strings.Contains(body, "low disk space") {
 		t.Errorf("body should mention low disk space, got %q", body)
+	}
+}
+
+// The readiness payload has to say that object bytes have no backup. jay
+// snapshots its metadata hourly, verifies it and prunes it — a maintenance
+// story confident enough that an operator reading only the logs concludes their
+// objects are covered. They are not, and the probe they look at during an
+// incident is where that has to be written down.
+func TestReadinessHandler_ReportsThatObjectBytesAreNotBackedUp(t *testing.T) {
+	hc, _ := newTestHealthChecker(t, 1)
+	hc.SetReady(true)
+
+	code, body := readiness(t, hc)
+	if code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body %q)", code, body)
+	}
+	if !strings.Contains(body, `"object_bytes_backup":"none`) {
+		t.Errorf("readiness must state that object bytes have no backup, got %q", body)
+	}
+	if !strings.Contains(body, `"metadata_backup_shares_data_filesystem":true`) {
+		t.Errorf("the default layout shares a filesystem and must say so, got %q", body)
+	}
+}
+
+// An isolation check that cannot run must degrade to the unsafe answer. A
+// backup directory jay could not even create is not an isolated one, and
+// reporting `false` there would be the reassuring lie this whole change exists
+// to remove.
+func TestDescribeDurability_UnknownIsolationDegradesToShared(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// A path under a regular file cannot be created, so the check has no answer.
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	d := describeDurability(Config{
+		DataDir:           t.TempDir(),
+		MetadataBackupDir: filepath.Join(blocker, "backups"),
+	}, log)
+
+	if !d.SharesDataFilesystem {
+		t.Error("an unanswerable isolation check must report the unsafe answer, not the comfortable one")
+	}
+	if d.Problem == "" {
+		t.Error("the payload must say why the answer is an assumption")
+	}
+}
+
+// A 503 must carry the same block. An operator looking at a failing probe is
+// exactly the one about to ask what they can restore.
+func TestReadinessHandler_NotReadyStillReportsDurability(t *testing.T) {
+	hc, _ := newTestHealthChecker(t, 0) // never marked ready
+
+	code, body := readiness(t, hc)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status: got %d, want 503", code)
+	}
+	if !strings.Contains(body, `"durability"`) {
+		t.Errorf("a 503 must still carry the durability block, got %q", body)
+	}
+	if !strings.Contains(body, "recovery in progress") {
+		t.Errorf("the 503 reason must survive the payload change, got %q", body)
 	}
 }
 
