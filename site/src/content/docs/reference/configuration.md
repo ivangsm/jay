@@ -29,7 +29,8 @@ both set the same key, **the environment wins** and the conflict is logged at
 | `JAY_SCRUB_INTERVAL_HOURS` | `6` | Scrubber interval |
 | `JAY_SCRUB_BYTES_PER_SEC` | `52428800` | Scrubber read throttle (`0` = unlimited) |
 | `JAY_SCRUB_MAX_PER_RUN` | `100` | Objects visited per bucket per scrub tick |
-| `JAY_BACKUP_DIR` | `<data_dir>/backups` | Where hourly bbolt snapshots go; point at a separate volume for real DR |
+| `JAY_METADATA_BACKUP_DIR` | `<data_dir>/backups` | Where the hourly bbolt snapshots go. **Metadata only** — object bytes are never copied there. Point it at a separate volume for real DR |
+| `JAY_BACKUP_DIR` | — | Deprecated spelling of the above. Still honoured, warns at startup |
 | `JAY_MIN_FREE_BYTES` | `524288000` | Readiness fails below this free space (`0` disables) |
 | `JAY_MAX_OBJECT_SIZE` | `5368709120` | Largest accepted body and multipart part (`0` disables) |
 | `JAY_SEED_TOKEN_ACCOUNT` | *(optional)* | See [Seed token](/jay/reference/seed-token/) |
@@ -83,8 +84,10 @@ scrub:
   bytes_per_sec: 52428800
   max_per_run: 100
 
-backup:
-  dir: ${JAY_BACKUP_DIR:-}
+# Metadata snapshots only. Object bytes are not copied here or anywhere else:
+# https://ivangsm.github.io/jay/guides/backup-and-restore/
+metadata_backup:
+  dir: ${JAY_METADATA_BACKUP_DIR:-}
 min_free_bytes: 524288000
 max_object_size: 5368709120
 
@@ -117,9 +120,17 @@ data directory or serve on port 80, because Go's `net/http` reads an empty
 switch for the native listener.
 
 When discarding an empty value actually overrides something, it is logged at
-`WARN`. When the key would have been empty anyway — `tls_cert`, `backup.dir`,
-`seed_token.*`, `client.*` above — it is not, because seven lines of noise per
-startup is what teaches people to ignore the one that matters.
+`WARN`. When the key would have been empty anyway — `tls_cert`,
+`metadata_backup.dir`, `seed_token.*`, `client.*` above — it is not, because
+seven lines of noise per startup is what teaches people to ignore the one that
+matters.
+
+**A renamed key keeps working and says so.** `backup.dir` / `JAY_BACKUP_DIR`
+became `metadata_backup.dir` / `JAY_METADATA_BACKUP_DIR`, because the old name
+promised a copy of the objects and only the metadata was ever copied. The old
+spelling still sets the same value and logs a deprecation warning naming the new
+one; dropping it would have made a deployment pointing at a separate volume fall
+back to the default without a word. With both set, the new name wins.
 
 **Interpolation** resolves `${VAR}` and `${VAR:-default}` against the
 environment, on string values only. If neither is set the value ends up empty,

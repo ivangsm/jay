@@ -45,6 +45,7 @@ export default defineConfig({
 						{ label: 'The native protocol', slug: 'guides/native-protocol' },
 						{ label: 'Command-line client', slug: 'guides/cli' },
 						{ label: 'Deploying Jay', slug: 'guides/deployment' },
+						{ label: 'Backup and restore', slug: 'guides/backup-and-restore' },
 					],
 				},
 				{

@@ -10,10 +10,15 @@ object bytes live on the filesystem in a two-level sharded layout.
 JAY_DATA_DIR/
   meta/jay.db      bbolt: buckets, objects, tokens, multipart state
   buckets/         object bytes, sharded two levels deep
+  multipart/       parts of uploads still in flight
   tmp/             in-flight writes
-  backups/         hourly verified snapshots of jay.db
+  backups/         hourly verified snapshots of jay.db — metadata only
   quarantine/      objects pulled out of service
 ```
+
+Only two of those are data you would miss: `meta/jay.db` and `buckets/`. Jay
+snapshots the first and never copies the second — see
+[Backup and restore](/jay/guides/backup-and-restore/).
 
 ## One authorization layer, two transports
 
@@ -80,19 +85,28 @@ the hot path.
 |---|---|---|
 | Scrubber | Every `JAY_SCRUB_INTERVAL_HOURS` (6h), first tick after 30 s | Walks buckets in parallel, bounded by `NumCPU`, verifying up to `JAY_SCRUB_MAX_PER_RUN` objects **per bucket**, resuming from a per-bucket cursor. Throttled by `JAY_SCRUB_BYTES_PER_SEC` |
 | GC | Every 15 min, and on demand after a delete | Old temp files, multipart uploads abandoned for more than 24 h, and orphaned part directories |
-| Backup | Hourly | Snapshot of bbolt, `fsync`, **verify**, then prune snapshots older than 7 days while keeping at least 3 |
+| Metadata snapshot | Hourly | Snapshot of bbolt, `fsync`, **verify**, then prune snapshots older than 7 days while keeping at least 3. Metadata only — no object bytes |
 
-Three consequences worth internalising:
+Five consequences worth internalising:
 
 - **Scrub coverage is not a percentage.** It is `max_per_run × buckets` objects
   per tick, so a full pass takes as long as the largest bucket needs. To speed
   it up, raise `JAY_SCRUB_MAX_PER_RUN`, and the byte throttle too if I/O is the
   bottleneck.
-- **A backup that fails verification is deleted.** An unrestorable snapshot is
+- **A snapshot that fails verification is deleted.** An unrestorable snapshot is
   worse than no snapshot, because it satisfies a retention policy silently. The
-  backup loop is also stopped before the database is closed on shutdown.
-- **The default backup directory is on the same disk as the data.** Point
-  `JAY_BACKUP_DIR` elsewhere for real disaster recovery.
+  snapshot loop is also stopped before the database is closed on shutdown.
+- **Verification proves the snapshot opens, not that anything is recoverable.**
+  It walks the required bbolt buckets and counts what is in them. It has no view
+  of the filesystem, so its object count is a count of *records* — restored over
+  an empty `buckets/`, every one of them gets quarantined.
+- **The default snapshot directory is on the same disk as the data.** Point
+  `JAY_METADATA_BACKUP_DIR` elsewhere for real disaster recovery. Jay warns at
+  startup while it is not, and says so on `/health/ready`.
+- **Object bytes are not backed up by anything here.** All the machinery above —
+  checksums, the scrubber, quarantine, startup recovery — *detects* damage.
+  None of it *repairs* it. The recovery path for `buckets/` is external and
+  documented in [Backup and restore](/jay/guides/backup-and-restore/).
 
 ## Auth caching
 

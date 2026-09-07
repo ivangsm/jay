@@ -14,6 +14,18 @@ The overwritten bytes are gone.
 The hourly backup covers **metadata only**, so it does not get them back either.
 If you need old versions, keep them under distinct keys or use something else.
 
+## Jay does not back up your objects
+
+The hourly snapshot is of `meta/jay.db` and nothing else. There is no
+replication, no sync-out and no remote target for the bytes under `buckets/` —
+copying that directory somewhere safe is your job, and Jay cannot be restored
+without it.
+
+Everything Jay does have — per-object checksums, the incremental scrubber,
+quarantine instead of deletion, startup reconciliation, readiness that fails on
+low disk — **detects** damage. None of it repairs any. The procedure that does
+is in [Backup and restore](/jay/guides/backup-and-restore/).
+
 ## No replication or erasure coding
 
 Jay is a single node over a single directory. There is no clustering, no
@@ -34,11 +46,13 @@ lock, `GetObjectAttributes` and `SelectObjectContent`.
 They answer `501 Not Implemented` — never a `200` that quietly does nothing. See
 [S3 compatibility](/jay/reference/s3-compatibility/) for the whole list.
 
-## Bucket policies cannot be configured
+## Bucket policies are configured off the S3 port
 
-The evaluation is real and tested, but `PutBucketPolicy` answers `501` and the
-admin API has no route for it. A policy can only be installed by writing the
-bucket record directly.
+`PutBucketPolicy` answers `501` and always will: Jay's policy dialect is its
+own, so serving the S3 operation would mean translating between two models that
+do not line up. Policies and bucket visibility are installed through the
+[admin API](/jay/reference/admin-api/) instead, which is where the rest of the
+operator surface already lives.
 
 ## aws-chunked bodies are refused
 

@@ -37,6 +37,11 @@ Jay is small on purpose. It has [no versioning](/jay/internals/limits/), no
 ACLs, no lifecycle rules, no server-side encryption and no object lock. Those
 answer `501 Not Implemented` — never a `200` that quietly does nothing.
 
+**It does not back up your object bytes.** The hourly snapshot is of the
+metadata file; copying `buckets/` somewhere safe is yours to arrange, and Jay
+cannot be restored without it. The procedure, in both directions, is in
+[Backup and restore](/jay/guides/backup-and-restore/).
+
 It also has no external dependencies at runtime and four in `go.mod`: bbolt,
 `golang.org/x/crypto`, `golang.org/x/time` and `gopkg.in/yaml.v3`.
 

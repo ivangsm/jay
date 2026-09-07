@@ -97,4 +97,6 @@ aws --endpoint-url http://localhost:9000 s3 ls s3://media/
 - [The S3 API](/jay/guides/s3-api/) — what works with which client.
 - [The native protocol](/jay/guides/native-protocol/) — if your caller is Go.
 - [Configuration](/jay/reference/configuration/) — every variable Jay reads.
-- [Deploying Jay](/jay/guides/deployment/) — TLS, proxies and backups.
+- [Deploying Jay](/jay/guides/deployment/) — TLS, proxies and disk.
+- [Backup and restore](/jay/guides/backup-and-restore/) — Jay backs up its
+  metadata, not your objects. Read this before you need it.

@@ -185,12 +185,33 @@ the whole bucket to every authenticated token of every account, `DeleteBucket`
 included. Name the actions and the prefixes.
 :::
 
-:::note[There is no endpoint that installs a policy yet]
-`PutBucketPolicy` answers `501` and the admin API has no route for it, so a
-policy can only be put in place by writing the bucket record directly. The
-evaluation described here is real and tested; the way to configure it is not
-built.
-:::
+### Installing one
+
+Through the admin API, not the S3 port — Jay's dialect is not AWS's, and
+`PutBucketPolicy` keeps answering `501`:
+
+```bash
+jay-admin set-bucket-policy -bucket mybucket -file policy.json
+jay-admin delete-bucket-policy -bucket mybucket
+jay-admin get-bucket -bucket mybucket
+```
+
+The document is validated when it arrives, not when it is evaluated: a misspelt
+action, an empty `subjects`, an effect that is neither `allow` nor `deny` or a
+CIDR that does not parse are all `400` and nothing is stored. Every one of them
+would otherwise produce a policy that looks installed and never matches. The
+full list is in [Admin API](/jay/reference/admin-api/).
+
+## Bucket visibility
+
+Every bucket is created `private`. `public-read` is the only other value, and it
+grants `object:get` and `object:list` to everyone — including callers with no
+credentials at all. Never writes.
+
+```bash
+jay-admin set-bucket-visibility -bucket mybucket -visibility public-read
+jay-admin set-bucket-visibility -bucket mybucket -visibility private
+```
 
 ## Rate limiting
 

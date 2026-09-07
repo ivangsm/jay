@@ -62,8 +62,10 @@ objects, and that its own body-size limit is at or above
 
 ## Disk
 
-The whole state of the server is `JAY_DATA_DIR`. Back that up and you have
-backed up Jay.
+The whole state of the server is `JAY_DATA_DIR`. That does **not** mean copying
+that directory backs Jay up — `meta/jay.db` is a live bbolt file, and a copy
+taken from a running server can be unrestorable. See
+[Backup and restore](/jay/guides/backup-and-restore/).
 
 Readiness fails when free space on that filesystem drops below
 `JAY_MIN_FREE_BYTES` (500 MiB by default), which pulls the instance out of a
@@ -72,18 +74,32 @@ rather stop serving than get there.
 
 ## Backups
 
-Jay snapshots its bbolt metadata every hour, verifies each snapshot after
+Jay snapshots its bbolt **metadata** every hour, verifies each snapshot after
 writing it, keeps 24 and prunes after 7 days. **A snapshot that fails
 verification is deleted** — an unrestorable backup is worse than none, because
 it satisfies a retention policy while being useless.
 
 Two things to be clear about:
 
-- **`JAY_BACKUP_DIR` defaults to `<JAY_DATA_DIR>/backups`**, which is the same
-  disk. For real disaster recovery, point it at a separate volume.
-- **The backup covers metadata only.** Object bytes are not in it. A `PUT` over
-  an existing key replaces the file, and the old bytes are gone — Jay has no
+- **The snapshot covers metadata only.** Object bytes are not in it and Jay
+  keeps no copy of them anywhere. Backing up `buckets/` is your job, and Jay
+  cannot be restored without it. A `PUT` over an existing key also replaces the
+  file, and the old bytes are gone — Jay has no
   [versioning](/jay/internals/limits/).
+- **`JAY_METADATA_BACKUP_DIR` defaults to `<JAY_DATA_DIR>/backups`**, which is
+  the same disk. For real disaster recovery, point it at a separate volume. Jay
+  warns at startup while it is not, and reports it in the `durability` block of
+  `/health/ready`.
+
+The full procedure — what to back up, in what order to restore it, and how to
+verify the result — is in [Backup and restore](/jay/guides/backup-and-restore/).
+
+:::note
+`JAY_BACKUP_DIR` was the old name of `JAY_METADATA_BACKUP_DIR`. It still works
+and logs a deprecation warning at startup; it was renamed because "backup"
+without a qualifier promised a recovery path for object bytes that does not
+exist.
+:::
 
 ## Health probes
 
@@ -97,6 +113,25 @@ GET /health/ready   200 once startup recovery has finished
 Readiness is a live check, not a one-time flag. It fails if a bbolt read
 transaction does not complete within its timeout, or if free space drops below
 the floor. If readiness starts failing, look at the disk first.
+
+Readiness also carries a `durability` block on every response, stating what this
+instance has a recovery path for:
+
+```json
+{
+  "status": "ready",
+  "durability": {
+    "metadata_backup": "hourly verified snapshot of meta/jay.db (bbolt): accounts, buckets, object records, tokens, multipart state",
+    "object_bytes_backup": "none — object bytes under buckets/ — jay keeps no copy of them; back that directory up separately",
+    "metadata_backup_dir": "/var/lib/jay/backups",
+    "metadata_backup_shares_data_filesystem": true
+  }
+}
+```
+
+It never changes the status code. Object bytes having no backup is a property of
+Jay's design, not a fault of the instance; failing readiness over it would pull a
+healthy server out of the pool forever.
 
 ## Upgrades
 

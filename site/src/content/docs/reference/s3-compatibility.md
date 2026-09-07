@@ -22,7 +22,7 @@ surface. Everything else answers `501 Not Implemented` — never a misleading
 | GetObject | `GET /<bucket>/<key>` | Range: `bytes=0-499`, suffix, open-ended |
 | HeadObject | `HEAD /<bucket>/<key>` | |
 | DeleteObject | `DELETE /<bucket>/<key>` | |
-| CopyObject | `PUT /<bucket>/<key>` | With `x-amz-copy-source` |
+| CopyObject | `PUT /<bucket>/<key>` | With `x-amz-copy-source`. `x-amz-checksum-algorithm` returns that digest inside `<CopyObjectResult>` |
 | CreateMultipartUpload | `POST /<bucket>/<key>?uploads` | `x-amz-checksum-algorithm` is refused if Jay cannot compute it, rather than ignored |
 | UploadPart | `PUT /<bucket>/<key>?uploadId=X&partNumber=N` | Same digest verification as `PutObject` |
 | CompleteMultipartUpload | `POST /<bucket>/<key>?uploadId=X` | A whole-object `x-amz-checksum-*` answers `501`; the parts are what get verified |
@@ -36,6 +36,15 @@ Multipart uploads accept up to 10,000 parts.
 
 Versioning, ACL, tagging, lifecycle, CORS, policy, encryption, object lock,
 `GetObjectAttributes` and `SelectObjectContent`.
+
+`PutBucketPolicy` is on that list and stays there, but bucket policies
+themselves are **not** unimplemented: they are configured through the
+[admin API](/jay/reference/admin-api/). Jay's policy dialect is its own —
+`subjects`/`prefixes`/`actions` rather than `Principal`/`Resource`/`Action` — so
+serving the S3 operation would mean either translating between two models that
+do not line up, or answering an S3 call with a document no S3 client can read.
+Bucket visibility has no S3 operation at all; the nearest, `PutBucketAcl`, is a
+third model again.
 
 The dispatch rule is asymmetric on purpose. On `PUT`, `POST` and `DELETE` any
 unrecognised sub-resource is refused, because guessing wrong destroys an object.
@@ -118,6 +127,24 @@ data directory rather than against the response. The check runs between the
 part's path is derived from its number, refusing before the rename is also what
 keeps a bad retry from destroying a part that was already accepted.
 
+### CopyObject computes the digest it was asked for
+
+A copy carries no digest to verify — the bytes never left the server, so the
+client has nothing to hash. What it can carry is
+`x-amz-checksum-algorithm`, which is a request for a digest in the *response*,
+and Jay answers it:
+
+| What arrives | Answer |
+|---|---|
+| `x-amz-checksum-algorithm: CRC32` (or any of the five) | `200` with `<ChecksumCRC32>` inside `<CopyObjectResult>`, computed over the copied bytes |
+| An algorithm Jay cannot compute | `400 InvalidRequest`, and **nothing is copied** |
+| No header at all | `200` with `<ETag>` and `<LastModified>` only, exactly as before |
+
+The digest goes in the body, not in a header: it describes the object that was
+just written, not the (empty) request. Exactly one element is ever populated —
+the algorithm that was named. The hashing happens in the same pass that writes
+the bytes, so a copy with a checksum costs no extra read.
+
 Two things Jay deliberately does not do:
 
 - **`CompleteMultipartUpload` refuses a whole-object checksum with `501`.** S3
@@ -125,7 +152,9 @@ Two things Jay deliberately does not do:
   composition, and accepting the header would answer `200` to a verification
   that never happened. Each part is verified instead.
 - **The extra digest is not persisted.** A `PutObject` declaring CRC32 gets its
-  CRC32 back in that response, but only the SHA-256 is stored.
+  CRC32 back in that response, but only the SHA-256 is stored. The same holds
+  for a copy: the response is computed live, and re-reading the object later
+  gives back the SHA-256 alone.
 
 ## DeleteObjects
 
@@ -156,7 +185,7 @@ not write.
 
 | Client | What it exercises |
 |---|---|
-| **aws-cli** (botocore) | `mb`/`rb --force`, `cp` up and down, `sync`, `rm --recursive`, `ListObjectsV2` with prefix and delimiter, multipart upload and ranged download of a 12 MiB object, `presign` including an expired URL, `GetBucketLocation`, `ListMultipartUploads`, `DeleteObjects` whole and partial, a `501` sub-resource, and that `--checksum-algorithm` answers with the algorithm it asked for — all five |
+| **aws-cli** (botocore) | `mb`/`rb --force`, `cp` up and down, `sync`, `rm --recursive`, `ListObjectsV2` with prefix and delimiter, multipart upload and ranged download of a 12 MiB object, `presign` including an expired URL, `GetBucketLocation`, `ListMultipartUploads`, `DeleteObjects` whole and partial, a `501` sub-resource, and that `--checksum-algorithm` answers with the algorithm it asked for — all five, on `put-object` and on `copy-object`, the copy compared against the digest the upload returned for the same bytes |
 | **curl** | That a deliberately wrong digest is refused and writes nothing. No correct client would ever send one, so it has to be forged by hand |
 | **aws-cli, second account** | That a token of account B can neither list, read, write, delete nor batch-delete inside a bucket of account A — each asserted against A's own view of the bucket, not against B's error message |
 | **mc** (minio-go) over HTTP | Listing, `stat`, `get`, bucket create/delete, `rm`, a presigned URL minted by minio-go, and that an upload is refused with `501` leaving nothing behind |

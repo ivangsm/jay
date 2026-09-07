@@ -94,10 +94,11 @@ Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
 | [Authentication](https://ivangsm.github.io/jay/reference/authentication/) | Accounts, tokens, scopes, SigV4, presigned URLs, bucket policies |
 | [S3 compatibility](https://ivangsm.github.io/jay/reference/s3-compatibility/) | The complete operation list and what answers `501` |
 | [Native protocol](https://ivangsm.github.io/jay/reference/native-protocol/) | Frame layout, opcodes, the Go client |
-| [Deploying Jay](https://ivangsm.github.io/jay/guides/deployment/) | TLS, reverse proxies, disk, backups |
+| [Deploying Jay](https://ivangsm.github.io/jay/guides/deployment/) | TLS, reverse proxies, disk, health probes |
+| [Backup and restore](https://ivangsm.github.io/jay/guides/backup-and-restore/) | **Jay backs up metadata, not your objects.** What to copy, and the restore procedure |
 | [Performance](https://ivangsm.github.io/jay/internals/performance/) | Measured benchmarks and the design behind them |
-| [Architecture](https://ivangsm.github.io/jay/internals/architecture/) | The write path, recovery, scrubbing, GC, backups |
-| [Limits](https://ivangsm.github.io/jay/internals/limits/) | No versioning, no replication, no events |
+| [Architecture](https://ivangsm.github.io/jay/internals/architecture/) | The write path, recovery, scrubbing, GC, snapshots |
+| [Limits](https://ivangsm.github.io/jay/internals/limits/) | No versioning, no object-byte backup, no replication, no events |
 
 ## One compatibility caveat
 
