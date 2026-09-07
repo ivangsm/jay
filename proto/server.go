@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -264,8 +265,51 @@ func handshakeRejection(err error) (status byte, respond bool) {
 	}
 }
 
+// logRecoveredPanic writes the one thing a panic must always leave behind: a
+// line in the same JSON stream as everything else, plus a counter that moves.
+//
+// The native server needs this more than the HTTP one does. net/http recovers a
+// panicking handler per connection, so there the cost of no middleware was one
+// unexplained request; here every connection is a bare goroutine, and an
+// unrecovered panic in a handler does not lose a request — it takes the whole
+// process down, every other connection with it, leaving a stack on stderr that
+// no JSON collector keeps.
+//
+// stack is passed in rather than taken here because runtime/debug.Stack only
+// sees the panicking frames while the deferred function that recovered is still
+// running; capturing it at the defer site keeps that unambiguous.
+//
+// log may be nil in a fixture. Falling back to the default logger matters more
+// here than anywhere else: this function runs while a panic is being handled,
+// and a nil dereference inside it would be a panic with nothing left to catch it.
+func logRecoveredPanic(log *slog.Logger, metrics *maintenance.Metrics, rec any, stack []byte, attrs ...any) {
+	metrics.RecordPanicRecovered()
+	if log == nil {
+		log = slog.Default()
+	}
+	args := make([]any, 0, len(attrs)+4)
+	args = append(args, "panic", rec, "stack", string(stack))
+	args = append(args, attrs...)
+	log.Error("panic recovered", args...)
+}
+
 func (s *Server) handleConn(nc net.Conn) {
 	defer func() { _ = nc.Close() }()
+
+	// Registered after the close above, so it runs BEFORE it: the connection is
+	// still closed either way, and the panic never reaches the top frame of this
+	// goroutine, where the runtime would kill the process.
+	//
+	// handleOneRequest recovers first and with better context (it knows the
+	// opcode). This one is what covers the handshake, authentication and the
+	// deadline plumbing around the loop — the part where there is no request to
+	// name yet, and the part a future edit is most likely to forget.
+	defer func() {
+		if rec := recover(); rec != nil {
+			logRecoveredPanic(s.log, s.metrics, rec, debug.Stack(),
+				"phase", "connection", "remote", nc.RemoteAddr())
+		}
+	}()
 
 	br := bufio.NewReaderSize(nc, 64*1024)
 	bw := bufio.NewWriterSize(nc, 64*1024)
@@ -404,11 +448,34 @@ func (h *connHandler) identity(action string) objops.Identity {
 	}
 }
 
-func (h *connHandler) handleOneRequest() error {
+func (h *connHandler) handleOneRequest() (err error) {
 	op, streamID, metaLen, dataLen, err := ReadHeader(h.br)
 	if err != nil {
 		return err
 	}
+
+	// The frame is identified from here on, so a panic can name the operation
+	// that caused it: "a connection died" and "op 0x11 on stream 7 panicked"
+	// are not the same diagnosis, and the first is indistinguishable from a
+	// client that simply hung up.
+	//
+	// The connection is NOT kept alive afterwards. The handler may have consumed
+	// part of its own frame before panicking, so the byte stream is of unknown
+	// alignment and the next ReadHeader would parse whatever came next as a
+	// header. Returning an error closes the connection, which is the honest
+	// answer: the client sees the request fail instead of receiving replies that
+	// belong to a different frame.
+	defer func() {
+		if rec := recover(); rec != nil {
+			logRecoveredPanic(h.log, h.metrics, rec, debug.Stack(),
+				"phase", "request",
+				"remote", h.conn.RemoteAddr(),
+				"token_id", h.token.TokenID,
+				"op", op,
+				"stream_id", streamID)
+			err = fmt.Errorf("proto: panic serving op 0x%02x: %v", op, rec)
+		}
+	}()
 
 	// Shared token-bucket rate limit. If the limiter rejects, we must still
 	// drain this frame's meta + data so the connection remains usable for

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -100,27 +101,113 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: 200}
+		// Deferred, not written after next() returns: a panic below skips
+		// everything after the call, so the ONE request that broke the process
+		// was the only one with no access line at all. withRecover normally
+		// absorbs the panic before it gets here, but the defer is what makes
+		// that a belt rather than the only strap — including for a panic
+		// raised by withRecover's own re-panic path.
+		defer func() {
+			// remote_ip is the key the pre-auth rate limiter buckets by, so
+			// without it a 429 names no one and JAY_TRUST_PROXY_HEADERS cannot
+			// be verified from the outside. It is derived exactly like the
+			// limiter derives it, from the same function, so the log cannot
+			// disagree with the decision.
+			//
+			// The token is deliberately NOT logged: withAuth resolves it
+			// further down the chain, into a context this middleware never
+			// sees, and the only way to hoist it back out is the shared mutable
+			// pointer the request-ID fix just removed. An identity in the log is
+			// not worth re-introducing the bug the log line is here to expose.
+			h.log.Info("request",
+				slog.String("request_id", requestIDFromContext(r.Context())),
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.String("remote_ip", clientIP(r, h.trustProxyHeaders)),
+				slog.Int("status", sw.status),
+				slog.Duration("duration", time.Since(start)),
+			)
+		}()
 		next(sw, r)
-		// remote_ip is the key the pre-auth rate limiter buckets by, so
-		// without it a 429 names no one and JAY_TRUST_PROXY_HEADERS cannot be
-		// verified from the outside. It is derived exactly like the limiter
-		// derives it, from the same function, so the log cannot disagree with
-		// the decision.
-		//
-		// The token is deliberately NOT logged: withAuth resolves it further
-		// down the chain, into a context this middleware never sees, and the
-		// only way to hoist it back out is the shared mutable pointer the
-		// request-ID fix just removed. An identity in the log is not worth
-		// re-introducing the bug the log line is here to expose.
-		h.log.Info("request",
-			slog.String("request_id", requestIDFromContext(r.Context())),
-			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
-			slog.String("remote_ip", clientIP(r, h.trustProxyHeaders)),
-			slog.Int("status", sw.status),
-			slog.Duration("duration", time.Since(start)),
-		)
 	}
+}
+
+// withRecover turns a panic below it into a 500 that names the request.
+//
+// Three things have to happen and none of them happened before: net/http's own
+// recovery closes the connection with no response at all, and writes its stack
+// to the package-level `log` — plain text on a stream that is JSON everywhere
+// else, which a collector that parses JSON drops on the floor. So the request
+// that broke the process was the only one leaving no trace, on exactly the
+// occasion when knowing which request it was matters most.
+//
+//   - The client gets a real S3 error document whose <RequestId> is the same
+//     string as the x-amz-request-id header it already received.
+//   - One Error line goes out in the same JSON stream as everything else,
+//     carrying the request id, the panic value and the stack.
+//   - The counter moves, so /_jay/metrics shows a process that is panicking.
+//
+// It sits INSIDE withLogging, so the access line still comes out and carries
+// status 500 — the recovered response goes through the same statusWriter.
+//
+// Recovering keeps the process alive with state that may be inconsistent, which
+// in an object store is a real trade rather than an obvious win. It is taken
+// deliberately: dying takes every other in-flight request down as well and
+// still explains nothing, whereas this answers the broken request honestly,
+// counts it, and leaves /health/ready as the thing that decides whether this
+// instance keeps taking traffic.
+func (h *Handler) withRecover(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			// http.ErrAbortHandler is net/http's documented way of abandoning a
+			// response on purpose. It is not a fault, and net/http suppresses
+			// its stack, so it is handed straight back untouched.
+			if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+				panic(rec)
+			}
+
+			// debug.Stack() has to be called from inside the deferred function:
+			// that is the only window in which the panicking frames are still
+			// on the goroutine's stack.
+			stack := debug.Stack()
+			started := responseStarted(w)
+			h.metrics.RecordPanicRecovered()
+			h.log.Error("panic recovered",
+				slog.String("request_id", requestIDFromContext(r.Context())),
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.String("remote_ip", clientIP(r, h.trustProxyHeaders)),
+				slog.Bool("response_started", started),
+				slog.Any("panic", rec),
+				slog.String("stack", string(stack)),
+			)
+
+			if started {
+				// Half a body already went out under a status that promised a
+				// whole one. Appending an error document to it would hand the
+				// client a truncated object with a success code on top, which is
+				// the exact defect this repo refuses. Aborting tears the
+				// connection down so the transfer fails the way it actually did.
+				panic(http.ErrAbortHandler)
+			}
+			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+				"Internal error", r.URL.Path)
+		}()
+		next(w, r)
+	}
+}
+
+// responseStarted reports whether any part of the response has reached the
+// client already. Only a statusWriter can answer, and withRecover always sits
+// below the one withLogging installs; anything else is assumed untouched, which
+// is the reading that still produces an answer for the client.
+func responseStarted(w http.ResponseWriter) bool {
+	sw, ok := w.(*statusWriter)
+	return ok && sw.wroteHeader
 }
 
 // requireAuth returns 401/403 if no valid token is present and the operation
@@ -212,18 +299,38 @@ func (h *Handler) authorizeLoadedBucket(
 }
 
 // statusWriter wraps ResponseWriter to capture the status code and enable sendfile.
+//
+// wroteHeader records whether anything has reached the client yet. It is what
+// lets withRecover tell a panic that happened before the response started
+// (answerable with a 500) from one that happened halfway through a body
+// (answerable only by tearing the connection down).
 type statusWriter struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
 }
 
 func (sw *statusWriter) WriteHeader(code int) {
-	sw.status = code
+	// The FIRST status is the one the client sees: net/http ignores every
+	// later WriteHeader. Recording the last one would have made the access log
+	// disagree with the response on any handler that tried twice.
+	if !sw.wroteHeader {
+		sw.status = code
+		sw.wroteHeader = true
+	}
 	sw.ResponseWriter.WriteHeader(code)
+}
+
+// Write records that the response has begun. A handler that writes without
+// calling WriteHeader first has implicitly sent a 200.
+func (sw *statusWriter) Write(b []byte) (int, error) {
+	sw.wroteHeader = true
+	return sw.ResponseWriter.Write(b)
 }
 
 // ReadFrom enables sendfile(2) when copying from *os.File to the response.
 func (sw *statusWriter) ReadFrom(r io.Reader) (int64, error) {
+	sw.wroteHeader = true
 	if rf, ok := sw.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
 	}

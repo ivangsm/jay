@@ -30,6 +30,13 @@ type Metrics struct {
 	// missing and nothing to say so.
 	MetadataDecodeFailures atomic.Int64
 
+	// PanicsRecovered counts panics caught by the HTTP middleware or by the
+	// native connection handler. Recovering keeps the process alive with state
+	// that may be inconsistent, so the number has to be readable from outside:
+	// an instance whose counter is climbing is one to take out of the pool, and
+	// without it the only evidence is a log line somebody has to go looking for.
+	PanicsRecovered atomic.Int64
+
 	BytesUploaded   atomic.Int64
 	BytesDownloaded atomic.Int64
 }
@@ -58,6 +65,17 @@ func (m *Metrics) RecordMetadataDecodeFailure() {
 	m.MetadataDecodeFailures.Add(1)
 }
 
+// RecordPanicRecovered bumps the recovered-panic counter. Nil-safe: the
+// recovery paths that call it run in handlers that may hold no metrics at all
+// (fixtures, the client-side harnesses), and a nil check there would be one
+// more thing to forget on the one path that must never itself panic.
+func (m *Metrics) RecordPanicRecovered() {
+	if m == nil {
+		return
+	}
+	m.PanicsRecovered.Add(1)
+}
+
 // Snapshot returns a JSON-serializable snapshot of all metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
@@ -75,6 +93,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		ObjectsQuarantined: m.ObjectsQuarantined.Load(),
 
 		MetadataDecodeFailures: m.MetadataDecodeFailures.Load(),
+		PanicsRecovered:        m.PanicsRecovered.Load(),
 		BytesUploaded:          m.BytesUploaded.Load(),
 		BytesDownloaded:        m.BytesDownloaded.Load(),
 	}
@@ -96,6 +115,7 @@ type MetricsSnapshot struct {
 	ObjectsQuarantined int64 `json:"objects_quarantined"`
 
 	MetadataDecodeFailures int64 `json:"metadata_decode_failures"`
+	PanicsRecovered        int64 `json:"panics_recovered"`
 	BytesUploaded          int64 `json:"bytes_uploaded"`
 	BytesDownloaded        int64 `json:"bytes_downloaded"`
 }

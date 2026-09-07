@@ -206,13 +206,34 @@ func (h *Handler) SetMaxObjectSize(n int64) {
 //     verification is never reached by a source that is already over its
 //     budget (see withIPRateLimit). withRateLimit then applies the per-token
 //     quota once the caller is known.
+//   - withRecover is immediately inside withLogging: it needs the request ID
+//     and the statusWriter the logger installed (so a recovered panic still
+//     produces an access line, with status 500), and it has to wrap everything
+//     below — a panic in the rate limiter or in authentication is as silent as
+//     one in a handler.
 //   - withUnframedBody sits between the two rate limiters and withPresigned: an
 //     aws-chunked body cannot be served by any handler, so it is refused before
 //     a signature is verified and before a single byte is read — but still
 //     inside the IP limiter, so refusing it is not free for the sender.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	handler := h.withRequestID(h.withLogging(h.withIPRateLimit(h.withUnframedBody(h.withPresigned(h.withAuth(h.withRateLimit(h.dispatch)))))))
-	handler(w, r)
+	h.chain(h.dispatch)(w, r)
+}
+
+// chain wraps final in the full middleware stack.
+//
+// It is a method of its own rather than an expression inside ServeHTTP so a
+// test can push a handler of its own — one that panics, say — through the REAL
+// chain. A test that rebuilt the stack by hand would be asserting against a
+// copy that drifts the day someone reorders the production one.
+func (h *Handler) chain(final http.HandlerFunc) http.HandlerFunc {
+	return h.withRequestID(
+		h.withLogging(
+			h.withRecover(
+				h.withIPRateLimit(
+					h.withUnframedBody(
+						h.withPresigned(
+							h.withAuth(
+								h.withRateLimit(final))))))))
 }
 
 // withPresigned checks for presigned URL query params before falling through

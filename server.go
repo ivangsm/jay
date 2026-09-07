@@ -63,11 +63,22 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20, // 1 MB
 		// Being S3-compatible, jay parses arbitrary client headers
-		// (`x-amz-meta-*`) and SignedHeaders lists. A byte cap alone
-		// solo no impide mandar decenas de miles de cabeceras diminutas, cada
-		// each with its own map entry. 500 is the stdlib default and is plenty
-		// for any real S3 client.
+		// (`x-amz-meta-*`) and SignedHeaders lists. A byte cap alone does not
+		// stop a client from sending tens of thousands of tiny headers, each
+		// with its own map entry. 500 is the stdlib default and is plenty for
+		// any real S3 client.
 		MaxHeaderValueCount: http.DefaultMaxHeaderValueCount,
+		// Everything net/http reports on its own — the stack of a panic it
+		// recovered outside jay's middleware, a rejected TLS handshake, a write
+		// that failed after the headers went out — goes through a *log.Logger.
+		// Left unset that is the package-level default: plain text on stderr, in
+		// the middle of a stream that is JSON everywhere else, which a collector
+		// that parses JSON drops. This routes it through the same slog handler
+		// as every other line, so nothing the process emits leaves the format.
+		//
+		// It covers the admin listener too (health probes, the admin API,
+		// pprof), which has no middleware chain of its own.
+		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelError),
 	}
 
 	go func() {
@@ -87,7 +98,7 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 	return srv.Shutdown, nil
 }
 
-// mountPprof cuelga net/http/pprof de mux bajo /debug/pprof/, envuelto en
+// mountPprof hangs net/http/pprof off mux under /debug/pprof/, wrapped in
 // guard. In jay the mux is the admin listener's (:4011) and the guard is
 // JAY_ADMIN_TOKEN authentication: profiles leak function names and the process's
 // memory layout, and /debug/pprof/profile burns CPU on demand, so they are never
@@ -97,10 +108,9 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 // http.DefaultServeMux, unauthenticated, merely by being imported — there is no
 // way to prevent that. It is harmless as long as jay NEVER serves the
 // DefaultServeMux, and today it does not: startServer always receives an
-// explicit mux
-// explícito. Si algún día alguien pasa nil o http.DefaultServeMux a
-// startServer, pprof queda abierto a internet. Registrarlos a mano acá es lo
-// which keeps the authenticated copy the only reachable one.
+// explicit mux. If anyone ever passes nil or http.DefaultServeMux to
+// startServer, pprof is open to the internet. Registering the handlers by hand
+// here is what keeps the authenticated copy the only reachable one.
 //
 // The profile that justifies all of this is /debug/pprof/goroutineleak, new in
 // Go 1.27: it lists goroutines that are stuck forever. Two known candidates in
