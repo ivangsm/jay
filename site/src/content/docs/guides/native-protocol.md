@@ -78,13 +78,44 @@ when you want a tool you did not write to work against Jay.
 
 ## Security boundary
 
-**The native listener must not face an untrusted network.** The handshake sends
-`token_id:secret` in the clear — there is no TLS on this transport. It is meant
-for a service reaching its own object store over an internal network or a
-container network.
+**Without TLS the handshake sends `token_id:secret` as plain bytes.** On a
+container network or a private subnet that is fine, and it is the default. Over
+anything else it publishes the credential to whatever is on the path.
 
-If you do not use it at all, turn the listener off entirely with an empty
-`JAY_NATIVE_ADDR`.
+Turn on TLS by giving the native listener its own key pair:
+
+```bash
+JAY_NATIVE_TLS_CERT=/etc/jay/native-fullchain.pem
+JAY_NATIVE_TLS_KEY=/etc/jay/native-privkey.pem
+```
+
+Then dial with a TLS config:
+
+```go
+c, err := client.DialWithOptions(addr, tokenID, secret, client.Options{
+    PoolSize:  4,
+    TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+})
+```
+
+Three things about that pair are deliberate:
+
+- **It is separate from `JAY_TLS_CERT`.** Enabling TLS on the S3 port does not
+  enable it here. Inheriting that certificate would mean an unrelated setting
+  silently changed this transport and broke every client already connected to
+  it in the clear.
+- **Setting one without the other aborts startup.** It does not warn and serve
+  in the clear — that combination would publish every client's credential while
+  looking like a working server.
+- **There is no negotiation.** A TLS client fails against a plaintext listener
+  and a plaintext client fails against a TLS one. A transport that fell back on
+  its own would make the encryption unverifiable from the client side.
+
+TLS costs the `sendfile(2)` fast path on downloads, since encryption has to see
+every byte. That is the reason it is opt-in rather than the default.
+
+If you do not use the native protocol at all, turn the listener off entirely
+with an empty `JAY_NATIVE_ADDR`.
 
 ## Limits and timeouts
 

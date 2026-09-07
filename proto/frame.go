@@ -52,8 +52,29 @@ func WriteHandshake(w io.Writer, credentials string) error {
 	return err
 }
 
+// Handshake failure sentinels. The server maps these onto the Handshake*
+// status bytes; without them every failure looked the same and got answered
+// as a version mismatch. Callers should match with errors.Is, never on the
+// message text.
+var (
+	// ErrHandshakeMagic means the first four bytes are not "JAY\0" — whatever
+	// connected is not speaking this protocol.
+	ErrHandshakeMagic = errors.New("proto: invalid handshake magic")
+
+	// ErrHandshakeVersion means the magic matched but the version byte did not.
+	ErrHandshakeVersion = errors.New("proto: unsupported protocol version")
+
+	// ErrHandshakeCredentials means the credential field is absent or unusable.
+	ErrHandshakeCredentials = errors.New("proto: malformed handshake credentials")
+)
+
 // ReadHandshake reads and validates the client handshake from r.
 // Returns the credentials string (token_id:secret).
+//
+// The returned error is one of ErrHandshakeMagic, ErrHandshakeVersion or
+// ErrHandshakeCredentials for a well-formed peer that disagrees with us, or a
+// wrapped I/O error when the socket died mid-handshake. The server needs that
+// distinction to answer with a status that is true.
 func ReadHandshake(r io.Reader) (credentials string, err error) {
 	var buf [HandshakeSize]byte
 	if _, err = io.ReadFull(r, buf[:]); err != nil {
@@ -61,15 +82,15 @@ func ReadHandshake(r io.Reader) (credentials string, err error) {
 	}
 	magic := binary.BigEndian.Uint32(buf[0:4])
 	if magic != Magic {
-		return "", fmt.Errorf("invalid magic: 0x%08X", magic)
+		return "", fmt.Errorf("%w: 0x%08X", ErrHandshakeMagic, magic)
 	}
 	version := buf[4]
 	if version != Version {
-		return "", fmt.Errorf("unsupported version: %d", version)
+		return "", fmt.Errorf("%w: %d", ErrHandshakeVersion, version)
 	}
 	authLen := binary.BigEndian.Uint16(buf[6:8])
 	if authLen == 0 {
-		return "", errors.New("empty credentials")
+		return "", fmt.Errorf("%w: empty", ErrHandshakeCredentials)
 	}
 	authBuf := make([]byte, authLen)
 	if _, err = io.ReadFull(r, authBuf); err != nil {

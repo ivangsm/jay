@@ -6,8 +6,17 @@ const (
 	// Magic bytes: "JAY\0"
 	Magic uint32 = 0x4A415900
 
-	// Version is the protocol version carried in every frame. A peer that does
-	// not recognise it is refused rather than guessed at.
+	// Version is the protocol version. It travels in the handshake ONLY — the
+	// per-frame header has no version byte — so it pins the dialect for the
+	// whole connection and cannot signal a mid-connection change.
+	//
+	// The practical consequence, and the reason this comment is worth reading:
+	// changing the layout of any Encode*/Decode* pair is invisible to the
+	// handshake, so a version bump does NOT protect against wire skew. What
+	// protects against it is the golden tests in wire_golden_test.go. Add a
+	// field to an existing struct and they fail on purpose.
+	//
+	// A peer whose version is not recognised is refused rather than guessed at.
 	Version byte = 0x01
 
 	// HeaderSize is the fixed size of a request/response frame header.
@@ -62,8 +71,34 @@ const (
 )
 
 // Handshake status codes.
+//
+// Every one of these is a deliberate diagnosis, not a catch-all. The server
+// used to answer HandshakeVersionMismatch for ANY handshake failure — a cut
+// socket, a client that dialled the wrong port, a full server — so the one
+// thing the client reported was the one thing that was almost never true.
+// Adding a status is backward compatible: an older client falls through to
+// its default branch and reports the raw number, which still beats a lie.
 const (
-	HandshakeOK              byte = 0x00
-	HandshakeAuthFailed      byte = 0x01
+	// HandshakeOK means the connection is authenticated and ready for frames.
+	HandshakeOK byte = 0x00
+
+	// HandshakeAuthFailed means the credentials were rejected, or were not
+	// shaped as "token_id:secret". The two are deliberately not distinguished:
+	// telling a caller that a token ID exists but its secret is wrong is a
+	// probing oracle.
+	HandshakeAuthFailed byte = 0x01
+
+	// HandshakeVersionMismatch means the magic matched but the version byte is
+	// one this server does not speak. It now means ONLY that.
 	HandshakeVersionMismatch byte = 0x02
+
+	// HandshakeServerBusy means the connection limit was reached. Before this
+	// status existed the server closed the socket without writing anything, so
+	// a client at capacity saw a bare EOF — indistinguishable from a dead
+	// server or a severed network, and therefore retried the wrong way.
+	HandshakeServerBusy byte = 0x03
+
+	// HandshakeMalformed means the bytes were not a Jay handshake at all: bad
+	// magic, usually something that dialled the wrong port.
+	HandshakeMalformed byte = 0x04
 )

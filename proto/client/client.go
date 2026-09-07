@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,28 @@ type Client struct {
 	pool    chan *conn
 	mu      sync.Mutex
 	closed  bool
+
+	// tlsConfig, when set, dials TLS instead of plain TCP.
+	tlsConfig *tls.Config
+}
+
+// Options configures a Client beyond the four positional arguments of Dial.
+// The zero value matches Dial's behaviour exactly.
+type Options struct {
+	// PoolSize is the number of pooled connections. Zero means 4.
+	PoolSize int
+
+	// TLSConfig, when non-nil, dials TLS. The handshake sends
+	// "token_id:secret" as plain bytes, so without this the credential is
+	// readable by anything on the network path — acceptable on a container
+	// network and nowhere else.
+	//
+	// The server must be configured to match (JAY_NATIVE_TLS_CERT /
+	// JAY_NATIVE_TLS_KEY). There is no negotiation: a TLS client against a
+	// plaintext listener fails its handshake, and so does the reverse. That is
+	// deliberate — a protocol that fell back to plaintext when TLS did not work
+	// would make the encryption unverifiable from the client's side.
+	TLSConfig *tls.Config
 }
 
 type conn struct {
@@ -58,16 +81,24 @@ type conn struct {
 	lastUsed time.Time
 }
 
-// Dial creates a new client and establishes the initial connection pool.
+// Dial creates a new client and establishes the initial connection pool over
+// plain TCP. For TLS, use DialWithOptions.
 func Dial(addr, tokenID, secret string, poolSize int) (*Client, error) {
+	return DialWithOptions(addr, tokenID, secret, Options{PoolSize: poolSize})
+}
+
+// DialWithOptions creates a new client with explicit options.
+func DialWithOptions(addr, tokenID, secret string, opts Options) (*Client, error) {
+	poolSize := opts.PoolSize
 	if poolSize <= 0 {
 		poolSize = 4
 	}
 	c := &Client{
-		addr:    addr,
-		tokenID: tokenID,
-		secret:  secret,
-		pool:    make(chan *conn, poolSize),
+		addr:      addr,
+		tokenID:   tokenID,
+		secret:    secret,
+		pool:      make(chan *conn, poolSize),
+		tlsConfig: opts.TLSConfig,
 	}
 	// Pre-connect one connection to validate credentials
 	cn, err := c.newConn()
@@ -152,8 +183,19 @@ func (c *Client) dropConn(cn *conn) {
 	_ = cn.nc.Close()
 }
 
+// dial opens the transport, with TLS when configured. The TLS handshake is
+// bounded by the same dialTimeout as the TCP connect, so a server that accepts
+// the socket and then stalls the handshake cannot hang the caller either.
+func (c *Client) dial() (net.Conn, error) {
+	d := &net.Dialer{Timeout: dialTimeout}
+	if c.tlsConfig == nil {
+		return d.Dial("tcp", c.addr)
+	}
+	return tls.DialWithDialer(d, "tcp", c.addr, c.tlsConfig)
+}
+
 func (c *Client) newConn() (*conn, error) {
-	nc, err := net.DialTimeout("tcp", c.addr, dialTimeout)
+	nc, err := c.dial()
 	if err != nil {
 		return nil, fmt.Errorf("jay client: dial: %w", err)
 	}
@@ -185,14 +227,7 @@ func (c *Client) newConn() (*conn, error) {
 	}
 	if status != proto.HandshakeOK {
 		_ = nc.Close()
-		switch status {
-		case proto.HandshakeAuthFailed:
-			return nil, errors.New("jay client: authentication failed")
-		case proto.HandshakeVersionMismatch:
-			return nil, errors.New("jay client: protocol version mismatch")
-		default:
-			return nil, fmt.Errorf("jay client: handshake failed with status %d", status)
-		}
+		return nil, handshakeError(status)
 	}
 
 	if err := nc.SetDeadline(time.Time{}); err != nil {
@@ -412,6 +447,46 @@ func (cr *connReader) Close() error {
 	}
 	cr.client.putConn(cr.cn)
 	return nil
+}
+
+// Handshake failure sentinels, so a caller can branch on what went wrong
+// instead of matching on message text. The distinction that matters in
+// practice is retryability: ErrServerBusy is worth backing off and retrying,
+// ErrAuthFailed and ErrVersionMismatch never are.
+var (
+	// ErrAuthFailed means the token was rejected, or the credentials were not
+	// shaped as "token_id:secret".
+	ErrAuthFailed = errors.New("jay client: authentication failed")
+
+	// ErrVersionMismatch means the server does not speak this protocol version.
+	ErrVersionMismatch = errors.New("jay client: protocol version mismatch")
+
+	// ErrServerBusy means the server is at its connection limit. Retry with
+	// backoff; the server is alive and the credentials were never examined.
+	ErrServerBusy = errors.New("jay client: server at connection limit")
+
+	// ErrMalformedHandshake means the server did not recognise our handshake
+	// magic — in practice, something other than Jay is on that port.
+	ErrMalformedHandshake = errors.New("jay client: server rejected handshake as malformed")
+)
+
+// handshakeError translates a non-OK handshake status into an error a caller
+// can match. An unknown status is reported with its number rather than folded
+// into one of the known ones: a future server may add statuses, and guessing
+// which one it meant is how "version mismatch" came to mean everything.
+func handshakeError(status byte) error {
+	switch status {
+	case proto.HandshakeAuthFailed:
+		return ErrAuthFailed
+	case proto.HandshakeVersionMismatch:
+		return ErrVersionMismatch
+	case proto.HandshakeServerBusy:
+		return ErrServerBusy
+	case proto.HandshakeMalformed:
+		return ErrMalformedHandshake
+	default:
+		return fmt.Errorf("jay client: handshake failed with status %d", status)
+	}
 }
 
 // Error represents a Jay protocol error.

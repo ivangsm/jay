@@ -19,8 +19,10 @@ both set the same key, **the environment wins** and the conflict is logged at
 | `JAY_ADMIN_TOKEN` | *(required)* | Bearer token for the admin API; at least 32 characters |
 | `JAY_SIGNING_SECRET` | *(required)* | AES-GCM key for presigned URLs and token secrets; at least 32 characters |
 | `JAY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
-| `JAY_TLS_CERT` | *(optional)* | Path to a TLS certificate |
-| `JAY_TLS_KEY` | *(optional)* | Path to a TLS private key |
+| `JAY_TLS_CERT` | *(optional)* | Path to a TLS certificate for the S3 and admin listeners |
+| `JAY_TLS_KEY` | *(optional)* | Path to the matching private key |
+| `JAY_NATIVE_TLS_CERT` | *(optional)* | Path to a TLS certificate for the **native** listener. Set both or neither — one alone aborts startup |
+| `JAY_NATIVE_TLS_KEY` | *(optional)* | Path to the matching private key |
 | `JAY_RATE_LIMIT` | `100` | Requests/sec per token (`0` disables) |
 | `JAY_RATE_BURST` | `200` | Rate limit burst size; must be at least `1` — a burst of `0` rejects every request, so turn the limiter off with `JAY_RATE_LIMIT=0` instead |
 | `JAY_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` |
@@ -70,6 +72,11 @@ trust_proxy_headers: false
 # ${VAR:-default} provides a fallback.
 tls_cert: ${JAY_TLS_CERT:-}
 tls_key: ${JAY_TLS_KEY:-}
+
+# The native listener has its own pair on purpose: it is not covered by
+# tls_cert above, and turning on TLS for S3 does not turn it on here.
+native_tls_cert: ${JAY_NATIVE_TLS_CERT:-}
+native_tls_key: ${JAY_NATIVE_TLS_KEY:-}
 
 scrub:
   interval_hours: 6

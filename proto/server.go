@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,10 @@ const (
 	// shutdownGrace is how long Shutdown waits for in-flight requests to
 	// finish on their own before force-closing the remaining connections.
 	shutdownGrace = 5 * time.Second
+
+	// busyRejectTimeout bounds the 8-byte "server busy" handshake reply that
+	// the accept loop writes before dropping an over-limit connection.
+	busyRejectTimeout = 2 * time.Second
 )
 
 // Server is the native TCP protocol server.
@@ -56,6 +61,10 @@ type Server struct {
 	quit     chan struct{}
 	maxConns int
 	active   atomic.Int64
+
+	// tlsConfig, when set, wraps the listener. Nil means the transport is in
+	// the clear — see SetTLSConfig.
+	tlsConfig *tls.Config
 
 	// conns tracks live connections so Shutdown can force-close them when
 	// they don't drain within shutdownGrace (they only observe quit between
@@ -99,6 +108,20 @@ func (s *Server) SetMaxObjectSize(n int64) {
 	s.objops.SetMaxObjectSize(n)
 }
 
+// SetTLSConfig wraps the native listener in TLS. Must be called before
+// ListenAndServe; a nil config leaves the transport in the clear.
+//
+// The handshake carries "token_id:secret" as plain bytes, so without this the
+// credential is readable by anything on the path. That is tolerable on a
+// container network and nowhere else.
+//
+// This costs the sendfile(2) fast path on GetObject: TLS has to see every byte,
+// so the kernel can no longer splice a file straight to the socket. It is the
+// reason TLS here is opt-in rather than the default.
+func (s *Server) SetTLSConfig(cfg *tls.Config) {
+	s.tlsConfig = cfg
+}
+
 // ListenAndServe starts the TCP server on the given address.
 // Returns a shutdown function.
 func (s *Server) ListenAndServe(addr string) (func() error, error) {
@@ -106,8 +129,11 @@ func (s *Server) ListenAndServe(addr string) (func() error, error) {
 	if err != nil {
 		return nil, fmt.Errorf("proto: listen: %w", err)
 	}
+	if s.tlsConfig != nil {
+		ln = tls.NewListener(ln, s.tlsConfig)
+	}
 	s.listener = ln
-	s.log.Info("native server listening", "addr", addr)
+	s.log.Info("native server listening", "addr", addr, "tls", s.tlsConfig != nil)
 
 	go s.acceptLoop()
 
@@ -184,7 +210,7 @@ func (s *Server) acceptLoop() {
 
 		if int(s.active.Load()) >= s.maxConns {
 			s.log.Warn("connection limit reached, rejecting", "remote", conn.RemoteAddr())
-			_ = conn.Close()
+			s.rejectBusy(conn)
 			continue
 		}
 
@@ -198,6 +224,43 @@ func (s *Server) acceptLoop() {
 			defer s.untrackConn(conn)
 			s.handleConn(conn)
 		})
+	}
+}
+
+// rejectBusy tells a client that the server is at its connection limit and
+// closes. It runs inline on the accept loop on purpose: the response is the
+// 8 fixed bytes of a handshake reply on a freshly accepted socket, which fit
+// in the kernel send buffer without blocking. The short deadline is the belt
+// that makes "without blocking" a guarantee rather than an expectation, so a
+// pathological peer cannot stall accepts.
+//
+// The client never sent its handshake at this point — we answer before
+// reading — which is fine: the reply is self-describing and the client is
+// waiting on exactly these bytes after its own write.
+func (s *Server) rejectBusy(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetWriteDeadline(time.Now().Add(busyRejectTimeout)); err != nil {
+		return
+	}
+	if err := WriteHandshakeResponse(conn, HandshakeServerBusy); err != nil {
+		s.log.Debug("write busy handshake response", "err", err, "remote", conn.RemoteAddr())
+	}
+}
+
+// handshakeRejection maps a ReadHandshake failure onto the status byte the
+// client deserves. The io.EOF case returns false: there is nobody left to
+// answer, and writing into a dead socket only produces a second error to log.
+func handshakeRejection(err error) (status byte, respond bool) {
+	switch {
+	case errors.Is(err, ErrHandshakeVersion):
+		return HandshakeVersionMismatch, true
+	case errors.Is(err, ErrHandshakeMagic):
+		return HandshakeMalformed, true
+	case errors.Is(err, ErrHandshakeCredentials):
+		return HandshakeAuthFailed, true
+	default:
+		// Torn socket, timeout, truncated read. Not a protocol disagreement.
+		return 0, false
 	}
 }
 
@@ -216,8 +279,10 @@ func (s *Server) handleConn(nc net.Conn) {
 	credentials, err := ReadHandshake(br)
 	if err != nil {
 		s.log.Debug("handshake read error", "err", err, "remote", nc.RemoteAddr())
-		_ = WriteHandshakeResponse(bw, HandshakeVersionMismatch)
-		_ = bw.Flush()
+		if status, respond := handshakeRejection(err); respond {
+			_ = WriteHandshakeResponse(bw, status)
+			_ = bw.Flush()
+		}
 		return
 	}
 
