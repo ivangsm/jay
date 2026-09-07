@@ -22,37 +22,45 @@ import (
 // sequences, null bytes, or resolves outside the data directory.
 var errInvalidLocationRef = errors.New("store: invalid location ref")
 
-// validateLocationRef checks that locationRef is safe to use as a sub-path
-// under s.dataDir. It rejects null bytes, ".." components, and any path that
-// would escape the data directory after cleaning.
-func (s *Store) validateLocationRef(locationRef string) error {
-	if strings.ContainsRune(locationRef, 0) {
-		return errInvalidLocationRef
+// safeJoin joins parts under the data directory and returns the absolute path,
+// rejecting null bytes, ".." components, and anything that would resolve
+// outside the data dir.
+//
+// The path it returns is the exact path it checked. That is the point: the
+// check and the construction must not be two separate steps, because a caller
+// that re-joins afterwards gets a path that merely looks like the validated
+// one and is not. Everything in this package that touches the filesystem with
+// an externally supplied component goes through here.
+func (s *Store) safeJoin(parts ...string) (string, error) {
+	for _, part := range parts {
+		if strings.ContainsRune(part, 0) || strings.Contains(part, "..") {
+			return "", errInvalidLocationRef
+		}
 	}
-	if strings.Contains(locationRef, "..") {
-		return errInvalidLocationRef
+	root := filepath.Clean(s.dataDir)
+	joined := filepath.Join(append([]string{root}, parts...)...)
+	if !strings.HasPrefix(joined, root+string(filepath.Separator)) {
+		return "", errInvalidLocationRef
 	}
-	cleaned := filepath.Join(s.dataDir, filepath.Clean(locationRef))
-	if !strings.HasPrefix(cleaned, filepath.Clean(s.dataDir)+string(filepath.Separator)) {
-		return errInvalidLocationRef
-	}
-	return nil
+	return joined, nil
 }
 
 // SafePath validates locationRef and returns the absolute path. Use this
 // whenever locationRef originates from untrusted or externally-stored input.
 func (s *Store) SafePath(locationRef string) (string, error) {
-	if err := s.validateLocationRef(locationRef); err != nil {
-		return "", err
-	}
-	return filepath.Join(s.dataDir, locationRef), nil
+	return s.safeJoin(locationRef)
+}
+
+// bucketDir returns the absolute path to a bucket's directory.
+func (s *Store) bucketDir(bucketID string) (string, error) {
+	return s.safeJoin("buckets", bucketID)
 }
 
 // BucketObjectsDir returns the absolute path to a bucket's objects directory.
 // Callers that only need to walk a bucket's directory tree should use this
 // instead of constructing paths manually.
-func (s *Store) BucketObjectsDir(bucketID string) string {
-	return filepath.Join(s.dataDir, "buckets", bucketID, "objects")
+func (s *Store) BucketObjectsDir(bucketID string) (string, error) {
+	return s.safeJoin("buckets", bucketID, "objects")
 }
 
 // Store manages physical object files on the filesystem.
@@ -297,11 +305,18 @@ func (s *Store) CleanTmp() (int, error) {
 // EnsureBucketDir creates the objects directory for a bucket and fsyncs the
 // parent to ensure the directory entry is durable.
 func (s *Store) EnsureBucketDir(bucketID string) error {
-	dir := filepath.Join(s.dataDir, "buckets", bucketID, "objects")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	objectsDir, err := s.BucketObjectsDir(bucketID)
+	if err != nil {
 		return err
 	}
-	if err := fsyncDir(filepath.Join(s.dataDir, "buckets", bucketID)); err != nil {
+	if err := os.MkdirAll(objectsDir, 0o755); err != nil {
+		return err
+	}
+	dir, err := s.bucketDir(bucketID)
+	if err != nil {
+		return err
+	}
+	if err := fsyncDir(dir); err != nil {
 		s.reportFsyncErr(err)
 		return err
 	}
@@ -310,7 +325,10 @@ func (s *Store) EnsureBucketDir(bucketID string) error {
 
 // RemoveBucketDir removes the bucket's directory tree. Only call after confirming no objects remain.
 func (s *Store) RemoveBucketDir(bucketID string) error {
-	dir := filepath.Join(s.dataDir, "buckets", bucketID)
+	dir, err := s.bucketDir(bucketID)
+	if err != nil {
+		return err
+	}
 	return os.RemoveAll(dir)
 }
 
@@ -372,9 +390,12 @@ func (s *Store) VerifyChecksumRateLimited(locationRef, expected string, limiter 
 
 // ListBucketFiles walks the bucket's objects directory and returns all object file paths (relative).
 func (s *Store) ListBucketFiles(bucketID string) ([]string, error) {
-	root := filepath.Join(s.dataDir, "buckets", bucketID, "objects")
+	root, err := s.BucketObjectsDir(bucketID)
+	if err != nil {
+		return nil, err
+	}
 	var files []string
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -407,9 +428,16 @@ func (s *Store) DataDir() string {
 	return s.dataDir
 }
 
-// ObjectExists checks if a physical object file exists at the location ref within this store.
+// ObjectExists checks if a physical object file exists at the location ref
+// within this store. A ref that does not validate is reported as missing: it
+// names nothing this store owns, so no Stat outside the data dir is worth
+// issuing to find that out.
 func (s *Store) ObjectExists(obj *meta.Object) bool {
-	_, err := os.Stat(s.absPath(obj.LocationRef))
+	p, err := s.SafePath(obj.LocationRef)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(p)
 	return err == nil
 }
 

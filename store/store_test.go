@@ -739,3 +739,71 @@ func TestWritePartVerified_RefusedRetryKeepsTheAcceptedPart(t *testing.T) {
 		t.Fatalf("the accepted part was overwritten: %q", got)
 	}
 }
+
+// --- path validation on ID-derived paths ---
+
+// CleanupUploadParts is an os.RemoveAll: a traversing upload ID must be
+// refused, and the test asserts the directory it aimed at is still on disk
+// rather than trusting the returned error.
+func TestCleanupUploadParts_TraversalRefused(t *testing.T) {
+	s := newTestStore(t)
+	victim := filepath.Join(s.dataDir, "buckets", "important")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatalf("mkdir victim: %v", err)
+	}
+
+	err := s.CleanupUploadParts("../buckets/important")
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("traversing upload ID deleted %s: %v", victim, statErr)
+	}
+	if !errors.Is(err, errInvalidLocationRef) {
+		t.Fatalf("CleanupUploadParts traversal: want errInvalidLocationRef, got %v", err)
+	}
+}
+
+func TestRemoveBucketDir_TraversalRefused(t *testing.T) {
+	s := newTestStore(t)
+	victim := filepath.Join(s.dataDir, "quarantine")
+
+	err := s.RemoveBucketDir("../quarantine")
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("traversing bucket ID deleted %s: %v", victim, statErr)
+	}
+	if !errors.Is(err, errInvalidLocationRef) {
+		t.Fatalf("RemoveBucketDir traversal: want errInvalidLocationRef, got %v", err)
+	}
+}
+
+func TestEnsureBucketDir_TraversalRefused(t *testing.T) {
+	s := newTestStore(t)
+	outside := filepath.Join(filepath.Dir(s.dataDir), "escaped")
+
+	err := s.EnsureBucketDir("../../escaped")
+	if _, statErr := os.Stat(outside); statErr == nil {
+		t.Fatalf("traversing bucket ID created %s outside the data dir", outside)
+	}
+	if !errors.Is(err, errInvalidLocationRef) {
+		t.Fatalf("EnsureBucketDir traversal: want errInvalidLocationRef, got %v", err)
+	}
+}
+
+func TestListBucketFiles_TraversalRefused(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.ListBucketFiles("../.."); !errors.Is(err, errInvalidLocationRef) {
+		t.Fatalf("ListBucketFiles traversal: want errInvalidLocationRef, got %v", err)
+	}
+}
+
+// A location ref read back from metadata is externally-stored input, so a
+// corrupted one must answer "missing" instead of reaching outside the store.
+func TestObjectExists_InvalidRefIsMissing(t *testing.T) {
+	s := newTestStore(t)
+	outside := filepath.Join(filepath.Dir(s.dataDir), "outside.bin")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+
+	if s.ObjectExists(&meta.Object{LocationRef: "../outside.bin"}) {
+		t.Error("ObjectExists reported a file outside the data dir as present")
+	}
+}

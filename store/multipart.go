@@ -177,7 +177,15 @@ func (s *Store) AssembleParts(bucketID, objectID string, partLocations []string)
 }
 
 // CleanupUploadParts removes all part files for an upload.
+//
+// The upload ID goes through the same validation as any other path component:
+// this is the most destructive call in the package, and the fact that every
+// caller today passes a server-generated UUID is a property of today's callers,
+// not of this function.
 func (s *Store) CleanupUploadParts(uploadID string) error {
-	dir := filepath.Join(s.dataDir, "multipart", uploadID)
+	dir, err := s.safeJoin("multipart", uploadID)
+	if err != nil {
+		return err
+	}
 	return os.RemoveAll(dir)
 }
