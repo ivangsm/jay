@@ -50,6 +50,12 @@ const (
 	OpHeadObject   byte = 0x12
 	OpDeleteObject byte = 0x13
 	OpListObjects  byte = 0x14
+	// OpGetObjectRange and OpCopyObject arrived after v1 shipped, as new
+	// opcodes rather than new fields: an older server answers UnknownOp and
+	// keeps the connection, which is the one compatible way to extend the
+	// protocol (see Version).
+	OpGetObjectRange byte = 0x15
+	OpCopyObject     byte = 0x16
 
 	OpCreateMultipartUpload byte = 0x20
 	OpUploadPart            byte = 0x21

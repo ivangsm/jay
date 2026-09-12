@@ -77,7 +77,7 @@ So pick one, deliberately:
   * The change is an ACCIDENT — revert it.
   * You need a NEW OPERATION — add an opcode instead. That IS compatible: an
     older server answers BadRequest/UnknownOp and keeps the connection open.
-    This is the supported path for Range, Copy and Presign.
+    This is how GetObjectRange (0x15) and CopyObject (0x16) were added.
   * You need a new field on an EXISTING message — it is only safe as a
     trailing field read with Decoder.HasMore, and only makes old-encoder →
     new-decoder work. It does nothing for new-encoder → old-decoder: the old
@@ -593,6 +593,51 @@ func TestGolden_BucketList(t *testing.T) {
 
 // TestGolden_ProtocolConstants pins the numeric values themselves. Renaming a
 // constant is free; renumbering one silently repoints every peer.
+// --- Post-v1 opcodes -----------------------------------------------------
+//
+// GetObjectRange and CopyObject were added after v1 shipped, as NEW opcodes.
+// Their layouts are as frozen as the originals: a client that speaks them to
+// a server that does not gets UnknownOp, never a misparse.
+
+func TestGolden_GetObjectRangeRequest(t *testing.T) {
+	got, err := EncodeGetObjectRangeRequest("bkt", "key", 1024, -1)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	assertWire(t, "GetObjectRangeRequest", got, wire(
+		b(0x00, 0x03), "bkt",
+		b(0x00, 0x03), "key",
+		b(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00), // offset = 1024
+		b(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF), // length = -1 (to end)
+	))
+}
+
+func TestGolden_CopyObjectRequest(t *testing.T) {
+	got, err := EncodeCopyObjectRequest("src", "a", "dst", "b")
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	assertWire(t, "CopyObjectRequest", got, wire(
+		b(0x00, 0x03), "src",
+		b(0x00, 0x01), "a",
+		b(0x00, 0x03), "dst",
+		b(0x00, 0x01), "b",
+	))
+}
+
+func TestGolden_CopyObjectResponse(t *testing.T) {
+	got, err := EncodeCopyObjectResponse("etag", "sum", 7, "2026-01-02T03:04:05Z")
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	assertWire(t, "CopyObjectResponse", got, wire(
+		b(0x00, 0x04), "etag",
+		b(0x00, 0x03), "sum",
+		b(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07), // size = 7
+		b(0x00, 0x14), "2026-01-02T03:04:05Z",
+	))
+}
+
 func TestGolden_ProtocolConstants(t *testing.T) {
 	cases := []struct {
 		name string
@@ -610,6 +655,8 @@ func TestGolden_ProtocolConstants(t *testing.T) {
 		{"OpHeadObject", OpHeadObject, 0x12},
 		{"OpDeleteObject", OpDeleteObject, 0x13},
 		{"OpListObjects", OpListObjects, 0x14},
+		{"OpGetObjectRange", OpGetObjectRange, 0x15},
+		{"OpCopyObject", OpCopyObject, 0x16},
 		{"OpCreateMultipartUpload", OpCreateMultipartUpload, 0x20},
 		{"OpUploadPart", OpUploadPart, 0x21},
 		{"OpCompleteMultipart", OpCompleteMultipart, 0x22},

@@ -24,6 +24,8 @@ func mapObjopsStatus(err error) (status byte, msg, code string, handled bool) {
 		return StatusForbidden, "access denied", "AccessDenied", true
 	case errors.Is(err, objops.ErrObjectTooLarge):
 		return StatusBadRequest, "object exceeds the configured maximum size", "EntityTooLarge", true
+	case errors.Is(err, objops.ErrInvalidRange):
+		return StatusBadRequest, "requested range not satisfiable", "InvalidRange", true
 	}
 	return 0, "", "", false
 }
@@ -149,10 +151,105 @@ func (h *connHandler) writeResponseStreaming(status byte, streamID uint32, meta 
 	if dataLen <= 0 || file == nil {
 		return nil
 	}
-	if _, err := io.Copy(h.conn, file); err != nil {
+	// Exactly dataLen bytes, never "until EOF": the header already promised
+	// that count, so a file shorter than its metadata claims must fail the
+	// request instead of leaving the stream one short frame out of alignment.
+	// io.CopyN wraps the file in an io.LimitedReader, which
+	// (*net.TCPConn).ReadFrom unwraps, so sendfile(2) still applies — for a
+	// whole object and for a range alike.
+	if _, err := io.CopyN(h.conn, file, dataLen); err != nil {
 		return err
 	}
 	return nil
+}
+
+// handleGetObjectRange is GetObject for a byte range. The response metadata is
+// the same ObjectInfo as GetObject — size is the WHOLE object's — and the
+// frame's data_len is the number of bytes actually served, which is the
+// requested length clamped to the end of the object. A range that does not
+// intersect the object is InvalidRange with no body, the native counterpart of
+// HTTP 416.
+//
+// The body path is the one GetObject uses: file → raw conn, so sendfile(2)
+// still applies to the sliced copy.
+func (h *connHandler) handleGetObjectRange(req *request) error {
+	bucket, key, offset, length, err := DecodeGetObjectRangeRequest(req.meta)
+	if err != nil {
+		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
+	}
+
+	obj, err := h.objops.HeadObject(context.TODO(), h.token, bucket, key, h.identity(meta.ActionObjectGet))
+	if err != nil {
+		if status, m, code, ok := mapObjopsStatus(err); ok {
+			return h.writeError(status, req.streamID, m, code)
+		}
+		return h.writeError(StatusInternal, req.streamID, "internal error", "InternalError")
+	}
+
+	start, n, err := objops.ResolveRange(offset, length, obj.SizeBytes)
+	if err != nil {
+		status, m, code, _ := mapObjopsStatus(err)
+		return h.writeError(status, req.streamID, m, code)
+	}
+
+	f, err := h.objops.OpenObjectRange(obj, start)
+	if err != nil {
+		h.log.Error("read object range", "err", err, "location", obj.LocationRef, "offset", start)
+		return h.writeError(StatusInternal, req.streamID, "failed to read object", "InternalError")
+	}
+	defer func() { _ = f.Close() }()
+
+	resp, encErr := EncodeObjectInfo(
+		obj.ContentType, obj.SizeBytes,
+		obj.ETag, obj.ChecksumSHA256,
+		obj.UpdatedAt.Format(time.RFC3339),
+		obj.MetadataHeaders,
+	)
+	if encErr != nil {
+		h.log.Error("encode response", "err", encErr)
+		return h.writeError(StatusInternal, req.streamID, "failed to encode response", "InternalError")
+	}
+
+	if h.metrics != nil {
+		h.metrics.GetObjectTotal.Add(1)
+		h.metrics.BytesDownloaded.Add(n)
+	}
+
+	return h.writeResponseStreaming(StatusOK, req.streamID, resp, f, n)
+}
+
+// handleCopyObject is a server-side copy through objops.CopyObject, which
+// authorizes both ends. The response describes the new object; the error, when
+// there is one, does not say which side it was about — the native error model
+// has no resource field — so the message does.
+func (h *connHandler) handleCopyObject(req *request) error {
+	srcBucket, srcKey, dstBucket, dstKey, err := DecodeCopyObjectRequest(req.meta)
+	if err != nil {
+		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
+	}
+
+	obj, err := h.objops.CopyObject(context.TODO(), h.token,
+		srcBucket, srcKey, dstBucket, dstKey,
+		objops.CopyOptions{}, h.identity(meta.ActionObjectPut))
+	if err != nil {
+		if status, m, code, ok := mapObjopsStatus(err); ok {
+			if side := objops.SideOfCopyError(err); side != "" {
+				m = string(side) + ": " + m
+			}
+			return h.writeError(status, req.streamID, m, code)
+		}
+		h.log.Error("copy object", "err", err,
+			"source", srcBucket+"/"+srcKey, "destination", dstBucket+"/"+dstKey)
+		return h.writeError(StatusInternal, req.streamID, "failed to copy object", "InternalError")
+	}
+
+	if h.metrics != nil {
+		h.metrics.PutObjectTotal.Add(1)
+		h.metrics.BytesUploaded.Add(obj.SizeBytes)
+	}
+
+	resp, encErr := EncodeCopyObjectResponse(obj.ETag, obj.ChecksumSHA256, obj.SizeBytes, obj.CreatedAt.Format(time.RFC3339))
+	return h.writeEncoded(StatusOK, req.streamID, resp, encErr)
 }
 
 // handleHeadObject returns object metadata only. No body frame.

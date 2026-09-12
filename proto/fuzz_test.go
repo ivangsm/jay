@@ -134,6 +134,9 @@ func FuzzDecodeMessages(f *testing.F) {
 		_, _, _, _ = DecodeCompleteMultipartResponse(data)
 		_, _ = DecodeListPartsResponse(data)
 		_, _, _ = DecodeBucketList(data)
+		_, _, _, _, _ = DecodeGetObjectRangeRequest(data)
+		_, _, _, _, _ = DecodeCopyObjectRequest(data)
+		_, _, _, _, _ = DecodeCopyObjectResponse(data)
 
 		// A decoder that reports success must have produced a value that
 		// survives being re-encoded. Anything else means it accepted bytes it

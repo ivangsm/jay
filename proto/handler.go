@@ -22,6 +22,10 @@ func (h *connHandler) dispatch(req *request) error {
 		return h.handleDeleteObject(req)
 	case OpListObjects:
 		return h.handleListObjects(req)
+	case OpGetObjectRange:
+		return h.handleGetObjectRange(req)
+	case OpCopyObject:
+		return h.handleCopyObject(req)
 	case OpCreateMultipartUpload:
 		return h.handleCreateMultipartUpload(req)
 	case OpUploadPart:

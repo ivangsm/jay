@@ -450,6 +450,69 @@ func DecodeObjectInfo(data []byte) (contentType string, size int64, etag, checks
 	return contentType, size, etag, checksum, lastModified, metadata, d.Err()
 }
 
+// EncodeGetObjectRangeRequest encodes a GetObjectRange request. length <= 0
+// asks for everything from offset to the end of the object.
+func EncodeGetObjectRangeRequest(bucket, key string, offset, length int64) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 4+len(bucket)+len(key)+16))
+	e.String(bucket)
+	e.String(key)
+	e.Int64(offset)
+	e.Int64(length)
+	return e.Bytes(), e.Err()
+}
+
+// DecodeGetObjectRangeRequest decodes a GetObjectRange request.
+func DecodeGetObjectRangeRequest(data []byte) (bucket, key string, offset, length int64, err error) {
+	d := NewDecoder(data)
+	bucket = d.String()
+	key = d.String()
+	offset = d.Int64()
+	length = d.Int64()
+	return bucket, key, offset, length, d.Err()
+}
+
+// EncodeCopyObjectRequest encodes a CopyObject request: source first, then
+// destination.
+func EncodeCopyObjectRequest(srcBucket, srcKey, dstBucket, dstKey string) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 8+len(srcBucket)+len(srcKey)+len(dstBucket)+len(dstKey)))
+	e.String(srcBucket)
+	e.String(srcKey)
+	e.String(dstBucket)
+	e.String(dstKey)
+	return e.Bytes(), e.Err()
+}
+
+// DecodeCopyObjectRequest decodes a CopyObject request.
+func DecodeCopyObjectRequest(data []byte) (srcBucket, srcKey, dstBucket, dstKey string, err error) {
+	d := NewDecoder(data)
+	srcBucket = d.String()
+	srcKey = d.String()
+	dstBucket = d.String()
+	dstKey = d.String()
+	return srcBucket, srcKey, dstBucket, dstKey, d.Err()
+}
+
+// EncodeCopyObjectResponse encodes a CopyObject response: what the new object
+// looks like, without its body.
+func EncodeCopyObjectResponse(etag, checksum string, size int64, lastModified string) ([]byte, error) {
+	e := NewEncoder(make([]byte, 0, 6+len(etag)+len(checksum)+len(lastModified)+8))
+	e.String(etag)
+	e.String(checksum)
+	e.Int64(size)
+	e.String(lastModified)
+	return e.Bytes(), e.Err()
+}
+
+// DecodeCopyObjectResponse decodes a CopyObject response.
+func DecodeCopyObjectResponse(data []byte) (etag, checksum string, size int64, lastModified string, err error) {
+	d := NewDecoder(data)
+	etag = d.String()
+	checksum = d.String()
+	size = d.Int64()
+	lastModified = d.String()
+	return etag, checksum, size, lastModified, d.Err()
+}
+
 // EncodeError encodes an error response. Unlike the other encoders it cannot
 // fail: message and code are clamped to the wire limit so the server can
 // always report an error, even one triggered by an oversized field.
