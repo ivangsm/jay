@@ -14,8 +14,8 @@ RUN CGO_ENABLED=0 go build \
       -ldflags "-s -w \
         -X github.com/ivangsm/jay/internal/version.Version=${VERSION} \
         -X github.com/ivangsm/jay/internal/version.Commit=${COMMIT}" \
-      -o /out/jay . \
- && CGO_ENABLED=0 go build -ldflags "-s -w" -o /out/ ./cmd/...
+      -o /out/jay ./cmd/jay \
+ && CGO_ENABLED=0 go build -ldflags "-s -w" -o /out/ ./cmd/jay-admin ./cmd/jay-config ./cmd/jay-rekey
 
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates wget

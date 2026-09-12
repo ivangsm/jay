@@ -31,7 +31,7 @@ echo ""
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE"' EXIT
 
-go test -bench='Benchmark(S3|Native)' -benchmem -timeout 30m "${BENCH_ARGS[@]}" "$@" 2>&1 | tee "$TMPFILE"
+go test ./cmd/jay -bench='Benchmark(S3|Native)' -benchmem -timeout 30m "${BENCH_ARGS[@]}" "$@" 2>&1 | tee "$TMPFILE"
 
 echo ""
 echo "=============================================="

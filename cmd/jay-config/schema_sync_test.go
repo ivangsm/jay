@@ -14,7 +14,7 @@ import (
 // min_free_bytes and max_object_size lived in bindings() for months while
 // yaml-to-env silently dropped them, so converting a config lost the backup
 // directory. This test makes that drift a build failure instead of a warning.
-const bindingsSource = "../../config_loader.go"
+const bindingsSource = "../jay/config_loader.go"
 
 func envKeysInBindings(t *testing.T) map[string]bool {
 	t.Helper()

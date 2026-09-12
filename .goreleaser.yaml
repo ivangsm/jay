@@ -17,7 +17,7 @@ before:
 
 builds:
   - id: jay
-    main: .
+    main: ./cmd/jay
     binary: jay
     env:
       - CGO_ENABLED=0

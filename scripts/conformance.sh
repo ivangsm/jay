@@ -280,7 +280,7 @@ fi
 # ---------------------------------------------------------------------------
 
 info "building jay from $REPO_ROOT ..."
-(cd "$REPO_ROOT" && go build -o "$WORK/jay" .) || die "go build failed"
+(cd "$REPO_ROOT" && go build -o "$WORK/jay" ./cmd/jay) || die "go build failed"
 
 # ---------------------------------------------------------------------------
 # Boot: two instances, because minio-go behaves differently on each

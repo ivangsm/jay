@@ -51,7 +51,7 @@ jobs:
           cache: true
 
       - name: Build
-        run: go build -o jay .
+        run: go build -o jay ./cmd/jay
 
       - name: Verify binary
         run: test -x ./jay
