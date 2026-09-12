@@ -29,8 +29,8 @@
 #   mc   — https://min.io/docs/minio/linux/reference/minio-mc.html (minio-go)
 #   warp — https://github.com/minio/warp     (minio-go, benchmark harness)
 #
-# warp is looked up on PATH and in $(go env GOPATH)/bin, because `go install`
-# puts it in the latter and CI runners rarely have that on PATH.
+# mc and warp are looked up on PATH and in $(go env GOPATH)/bin, because
+# `go install` puts them in the latter and CI runners rarely have that on PATH.
 
 set -uo pipefail
 # Deliberately NOT `set -e`: half of the checks below run a command that is
@@ -250,14 +250,19 @@ done
 AWS_BIN="$(command -v aws || true)"
 MC_BIN="$(command -v mc || true)"
 WARP_BIN="$(command -v warp || true)"
-if [ -z "$WARP_BIN" ]; then
-	for candidate in "$(go env GOPATH 2>/dev/null)/bin/warp" "$HOME/go/bin/warp"; do
+
+# go_installed_bin echoes the path of a tool `go install` left in GOPATH/bin,
+# or nothing.
+go_installed_bin() {
+	for candidate in "$(go env GOPATH 2>/dev/null)/bin/$1" "$HOME/go/bin/$1"; do
 		if [ -x "$candidate" ]; then
-			WARP_BIN="$candidate"
-			break
+			echo "$candidate"
+			return
 		fi
 	done
-fi
+}
+[ -n "$MC_BIN" ] || MC_BIN="$(go_installed_bin mc)"
+[ -n "$WARP_BIN" ] || WARP_BIN="$(go_installed_bin warp)"
 
 info "aws:  ${AWS_BIN:-(not found)}"
 info "mc:   ${MC_BIN:-(not found)}"

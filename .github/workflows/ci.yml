@@ -96,18 +96,16 @@ jobs:
       - name: Verify aws-cli
         run: aws --version
 
-      # Into the runner's own bin rather than /usr/local/bin, which needs sudo.
-      # GITHUB_PATH only affects later steps, so the version check is its own.
+      # Built from source like warp: dl.min.io stopped serving the prebuilt
+      # binary (410 Gone) on 2026-09-12 and took this job down with it. mc has
+      # no semver tags, so @latest resolves to the head of its default branch —
+      # which is the point: track what a current minio-go client does. It lands
+      # in $(go env GOPATH)/bin, which conformance.sh looks in.
       - name: Install mc (minio-go)
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$HOME/.local/bin/mc"
-          chmod +x "$HOME/.local/bin/mc"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        run: go install github.com/minio/mc@latest
 
       - name: Verify mc
-        run: mc --version
+        run: "$(go env GOPATH)/bin/mc" --version
 
       # warp lands in $(go env GOPATH)/bin, which conformance.sh looks in.
       # Unpinned on purpose: the point is to track what a current minio-go
