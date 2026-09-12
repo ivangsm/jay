@@ -37,7 +37,7 @@ func setupTestHandler(t *testing.T) (*Handler, *meta.DB, *meta.Token, string) {
 	}
 
 	secret := "test-secret-value"
-	hash, _ := auth.HashSecret(secret)
+	hash := testHash(t, secret)
 	tok := &meta.Token{
 		TokenID:        "test-token",
 		AccountID:      acc.AccountID,

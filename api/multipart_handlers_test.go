@@ -49,10 +49,7 @@ func setupMultipartHTTPEnv(t *testing.T) *multipartHTTPEnv {
 	}
 
 	secret := "test-secret-value"
-	hash, err := auth.HashSecret(secret)
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
-	}
+	hash := testHash(t, secret)
 	token := &meta.Token{
 		TokenID:        "test-token",
 		AccountID:      account.AccountID,

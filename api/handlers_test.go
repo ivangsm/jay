@@ -10,7 +10,6 @@ import (
 	"testing"
 	"uuid"
 
-	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -21,7 +20,7 @@ func fullSetupTestHandler(t *testing.T) (*Handler, *meta.DB, *meta.Token, string
 	h, db, tok, _ := setupTestHandler(t)
 
 	fullSecret := "full-secret-value-xyz"
-	hash, _ := auth.HashSecret(fullSecret)
+	hash := testHash(t, fullSecret)
 	fullTok := &meta.Token{
 		TokenID:        "full-token",
 		AccountID:      tok.AccountID,
@@ -681,7 +680,7 @@ func foreignToken(t *testing.T, db *meta.DB, bucketScope []string) (*meta.Token,
 		t.Fatalf("create foreign account: %v", err)
 	}
 	secret := "foreign-secret-value"
-	hash, _ := auth.HashSecret(secret)
+	hash := testHash(t, secret)
 	tok := &meta.Token{
 		TokenID:        "foreign-token",
 		AccountID:      acc.AccountID,

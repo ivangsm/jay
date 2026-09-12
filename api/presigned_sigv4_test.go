@@ -233,10 +233,7 @@ func putObjectEscaped(t *testing.T, h *Handler, tok *meta.Token, secret, bucket,
 func scopedToken(t *testing.T, db *meta.DB, accountID, id string, actions, bucketScope, prefixScope []string) (*meta.Token, string) {
 	t.Helper()
 	secret := "scoped-secret-" + id
-	hash, err := auth.HashSecret(secret)
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
-	}
+	hash := testHash(t, secret)
 	tok := &meta.Token{
 		TokenID:        id,
 		AccountID:      accountID,
