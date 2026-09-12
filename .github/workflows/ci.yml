@@ -102,10 +102,14 @@ jobs:
       # which is the point: track what a current minio-go client does. It lands
       # in $(go env GOPATH)/bin, which conformance.sh looks in.
       - name: Install mc (minio-go)
-        run: go install github.com/minio/mc@latest
+        run: |
+          set -euo pipefail
+          go install github.com/minio/mc@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      # GITHUB_PATH only affects later steps, so the version check is its own.
       - name: Verify mc
-        run: "$(go env GOPATH)/bin/mc" --version
+        run: mc --version
 
       # warp lands in $(go env GOPATH)/bin, which conformance.sh looks in.
       # Unpinned on purpose: the point is to track what a current minio-go
