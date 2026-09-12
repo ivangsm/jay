@@ -2,6 +2,7 @@ package proto_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"strings"
@@ -53,7 +54,7 @@ func intruderClient(t *testing.T, env *testEnv) *client.Client {
 		t.Fatalf("create intruder token: %v", err)
 	}
 
-	c, err := client.Dial(env.addr, "intruder-token", secret, 2)
+	c, err := client.Dial(context.Background(), env.addr, "intruder-token", secret, client.WithPoolSize(2))
 	if err != nil {
 		t.Fatalf("dial as intruder: %v", err)
 	}
@@ -65,11 +66,11 @@ func intruderClient(t *testing.T, env *testEnv) *client.Client {
 // its bucket id, so assertions can read the record straight from bbolt.
 func seedOwnedBucket(t *testing.T, env *testEnv, owner *client.Client) string {
 	t.Helper()
-	if _, err := owner.CreateBucket(protoBucket); err != nil {
+	if _, err := owner.CreateBucket(context.Background(), protoBucket); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	body := strings.NewReader(protoContent)
-	if _, err := owner.PutObject(protoBucket, protoKey, body, int64(len(protoContent)), nil); err != nil {
+	if _, err := owner.PutObject(context.Background(), protoBucket, protoKey, body, int64(len(protoContent)), nil); err != nil {
 		t.Fatalf("owner put: %v", err)
 	}
 	bkt, err := env.db.GetBucket(protoBucket)
@@ -97,7 +98,7 @@ func TestProtoCrossAccount_ObjectOperationsRefused(t *testing.T) {
 	bucketID := seedOwnedBucket(t, env, owner)
 	intruder := intruderClient(t, env)
 
-	if res, err := intruder.GetObject(protoBucket, protoKey); err == nil {
+	if res, err := intruder.GetObject(context.Background(), protoBucket, protoKey); err == nil {
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(res.Body)
 		_ = res.Body.Close()
@@ -105,17 +106,17 @@ func TestProtoCrossAccount_ObjectOperationsRefused(t *testing.T) {
 	}
 
 	body := strings.NewReader("not mine")
-	if _, err := intruder.PutObject(protoBucket, "injected.txt", body, int64(len("not mine")), nil); err == nil {
+	if _, err := intruder.PutObject(context.Background(), protoBucket, "injected.txt", body, int64(len("not mine")), nil); err == nil {
 		t.Fatal("PutObject wrote into another account's bucket")
 	}
 	if _, err := env.db.GetObjectMeta(bucketID, "injected.txt"); err == nil {
 		t.Fatal("injected.txt landed in another account's bucket")
 	}
 
-	_ = intruder.DeleteObject(protoBucket, protoKey)
+	_ = intruder.DeleteObject(context.Background(), protoBucket, protoKey)
 	assertProtoObjectIntact(t, env, bucketID, "DeleteObject")
 
-	if _, err := intruder.HeadObject(protoBucket, protoKey); err == nil {
+	if _, err := intruder.HeadObject(context.Background(), protoBucket, protoKey); err == nil {
 		t.Fatal("HeadObject disclosed another account's object metadata")
 	}
 }
@@ -126,7 +127,7 @@ func TestProtoCrossAccount_ListAndMultipartRefused(t *testing.T) {
 	seedOwnedBucket(t, env, owner)
 	intruder := intruderClient(t, env)
 
-	if res, err := intruder.ListObjects(protoBucket, nil); err == nil {
+	if res, err := intruder.ListObjects(context.Background(), protoBucket, nil); err == nil {
 		for _, o := range res.Objects {
 			if o.Key == protoKey {
 				t.Fatalf("ListObjects disclosed another account's keys: %v", res.Objects)
@@ -134,7 +135,7 @@ func TestProtoCrossAccount_ListAndMultipartRefused(t *testing.T) {
 		}
 	}
 
-	if id, err := intruder.CreateMultipartUpload(protoBucket, "sneak.bin", nil); err == nil {
+	if id, err := intruder.CreateMultipartUpload(context.Background(), protoBucket, "sneak.bin", nil); err == nil {
 		t.Fatalf("multipart upload %q started in another account's bucket", id)
 	}
 }
@@ -146,7 +147,7 @@ func TestProtoCrossAccount_OwnerIsUnaffected(t *testing.T) {
 	owner := dial(t, env)
 	bucketID := seedOwnedBucket(t, env, owner)
 
-	res, err := owner.GetObject(protoBucket, protoKey)
+	res, err := owner.GetObject(context.Background(), protoBucket, protoKey)
 	if err != nil {
 		t.Fatalf("owner get: %v", err)
 	}
@@ -159,7 +160,7 @@ func TestProtoCrossAccount_OwnerIsUnaffected(t *testing.T) {
 		t.Fatalf("owner read %q, want %q", buf.String(), protoContent)
 	}
 
-	list, err := owner.ListObjects(protoBucket, nil)
+	list, err := owner.ListObjects(context.Background(), protoBucket, nil)
 	if err != nil {
 		t.Fatalf("owner list: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestProtoCrossAccount_OwnerIsUnaffected(t *testing.T) {
 		t.Fatalf("owner listing = %v", list.Objects)
 	}
 
-	if err := owner.DeleteObject(protoBucket, protoKey); err != nil {
+	if err := owner.DeleteObject(context.Background(), protoBucket, protoKey); err != nil {
 		t.Fatalf("owner delete: %v", err)
 	}
 	if _, err := env.db.GetObjectMeta(bucketID, protoKey); err == nil {
@@ -188,7 +189,7 @@ func TestProtoCrossAccount_PolicyAllowGrantsRead(t *testing.T) {
 		t.Fatalf("update bucket policy: %v", err)
 	}
 
-	res, err := intruder.GetObject(protoBucket, protoKey)
+	res, err := intruder.GetObject(context.Background(), protoBucket, protoKey)
 	if err != nil {
 		t.Fatalf("an explicit allow did not grant the read: %v", err)
 	}
@@ -201,7 +202,7 @@ func TestProtoCrossAccount_PolicyAllowGrantsRead(t *testing.T) {
 		t.Fatalf("granted read returned %q, want %q", buf.String(), protoContent)
 	}
 
-	list, err := intruder.ListObjects(protoBucket, nil)
+	list, err := intruder.ListObjects(context.Background(), protoBucket, nil)
 	if err != nil {
 		t.Fatalf("an explicit allow did not grant the listing: %v", err)
 	}

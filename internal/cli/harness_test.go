@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
@@ -140,7 +141,7 @@ func (e *testEnv) fetch(t *testing.T, bucket, key string) []byte {
 	}
 	defer func() { _ = c.Close() }()
 
-	obj, err := c.GetObject(bucket, key)
+	obj, err := c.GetObject(context.Background(), bucket, key)
 	if err != nil {
 		t.Fatalf("get %s/%s: %v", bucket, key, err)
 	}
@@ -163,7 +164,7 @@ func (e *testEnv) keys(t *testing.T, bucket string) []string {
 	defer func() { _ = c.Close() }()
 
 	var out []string
-	err = walkObjects(c, bucket, "", "", func(page *client.ListResult) error {
+	err = walkObjects(context.Background(), c, bucket, "", "", func(page *client.ListResult) error {
 		for _, o := range page.Objects {
 			out = append(out, o.Key)
 		}
@@ -186,7 +187,7 @@ func (e *testEnv) putObject(t *testing.T, bucket, key string, data []byte) {
 	}
 	defer func() { _ = c.Close() }()
 
-	if _, err := c.PutObject(bucket, key, bytes.NewReader(data), int64(len(data)), nil); err != nil {
+	if _, err := c.PutObject(context.Background(), bucket, key, bytes.NewReader(data), int64(len(data)), nil); err != nil {
 		t.Fatalf("put %s/%s: %v", bucket, key, err)
 	}
 }

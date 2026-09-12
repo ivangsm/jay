@@ -41,7 +41,7 @@ func runRm(opts Options, args []string) error {
 	defer closeClient(c, opts.errOut())
 
 	if !*recursive {
-		if err := c.DeleteObject(loc.Bucket, loc.Key); err != nil {
+		if err := c.DeleteObject(opts.context(), loc.Bucket, loc.Key); err != nil {
 			return err
 		}
 		printf(opts.out(), "deleted %s\n", loc)
@@ -55,7 +55,7 @@ func runRm(opts Options, args []string) error {
 // because deleting while paging moves the cursor out from under the listing.
 func removePrefix(opts Options, c *client.Client, loc Location) error {
 	var keys []string
-	err := walkObjects(c, loc.Bucket, DirPrefix(loc.Key), "", func(page *client.ListResult) error {
+	err := walkObjects(opts.context(), c, loc.Bucket, DirPrefix(loc.Key), "", func(page *client.ListResult) error {
 		for _, o := range page.Objects {
 			keys = append(keys, o.Key)
 		}
@@ -71,7 +71,7 @@ func removePrefix(opts Options, c *client.Client, loc Location) error {
 
 	var failed int
 	for _, key := range keys {
-		if err := c.DeleteObject(loc.Bucket, key); err != nil {
+		if err := c.DeleteObject(opts.context(), loc.Bucket, key); err != nil {
 			failed++
 			printf(opts.errOut(), "delete %s%s/%s: %v\n", Scheme, loc.Bucket, key, err)
 			continue

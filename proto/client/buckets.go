@@ -1,11 +1,7 @@
-// Package client is the Go client for jay's native binary protocol.
-//
-// It is what falco talks to. Connections are pooled and long-lived: the point of
-// the native protocol is to avoid paying HTTP's framing and header cost on every
-// object read.
 package client
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/ivangsm/jay/proto"
@@ -26,12 +22,12 @@ type BucketEntry struct {
 }
 
 // CreateBucket creates a new bucket.
-func (c *Client) CreateBucket(name string) (*BucketInfo, error) {
+func (c *Client) CreateBucket(ctx context.Context, name string) (*BucketInfo, error) {
 	meta, err := proto.EncodeBucket(name)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	status, respMeta, err := c.doRequest(proto.OpCreateBucket, meta)
+	status, respMeta, err := c.doRequest(ctx, proto.OpCreateBucket, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -46,12 +42,12 @@ func (c *Client) CreateBucket(name string) (*BucketInfo, error) {
 }
 
 // DeleteBucket deletes a bucket.
-func (c *Client) DeleteBucket(name string) error {
+func (c *Client) DeleteBucket(ctx context.Context, name string) error {
 	meta, err := proto.EncodeBucket(name)
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
 	}
-	status, respMeta, err := c.doRequest(proto.OpDeleteBucket, meta)
+	status, respMeta, err := c.doRequest(ctx, proto.OpDeleteBucket, meta)
 	if err != nil {
 		return err
 	}
@@ -59,12 +55,12 @@ func (c *Client) DeleteBucket(name string) error {
 }
 
 // HeadBucket returns metadata about a bucket.
-func (c *Client) HeadBucket(name string) (*BucketInfo, error) {
+func (c *Client) HeadBucket(ctx context.Context, name string) (*BucketInfo, error) {
 	meta, err := proto.EncodeBucket(name)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	status, respMeta, err := c.doRequest(proto.OpHeadBucket, meta)
+	status, respMeta, err := c.doRequest(ctx, proto.OpHeadBucket, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -79,8 +75,8 @@ func (c *Client) HeadBucket(name string) (*BucketInfo, error) {
 }
 
 // ListBuckets returns all buckets the authenticated user has access to.
-func (c *Client) ListBuckets() ([]BucketEntry, error) {
-	status, respMeta, err := c.doRequest(proto.OpListBuckets, nil)
+func (c *Client) ListBuckets(ctx context.Context) ([]BucketEntry, error) {
+	status, respMeta, err := c.doRequest(ctx, proto.OpListBuckets, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -99,8 +95,8 @@ func (c *Client) ListBuckets() ([]BucketEntry, error) {
 }
 
 // Ping sends a ping to the server.
-func (c *Client) Ping() error {
-	status, respMeta, err := c.doRequest(proto.OpPing, nil)
+func (c *Client) Ping(ctx context.Context) error {
+	status, respMeta, err := c.doRequest(ctx, proto.OpPing, nil)
 	if err != nil {
 		return err
 	}

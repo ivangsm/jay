@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"io"
@@ -66,6 +67,7 @@ func setup(t *testing.T) *testEnv {
 		AccountID:      "test-account",
 		Name:           "test",
 		SecretHash:     hash,
+		SecretKey:      secret, // what the S3 side needs to verify SigV4 (PresignURL)
 		AllowedActions: meta.AllActions,
 		Status:         "active",
 	}
@@ -90,7 +92,7 @@ func setup(t *testing.T) *testEnv {
 	}
 	t.Cleanup(func() { _ = shutdown() })
 
-	c, err := Dial(addr, "test-token", secret, 2)
+	c, err := Dial(context.Background(), addr, "test-token", secret, WithPoolSize(2))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -111,7 +113,7 @@ func setup(t *testing.T) *testEnv {
 
 func TestDial_InvalidAddr(t *testing.T) {
 	// Port 1 on loopback should refuse connections.
-	_, err := Dial("127.0.0.1:1", "token", "secret", 1)
+	_, err := Dial(context.Background(), "127.0.0.1:1", "token", "secret", WithPoolSize(1))
 	if err == nil {
 		t.Fatal("expected error dialing invalid address")
 	}
@@ -120,7 +122,7 @@ func TestDial_InvalidAddr(t *testing.T) {
 func TestDial_BadCredentials(t *testing.T) {
 	env := setup(t)
 
-	_, err := Dial(env.addr, "bad-token", "bad-secret", 1)
+	_, err := Dial(context.Background(), env.addr, "bad-token", "bad-secret", WithPoolSize(1))
 	if err == nil {
 		t.Fatal("expected auth failure")
 	}
@@ -132,7 +134,7 @@ func TestDial_BadCredentials(t *testing.T) {
 func TestClose_Idempotent(t *testing.T) {
 	env := setup(t)
 
-	c, err := Dial(env.addr, env.tokenID, env.secret, 1)
+	c, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithPoolSize(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,13 +149,13 @@ func TestClose_Idempotent(t *testing.T) {
 	// iterating over a closed empty channel is fine — we just skip the for-range).
 	// Actually Close() calls close(c.pool) which panics on double-close.
 	// So we test the semantics: after Close, operations fail gracefully.
-	_ = c.Ping() // should return "client is closed" error, not panic
+	_ = c.Ping(context.Background()) // should return "client is closed" error, not panic
 }
 
 func TestClose_OperationsAfterClose(t *testing.T) {
 	env := setup(t)
 
-	c, err := Dial(env.addr, env.tokenID, env.secret, 1)
+	c, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithPoolSize(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +163,7 @@ func TestClose_OperationsAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = c.Ping()
+	err = c.Ping(context.Background())
 	if err == nil {
 		t.Fatal("expected error after close")
 	}
@@ -174,7 +176,7 @@ func TestClose_OperationsAfterClose(t *testing.T) {
 
 func TestPing(t *testing.T) {
 	env := setup(t)
-	if err := env.client.Ping(); err != nil {
+	if err := env.client.Ping(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -184,7 +186,7 @@ func TestPing(t *testing.T) {
 func TestCreateBucket_Success(t *testing.T) {
 	env := setup(t)
 
-	info, err := env.client.CreateBucket("test-bucket")
+	info, err := env.client.CreateBucket(context.Background(), "test-bucket")
 	if err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
@@ -202,11 +204,11 @@ func TestCreateBucket_Success(t *testing.T) {
 func TestCreateBucket_Duplicate(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("dup-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "dup-bucket"); err != nil {
 		t.Fatalf("first CreateBucket: %v", err)
 	}
 
-	_, err := env.client.CreateBucket("dup-bucket")
+	_, err := env.client.CreateBucket(context.Background(), "dup-bucket")
 	if err == nil {
 		t.Fatal("expected error creating duplicate bucket")
 	}
@@ -215,11 +217,11 @@ func TestCreateBucket_Duplicate(t *testing.T) {
 func TestHeadBucket_Exists(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("head-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "head-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
-	info, err := env.client.HeadBucket("head-bucket")
+	info, err := env.client.HeadBucket(context.Background(), "head-bucket")
 	if err != nil {
 		t.Fatalf("HeadBucket: %v", err)
 	}
@@ -231,7 +233,7 @@ func TestHeadBucket_Exists(t *testing.T) {
 func TestHeadBucket_NotFound(t *testing.T) {
 	env := setup(t)
 
-	_, err := env.client.HeadBucket("nonexistent-bucket")
+	_, err := env.client.HeadBucket(context.Background(), "nonexistent-bucket")
 	if err == nil {
 		t.Fatal("expected error for nonexistent bucket")
 	}
@@ -240,16 +242,16 @@ func TestHeadBucket_NotFound(t *testing.T) {
 func TestDeleteBucket_Empty(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("to-delete"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "to-delete"); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := env.client.DeleteBucket("to-delete"); err != nil {
+	if err := env.client.DeleteBucket(context.Background(), "to-delete"); err != nil {
 		t.Fatalf("DeleteBucket: %v", err)
 	}
 
 	// After deletion, HeadBucket should fail.
-	_, err := env.client.HeadBucket("to-delete")
+	_, err := env.client.HeadBucket(context.Background(), "to-delete")
 	if err == nil {
 		t.Fatal("expected error for deleted bucket")
 	}
@@ -258,7 +260,7 @@ func TestDeleteBucket_Empty(t *testing.T) {
 func TestDeleteBucket_NotFound(t *testing.T) {
 	env := setup(t)
 
-	err := env.client.DeleteBucket("ghost-bucket")
+	err := env.client.DeleteBucket(context.Background(), "ghost-bucket")
 	if err == nil {
 		t.Fatal("expected error deleting nonexistent bucket")
 	}
@@ -267,15 +269,15 @@ func TestDeleteBucket_NotFound(t *testing.T) {
 func TestDeleteBucket_NotEmpty(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("notempty"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "notempty"); err != nil {
 		t.Fatal(err)
 	}
 	data := "content"
-	if _, err := env.client.PutObject("notempty", "file.txt", strings.NewReader(data), int64(len(data)), nil); err != nil {
+	if _, err := env.client.PutObject(context.Background(), "notempty", "file.txt", strings.NewReader(data), int64(len(data)), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	err := env.client.DeleteBucket("notempty")
+	err := env.client.DeleteBucket(context.Background(), "notempty")
 	if err == nil {
 		t.Fatal("expected error deleting non-empty bucket")
 	}
@@ -291,7 +293,7 @@ func TestDeleteBucket_NotEmpty(t *testing.T) {
 func TestListBuckets_Empty(t *testing.T) {
 	env := setup(t)
 
-	buckets, err := env.client.ListBuckets()
+	buckets, err := env.client.ListBuckets(context.Background())
 	if err != nil {
 		t.Fatalf("ListBuckets: %v", err)
 	}
@@ -305,12 +307,12 @@ func TestListBuckets_Multiple(t *testing.T) {
 
 	names := []string{"alpha", "beta"}
 	for _, name := range names {
-		if _, err := env.client.CreateBucket(name); err != nil {
+		if _, err := env.client.CreateBucket(context.Background(), name); err != nil {
 			t.Fatalf("CreateBucket %q: %v", name, err)
 		}
 	}
 
-	buckets, err := env.client.ListBuckets()
+	buckets, err := env.client.ListBuckets(context.Background())
 	if err != nil {
 		t.Fatalf("ListBuckets: %v", err)
 	}
@@ -337,12 +339,12 @@ func TestListBuckets_Multiple(t *testing.T) {
 func TestPutObject_Success(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("put-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "put-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := []byte("hello world")
-	result, err := env.client.PutObject("put-bucket", "hello.txt",
+	result, err := env.client.PutObject(context.Background(), "put-bucket", "hello.txt",
 		bytes.NewReader(content), int64(len(content)),
 		&PutOptions{ContentType: "text/plain"})
 	if err != nil {
@@ -359,12 +361,12 @@ func TestPutObject_Success(t *testing.T) {
 func TestPutObject_NoOptions(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("put-bucket2"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "put-bucket2"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := []byte("no opts")
-	result, err := env.client.PutObject("put-bucket2", "obj.bin",
+	result, err := env.client.PutObject(context.Background(), "put-bucket2", "obj.bin",
 		bytes.NewReader(content), int64(len(content)), nil)
 	if err != nil {
 		t.Fatalf("PutObject: %v", err)
@@ -377,12 +379,12 @@ func TestPutObject_NoOptions(t *testing.T) {
 func TestPutObject_SkipETag(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("put-bucket-skip"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "put-bucket-skip"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := []byte("skip my etag")
-	result, err := env.client.PutObject("put-bucket-skip", "hello.txt",
+	result, err := env.client.PutObject(context.Background(), "put-bucket-skip", "hello.txt",
 		bytes.NewReader(content), int64(len(content)),
 		&PutOptions{ContentType: "text/plain", SkipETag: true})
 	if err != nil {
@@ -399,18 +401,18 @@ func TestPutObject_SkipETag(t *testing.T) {
 func TestGetObject_Success(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("get-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "get-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := "hello native protocol"
-	if _, err := env.client.PutObject("get-bucket", "msg.txt",
+	if _, err := env.client.PutObject(context.Background(), "get-bucket", "msg.txt",
 		strings.NewReader(content), int64(len(content)),
 		&PutOptions{ContentType: "text/plain"}); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := env.client.GetObject("get-bucket", "msg.txt")
+	result, err := env.client.GetObject(context.Background(), "get-bucket", "msg.txt")
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
@@ -434,11 +436,11 @@ func TestGetObject_Success(t *testing.T) {
 func TestGetObject_NotFound(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("get-bucket2"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "get-bucket2"); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := env.client.GetObject("get-bucket2", "nonexistent.txt")
+	_, err := env.client.GetObject(context.Background(), "get-bucket2", "nonexistent.txt")
 	if err == nil {
 		t.Fatal("expected error for nonexistent object")
 	}
@@ -447,7 +449,7 @@ func TestGetObject_NotFound(t *testing.T) {
 func TestGetObject_BucketNotFound(t *testing.T) {
 	env := setup(t)
 
-	_, err := env.client.GetObject("no-such-bucket", "key.txt")
+	_, err := env.client.GetObject(context.Background(), "no-such-bucket", "key.txt")
 	if err == nil {
 		t.Fatal("expected error for nonexistent bucket")
 	}
@@ -456,18 +458,18 @@ func TestGetObject_BucketNotFound(t *testing.T) {
 func TestHeadObject_Exists(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("head-obj-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "head-obj-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := "head me"
-	if _, err := env.client.PutObject("head-obj-bucket", "obj.txt",
+	if _, err := env.client.PutObject(context.Background(), "head-obj-bucket", "obj.txt",
 		strings.NewReader(content), int64(len(content)),
 		&PutOptions{ContentType: "text/plain"}); err != nil {
 		t.Fatal(err)
 	}
 
-	info, err := env.client.HeadObject("head-obj-bucket", "obj.txt")
+	info, err := env.client.HeadObject(context.Background(), "head-obj-bucket", "obj.txt")
 	if err != nil {
 		t.Fatalf("HeadObject: %v", err)
 	}
@@ -485,11 +487,11 @@ func TestHeadObject_Exists(t *testing.T) {
 func TestHeadObject_NotFound(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("head-obj-bucket2"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "head-obj-bucket2"); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := env.client.HeadObject("head-obj-bucket2", "missing.txt")
+	_, err := env.client.HeadObject(context.Background(), "head-obj-bucket2", "missing.txt")
 	if err == nil {
 		t.Fatal("expected error for nonexistent object")
 	}
@@ -498,22 +500,22 @@ func TestHeadObject_NotFound(t *testing.T) {
 func TestDeleteObject_Success(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("del-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "del-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := "delete me"
-	if _, err := env.client.PutObject("del-bucket", "obj.txt",
+	if _, err := env.client.PutObject(context.Background(), "del-bucket", "obj.txt",
 		strings.NewReader(content), int64(len(content)), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := env.client.DeleteObject("del-bucket", "obj.txt"); err != nil {
+	if err := env.client.DeleteObject(context.Background(), "del-bucket", "obj.txt"); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
 	// Object should be gone.
-	_, err := env.client.GetObject("del-bucket", "obj.txt")
+	_, err := env.client.GetObject(context.Background(), "del-bucket", "obj.txt")
 	if err == nil {
 		t.Fatal("expected error for deleted object")
 	}
@@ -522,18 +524,18 @@ func TestDeleteObject_Success(t *testing.T) {
 func TestDeleteObject_NotFound(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("del-bucket2"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "del-bucket2"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Deleting a nonexistent object — server may or may not error; just ensure no panic.
-	_ = env.client.DeleteObject("del-bucket2", "ghost.txt")
+	_ = env.client.DeleteObject(context.Background(), "del-bucket2", "ghost.txt")
 }
 
 func TestPutGet_LargeObject(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("large-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "large-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -543,12 +545,12 @@ func TestPutGet_LargeObject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := env.client.PutObject("large-bucket", "large.bin",
+	if _, err := env.client.PutObject(context.Background(), "large-bucket", "large.bin",
 		bytes.NewReader(data), size, nil); err != nil {
 		t.Fatalf("PutObject large: %v", err)
 	}
 
-	result, err := env.client.GetObject("large-bucket", "large.bin")
+	result, err := env.client.GetObject(context.Background(), "large-bucket", "large.bin")
 	if err != nil {
 		t.Fatalf("GetObject large: %v", err)
 	}
@@ -567,12 +569,12 @@ func TestPutGet_LargeObject(t *testing.T) {
 func TestPutObject_UserMetadata(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("meta-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "meta-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := "with metadata"
-	if _, err := env.client.PutObject("meta-bucket", "file.txt",
+	if _, err := env.client.PutObject(context.Background(), "meta-bucket", "file.txt",
 		strings.NewReader(content), int64(len(content)),
 		&PutOptions{
 			Metadata: map[string]string{"x-custom-key": "custom-value"},
@@ -580,7 +582,7 @@ func TestPutObject_UserMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	info, err := env.client.HeadObject("meta-bucket", "file.txt")
+	info, err := env.client.HeadObject(context.Background(), "meta-bucket", "file.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,23 +594,23 @@ func TestPutObject_UserMetadata(t *testing.T) {
 func TestPutObject_Overwrite(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("overwrite-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "overwrite-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	v1 := "version one"
-	if _, err := env.client.PutObject("overwrite-bucket", "data.txt",
+	if _, err := env.client.PutObject(context.Background(), "overwrite-bucket", "data.txt",
 		strings.NewReader(v1), int64(len(v1)), nil); err != nil {
 		t.Fatal(err)
 	}
 
 	v2 := "version two"
-	if _, err := env.client.PutObject("overwrite-bucket", "data.txt",
+	if _, err := env.client.PutObject(context.Background(), "overwrite-bucket", "data.txt",
 		strings.NewReader(v2), int64(len(v2)), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := env.client.GetObject("overwrite-bucket", "data.txt")
+	result, err := env.client.GetObject(context.Background(), "overwrite-bucket", "data.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,11 +627,11 @@ func TestPutObject_Overwrite(t *testing.T) {
 func TestListObjects_Empty(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("list-empty"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "list-empty"); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := env.client.ListObjects("list-empty", nil)
+	result, err := env.client.ListObjects(context.Background(), "list-empty", nil)
 	if err != nil {
 		t.Fatalf("ListObjects: %v", err)
 	}
@@ -641,18 +643,18 @@ func TestListObjects_Empty(t *testing.T) {
 func TestListObjects_All(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("list-all"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "list-all"); err != nil {
 		t.Fatal(err)
 	}
 
 	keys := []string{"a.txt", "b.txt", "c.txt"}
 	for _, k := range keys {
-		if _, err := env.client.PutObject("list-all", k, strings.NewReader("x"), 1, nil); err != nil {
+		if _, err := env.client.PutObject(context.Background(), "list-all", k, strings.NewReader("x"), 1, nil); err != nil {
 			t.Fatalf("PutObject %q: %v", k, err)
 		}
 	}
 
-	result, err := env.client.ListObjects("list-all", nil)
+	result, err := env.client.ListObjects(context.Background(), "list-all", nil)
 	if err != nil {
 		t.Fatalf("ListObjects: %v", err)
 	}
@@ -664,7 +666,7 @@ func TestListObjects_All(t *testing.T) {
 func TestListObjects_WithPrefix(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("list-prefix"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "list-prefix"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -674,12 +676,12 @@ func TestListObjects_WithPrefix(t *testing.T) {
 		"docs/readme":  "doc",
 	}
 	for k, v := range items {
-		if _, err := env.client.PutObject("list-prefix", k, strings.NewReader(v), int64(len(v)), nil); err != nil {
+		if _, err := env.client.PutObject(context.Background(), "list-prefix", k, strings.NewReader(v), int64(len(v)), nil); err != nil {
 			t.Fatalf("PutObject %q: %v", k, err)
 		}
 	}
 
-	result, err := env.client.ListObjects("list-prefix", &ListOptions{Prefix: "photos/"})
+	result, err := env.client.ListObjects(context.Background(), "list-prefix", &ListOptions{Prefix: "photos/"})
 	if err != nil {
 		t.Fatalf("ListObjects with prefix: %v", err)
 	}
@@ -691,18 +693,18 @@ func TestListObjects_WithPrefix(t *testing.T) {
 func TestListObjects_WithDelimiter(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("list-delim"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "list-delim"); err != nil {
 		t.Fatal(err)
 	}
 
 	items := []string{"photos/a.jpg", "photos/b.jpg", "docs/readme.md", "root.txt"}
 	for _, k := range items {
-		if _, err := env.client.PutObject("list-delim", k, strings.NewReader("x"), 1, nil); err != nil {
+		if _, err := env.client.PutObject(context.Background(), "list-delim", k, strings.NewReader("x"), 1, nil); err != nil {
 			t.Fatalf("PutObject %q: %v", k, err)
 		}
 	}
 
-	result, err := env.client.ListObjects("list-delim", &ListOptions{Delimiter: "/"})
+	result, err := env.client.ListObjects(context.Background(), "list-delim", &ListOptions{Delimiter: "/"})
 	if err != nil {
 		t.Fatalf("ListObjects with delimiter: %v", err)
 	}
@@ -719,18 +721,18 @@ func TestListObjects_WithDelimiter(t *testing.T) {
 func TestListObjects_MaxKeys(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("list-maxkeys"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "list-maxkeys"); err != nil {
 		t.Fatal(err)
 	}
 
 	for i := range 5 {
 		key := "key-" + string(rune('0'+i))
-		if _, err := env.client.PutObject("list-maxkeys", key, strings.NewReader("v"), 1, nil); err != nil {
+		if _, err := env.client.PutObject(context.Background(), "list-maxkeys", key, strings.NewReader("v"), 1, nil); err != nil {
 			t.Fatalf("PutObject: %v", err)
 		}
 	}
 
-	result, err := env.client.ListObjects("list-maxkeys", &ListOptions{MaxKeys: 2})
+	result, err := env.client.ListObjects(context.Background(), "list-maxkeys", &ListOptions{MaxKeys: 2})
 	if err != nil {
 		t.Fatalf("ListObjects MaxKeys: %v", err)
 	}
@@ -742,7 +744,7 @@ func TestListObjects_MaxKeys(t *testing.T) {
 func TestListObjects_BucketNotFound(t *testing.T) {
 	env := setup(t)
 
-	_, err := env.client.ListObjects("ghost-bucket", nil)
+	_, err := env.client.ListObjects(context.Background(), "ghost-bucket", nil)
 	if err == nil {
 		t.Fatal("expected error for nonexistent bucket")
 	}
@@ -753,12 +755,12 @@ func TestListObjects_BucketNotFound(t *testing.T) {
 func TestMultipart_FullFlow(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("mp-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "mp-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Create multipart upload
-	uploadID, err := env.client.CreateMultipartUpload("mp-bucket", "big.bin",
+	uploadID, err := env.client.CreateMultipartUpload(context.Background(), "mp-bucket", "big.bin",
 		&PutOptions{ContentType: "application/octet-stream"})
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
@@ -771,7 +773,7 @@ func TestMultipart_FullFlow(t *testing.T) {
 	partSize := int64(5 << 20) // 5 MB
 	part1Data := make([]byte, partSize)
 	rand.Read(part1Data)
-	etag1, err := env.client.UploadPart("mp-bucket", "big.bin", uploadID, 1,
+	etag1, err := env.client.UploadPart(context.Background(), "mp-bucket", "big.bin", uploadID, 1,
 		bytes.NewReader(part1Data), partSize)
 	if err != nil {
 		t.Fatalf("UploadPart 1: %v", err)
@@ -782,14 +784,14 @@ func TestMultipart_FullFlow(t *testing.T) {
 
 	part2Data := make([]byte, 1024) // last part can be smaller
 	rand.Read(part2Data)
-	etag2, err := env.client.UploadPart("mp-bucket", "big.bin", uploadID, 2,
+	etag2, err := env.client.UploadPart(context.Background(), "mp-bucket", "big.bin", uploadID, 2,
 		bytes.NewReader(part2Data), int64(len(part2Data)))
 	if err != nil {
 		t.Fatalf("UploadPart 2: %v", err)
 	}
 
 	// Complete
-	result, err := env.client.CompleteMultipartUpload("mp-bucket", "big.bin", uploadID, []CompletePart{
+	result, err := env.client.CompleteMultipartUpload(context.Background(), "mp-bucket", "big.bin", uploadID, []CompletePart{
 		{PartNumber: 1, ETag: etag1},
 		{PartNumber: 2, ETag: etag2},
 	})
@@ -801,7 +803,7 @@ func TestMultipart_FullFlow(t *testing.T) {
 	}
 
 	// Verify object is accessible
-	info, err := env.client.HeadObject("mp-bucket", "big.bin")
+	info, err := env.client.HeadObject(context.Background(), "mp-bucket", "big.bin")
 	if err != nil {
 		t.Fatalf("HeadObject after multipart complete: %v", err)
 	}
@@ -814,11 +816,11 @@ func TestMultipart_FullFlow(t *testing.T) {
 func TestMultipart_Abort(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("abort-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "abort-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
-	uploadID, err := env.client.CreateMultipartUpload("abort-bucket", "will-abort.bin", nil)
+	uploadID, err := env.client.CreateMultipartUpload(context.Background(), "abort-bucket", "will-abort.bin", nil)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
@@ -826,19 +828,19 @@ func TestMultipart_Abort(t *testing.T) {
 	// Upload one part
 	partData := make([]byte, 1024)
 	rand.Read(partData)
-	_, err = env.client.UploadPart("abort-bucket", "will-abort.bin", uploadID, 1,
+	_, err = env.client.UploadPart(context.Background(), "abort-bucket", "will-abort.bin", uploadID, 1,
 		bytes.NewReader(partData), int64(len(partData)))
 	if err != nil {
 		t.Fatalf("UploadPart: %v", err)
 	}
 
 	// Abort
-	if err := env.client.AbortMultipartUpload("abort-bucket", "will-abort.bin", uploadID); err != nil {
+	if err := env.client.AbortMultipartUpload(context.Background(), "abort-bucket", "will-abort.bin", uploadID); err != nil {
 		t.Fatalf("AbortMultipartUpload: %v", err)
 	}
 
 	// Completing an aborted upload should fail
-	_, err = env.client.CompleteMultipartUpload("abort-bucket", "will-abort.bin", uploadID, []CompletePart{
+	_, err = env.client.CompleteMultipartUpload(context.Background(), "abort-bucket", "will-abort.bin", uploadID, []CompletePart{
 		{PartNumber: 1},
 	})
 	if err == nil {
@@ -849,11 +851,11 @@ func TestMultipart_Abort(t *testing.T) {
 func TestMultipart_ListParts(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("lp-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "lp-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
-	uploadID, err := env.client.CreateMultipartUpload("lp-bucket", "multi.bin", nil)
+	uploadID, err := env.client.CreateMultipartUpload(context.Background(), "lp-bucket", "multi.bin", nil)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
@@ -862,14 +864,14 @@ func TestMultipart_ListParts(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		data := make([]byte, 1024)
 		rand.Read(data)
-		_, err := env.client.UploadPart("lp-bucket", "multi.bin", uploadID, i,
+		_, err := env.client.UploadPart(context.Background(), "lp-bucket", "multi.bin", uploadID, i,
 			bytes.NewReader(data), int64(len(data)))
 		if err != nil {
 			t.Fatalf("UploadPart %d: %v", i, err)
 		}
 	}
 
-	parts, err := env.client.ListParts("lp-bucket", "multi.bin", uploadID)
+	parts, err := env.client.ListParts(context.Background(), "lp-bucket", "multi.bin", uploadID)
 	if err != nil {
 		t.Fatalf("ListParts: %v", err)
 	}
@@ -889,11 +891,11 @@ func TestMultipart_ListParts(t *testing.T) {
 func TestMultipart_CreateNoOptions(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("mp-noopts"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "mp-noopts"); err != nil {
 		t.Fatal(err)
 	}
 
-	uploadID, err := env.client.CreateMultipartUpload("mp-noopts", "obj.bin", nil)
+	uploadID, err := env.client.CreateMultipartUpload(context.Background(), "mp-noopts", "obj.bin", nil)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
@@ -902,7 +904,7 @@ func TestMultipart_CreateNoOptions(t *testing.T) {
 	}
 
 	// Clean up
-	_ = env.client.AbortMultipartUpload("mp-noopts", "obj.bin", uploadID)
+	_ = env.client.AbortMultipartUpload(context.Background(), "mp-noopts", "obj.bin", uploadID)
 }
 
 // --- Connection pool behaviour ---
@@ -910,7 +912,7 @@ func TestMultipart_CreateNoOptions(t *testing.T) {
 func TestConnectionReuse(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("reuse-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "reuse-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -918,13 +920,13 @@ func TestConnectionReuse(t *testing.T) {
 	for i := range 10 {
 		data := "value"
 		key := "obj-" + string(rune('0'+i))
-		if _, err := env.client.PutObject("reuse-bucket", key,
+		if _, err := env.client.PutObject(context.Background(), "reuse-bucket", key,
 			strings.NewReader(data), int64(len(data)), nil); err != nil {
 			t.Fatalf("PutObject %d: %v", i, err)
 		}
 	}
 
-	result, err := env.client.ListObjects("reuse-bucket", nil)
+	result, err := env.client.ListObjects(context.Background(), "reuse-bucket", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -960,17 +962,17 @@ func TestError_ErrorString_NoCode(t *testing.T) {
 func TestGetObject_CloseBeforeRead(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("close-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "close-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := "close without reading"
-	if _, err := env.client.PutObject("close-bucket", "obj.txt",
+	if _, err := env.client.PutObject(context.Background(), "close-bucket", "obj.txt",
 		strings.NewReader(content), int64(len(content)), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := env.client.GetObject("close-bucket", "obj.txt")
+	result, err := env.client.GetObject(context.Background(), "close-bucket", "obj.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -983,17 +985,17 @@ func TestGetObject_CloseBeforeRead(t *testing.T) {
 func TestGetObject_PartialReadThenClose(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("partial-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "partial-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := "partial read content here"
-	if _, err := env.client.PutObject("partial-bucket", "obj.txt",
+	if _, err := env.client.PutObject(context.Background(), "partial-bucket", "obj.txt",
 		strings.NewReader(content), int64(len(content)), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := env.client.GetObject("partial-bucket", "obj.txt")
+	result, err := env.client.GetObject(context.Background(), "partial-bucket", "obj.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1007,7 +1009,7 @@ func TestGetObject_PartialReadThenClose(t *testing.T) {
 	}
 
 	// The connection should be reusable after partial read + close
-	if err := env.client.Ping(); err != nil {
+	if err := env.client.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping after partial read close: %v", err)
 	}
 }
@@ -1015,17 +1017,17 @@ func TestGetObject_PartialReadThenClose(t *testing.T) {
 func TestGetObject_CloseIdempotent(t *testing.T) {
 	env := setup(t)
 
-	if _, err := env.client.CreateBucket("close2-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "close2-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	content := "idempotent close"
-	if _, err := env.client.PutObject("close2-bucket", "obj.txt",
+	if _, err := env.client.PutObject(context.Background(), "close2-bucket", "obj.txt",
 		strings.NewReader(content), int64(len(content)), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := env.client.GetObject("close2-bucket", "obj.txt")
+	result, err := env.client.GetObject(context.Background(), "close2-bucket", "obj.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1131,7 +1133,7 @@ func TestDoRequest_RetriesOnDeadPooledConn(t *testing.T) {
 		serveRequests(nc, br, bw)
 	})
 
-	c, err := Dial(fs.addr(), "tok", "sec", 2)
+	c, err := Dial(context.Background(), fs.addr(), "tok", "sec", WithPoolSize(2))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -1141,7 +1143,7 @@ func TestDoRequest_RetriesOnDeadPooledConn(t *testing.T) {
 
 	// The pooled connection is dead; Ping must succeed via a transparent
 	// single retry on a fresh connection.
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(context.Background()); err != nil {
 		t.Fatalf("expected transparent retry, got: %v", err)
 	}
 	if got := fs.accepts.Load(); got != 2 {
@@ -1158,7 +1160,7 @@ func TestDoRequestWithData_NoRetryOnDeadPooledConn(t *testing.T) {
 		}
 	})
 
-	c, err := Dial(fs.addr(), "tok", "sec", 1)
+	c, err := Dial(context.Background(), fs.addr(), "tok", "sec", WithPoolSize(1))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -1168,7 +1170,7 @@ func TestDoRequestWithData_NoRetryOnDeadPooledConn(t *testing.T) {
 
 	// Upload paths must NOT retry: the body reader may be partially consumed.
 	data := "payload"
-	_, err = c.PutObject("bucket", "key", strings.NewReader(data), int64(len(data)), nil)
+	_, err = c.PutObject(context.Background(), "bucket", "key", strings.NewReader(data), int64(len(data)), nil)
 	if err == nil {
 		t.Fatal("expected error from PutObject on dead connection")
 	}
@@ -1182,7 +1184,7 @@ func TestGetConn_DiscardsIdleConnection(t *testing.T) {
 		serveRequests(nc, br, bw)
 	})
 
-	c, err := Dial(fs.addr(), "tok", "sec", 2)
+	c, err := Dial(context.Background(), fs.addr(), "tok", "sec", WithPoolSize(2))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -1193,7 +1195,7 @@ func TestGetConn_DiscardsIdleConnection(t *testing.T) {
 	stale.lastUsed = time.Now().Add(-maxConnIdle - time.Second)
 	c.pool <- stale
 
-	got, pooled, err := c.getConn()
+	got, pooled, err := c.getConn(context.Background())
 	if err != nil {
 		t.Fatalf("getConn: %v", err)
 	}
@@ -1219,7 +1221,7 @@ func TestGetConn_ReusesFreshConnection(t *testing.T) {
 		serveRequests(nc, br, bw)
 	})
 
-	c, err := Dial(fs.addr(), "tok", "sec", 2)
+	c, err := Dial(context.Background(), fs.addr(), "tok", "sec", WithPoolSize(2))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -1228,7 +1230,7 @@ func TestGetConn_ReusesFreshConnection(t *testing.T) {
 	fresh := <-c.pool
 	c.pool <- fresh
 
-	got, pooled, err := c.getConn()
+	got, pooled, err := c.getConn(context.Background())
 	if err != nil {
 		t.Fatalf("getConn: %v", err)
 	}
@@ -1246,25 +1248,35 @@ func TestGetConn_ReusesFreshConnection(t *testing.T) {
 }
 
 func TestOpTimeout_Scaling(t *testing.T) {
+	tm := Timeouts{}.withDefaults()
 	// No payload: floor applies.
-	if got := opTimeout(0); got != minOpTimeout {
-		t.Fatalf("opTimeout(0) = %v, want %v", got, minOpTimeout)
+	if got := tm.op(0); got != defaultMinOpTimeout {
+		t.Fatalf("op(0) = %v, want %v", got, defaultMinOpTimeout)
 	}
 	// Small payload still under the floor.
-	if got := opTimeout(1024); got != minOpTimeout {
-		t.Fatalf("opTimeout(1KB) = %v, want %v", got, minOpTimeout)
+	if got := tm.op(1024); got != defaultMinOpTimeout {
+		t.Fatalf("op(1KB) = %v, want %v", got, defaultMinOpTimeout)
 	}
-	// Large payload scales at opBytesPerSec plus slack.
+	// Large payload scales at BytesPerSec plus slack.
 	size := int64(100 << 20) // 100 MB
-	want := 100*time.Second + opTimeoutSlack
-	if got := opTimeout(size); got != want {
-		t.Fatalf("opTimeout(100MB) = %v, want %v", got, want)
+	want := 100*time.Second + defaultOpTimeoutSlack
+	if got := tm.op(size); got != want {
+		t.Fatalf("op(100MB) = %v, want %v", got, want)
+	}
+
+	// WithTimeouts fills only what the caller left at zero.
+	custom := Timeouts{MinOperation: time.Second, BytesPerSec: 1 << 30}.withDefaults()
+	if custom.Dial != defaultDialTimeout || custom.Slack != defaultOpTimeoutSlack {
+		t.Fatalf("unset fields must take the defaults: %+v", custom)
+	}
+	if got := custom.op(1 << 30); got != time.Second+defaultOpTimeoutSlack {
+		t.Fatalf("op(1GiB at 1GiB/s) = %v, want %v", got, time.Second+defaultOpTimeoutSlack)
 	}
 }
 
 func TestTimeoutConstants_Sane(t *testing.T) {
-	if dialTimeout <= 0 {
-		t.Fatal("dialTimeout must be positive")
+	if defaultDialTimeout <= 0 {
+		t.Fatal("defaultDialTimeout must be positive")
 	}
 	// The server closes idle connections after 60s (proto/server.go
 	// idleTimeout); the pool must discard strictly earlier to avoid handing
@@ -1277,7 +1289,7 @@ func TestTimeoutConstants_Sane(t *testing.T) {
 func TestClose_Twice(t *testing.T) {
 	env := setup(t)
 
-	c, err := Dial(env.addr, env.tokenID, env.secret, 1)
+	c, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithPoolSize(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1293,24 +1305,24 @@ func TestMultipleClients_SameBucket(t *testing.T) {
 	env := setup(t)
 
 	// Create a second client to the same server
-	c2, err := Dial(env.addr, env.tokenID, env.secret, 1)
+	c2, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithPoolSize(1))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = c2.Close() }()
 
-	if _, err := env.client.CreateBucket("shared-bucket"); err != nil {
+	if _, err := env.client.CreateBucket(context.Background(), "shared-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	// c1 writes, c2 reads
 	content := "written by c1"
-	if _, err := env.client.PutObject("shared-bucket", "item.txt",
+	if _, err := env.client.PutObject(context.Background(), "shared-bucket", "item.txt",
 		strings.NewReader(content), int64(len(content)), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := c2.GetObject("shared-bucket", "item.txt")
+	result, err := c2.GetObject(context.Background(), "shared-bucket", "item.txt")
 	if err != nil {
 		t.Fatalf("GetObject via c2: %v", err)
 	}

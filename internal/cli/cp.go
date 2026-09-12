@@ -64,7 +64,7 @@ func copyOne(opts Options, c *client.Client, src, dst Location) error {
 	case !src.Remote && dst.Remote:
 		target := dst
 		target.Key = resolveKey(dst.Key, src.Path)
-		sum, err := upload(c, src.Path, target, opts.errOut())
+		sum, err := upload(opts.context(), c, src.Path, target, opts.errOut())
 		if err != nil {
 			return err
 		}
@@ -73,7 +73,7 @@ func copyOne(opts Options, c *client.Client, src, dst Location) error {
 
 	case src.Remote && !dst.Remote:
 		target := resolveLocalPath(dst.Path, src.Key)
-		if _, err := download(c, src, target, opts.errOut()); err != nil {
+		if _, err := download(opts.context(), c, src, target, opts.errOut()); err != nil {
 			return err
 		}
 		printf(opts.out(), "%s -> %s\n", src, target)
@@ -82,7 +82,7 @@ func copyOne(opts Options, c *client.Client, src, dst Location) error {
 	default:
 		target := dst
 		target.Key = resolveKey(dst.Key, src.Key)
-		if err := remoteCopy(c, src, target, opts.errOut()); err != nil {
+		if err := remoteCopy(opts.context(), c, src, target, opts.errOut()); err != nil {
 			return err
 		}
 		printf(opts.out(), "%s -> %s\n", src, target)

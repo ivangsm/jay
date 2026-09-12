@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -25,7 +26,7 @@ const multipartChunkSize = 16 << 20
 
 // upload sends a local file to a bucket, choosing single-shot or multipart by
 // size. It returns the checksum the server computed.
-func upload(c *client.Client, path string, dst Location, progress io.Writer) (string, error) {
+func upload(ctx context.Context, c *client.Client, path string, dst Location, progress io.Writer) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
@@ -35,7 +36,7 @@ func upload(c *client.Client, path string, dst Location, progress io.Writer) (st
 	}
 
 	if info.Size() > multipartThreshold {
-		return uploadMultipart(c, path, info.Size(), dst, progress)
+		return uploadMultipart(ctx, c, path, info.Size(), dst, progress)
 	}
 
 	f, err := os.Open(path) //nolint:gosec // the path is the argument the user typed
@@ -45,7 +46,7 @@ func upload(c *client.Client, path string, dst Location, progress io.Writer) (st
 	defer func() { _ = f.Close() }()
 
 	body := newProgressReader(f, info.Size(), filepath.Base(path), progress)
-	res, err := c.PutObject(dst.Bucket, dst.Key, body, info.Size(), nil)
+	res, err := c.PutObject(ctx, dst.Bucket, dst.Key, body, info.Size(), nil)
 	if err != nil {
 		return "", err
 	}
@@ -56,31 +57,31 @@ func upload(c *client.Client, path string, dst Location, progress io.Writer) (st
 // upload server-side: leaving it open would hold the parts on disk until the
 // GC reclaims them 24h later, and would look to the caller like a finished
 // object that simply is not there.
-func uploadMultipart(c *client.Client, path string, size int64, dst Location, progress io.Writer) (string, error) {
+func uploadMultipart(ctx context.Context, c *client.Client, path string, size int64, dst Location, progress io.Writer) (string, error) {
 	f, err := os.Open(path) //nolint:gosec // the path is the argument the user typed
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = f.Close() }()
 
-	uploadID, err := c.CreateMultipartUpload(dst.Bucket, dst.Key, nil)
+	uploadID, err := c.CreateMultipartUpload(ctx, dst.Bucket, dst.Key, nil)
 	if err != nil {
 		return "", err
 	}
 
 	body := newProgressReader(f, size, filepath.Base(path), progress)
 
-	parts, err := uploadParts(c, body, size, dst, uploadID)
+	parts, err := uploadParts(ctx, c, body, size, dst, uploadID)
 	if err != nil {
-		if abortErr := c.AbortMultipartUpload(dst.Bucket, dst.Key, uploadID); abortErr != nil {
+		if abortErr := c.AbortMultipartUpload(ctx, dst.Bucket, dst.Key, uploadID); abortErr != nil {
 			return "", fmt.Errorf("%w (and aborting the upload failed: %w)", err, abortErr)
 		}
 		return "", err
 	}
 
-	res, err := c.CompleteMultipartUpload(dst.Bucket, dst.Key, uploadID, parts)
+	res, err := c.CompleteMultipartUpload(ctx, dst.Bucket, dst.Key, uploadID, parts)
 	if err != nil {
-		if abortErr := c.AbortMultipartUpload(dst.Bucket, dst.Key, uploadID); abortErr != nil {
+		if abortErr := c.AbortMultipartUpload(ctx, dst.Bucket, dst.Key, uploadID); abortErr != nil {
 			return "", fmt.Errorf("%w (and aborting the upload failed: %w)", err, abortErr)
 		}
 		return "", err
@@ -91,7 +92,7 @@ func uploadMultipart(c *client.Client, path string, size int64, dst Location, pr
 // uploadParts streams the reader into fixed-size parts. Parts go up in order
 // because the source is a single sequential reader; the progress bar wraps it
 // once, so it measures the whole object rather than each part.
-func uploadParts(c *client.Client, body io.Reader, size int64, dst Location, uploadID string) ([]client.CompletePart, error) {
+func uploadParts(ctx context.Context, c *client.Client, body io.Reader, size int64, dst Location, uploadID string) ([]client.CompletePart, error) {
 	var parts []client.CompletePart
 	remaining := size
 
@@ -101,7 +102,7 @@ func uploadParts(c *client.Client, body io.Reader, size int64, dst Location, upl
 			chunk = remaining
 		}
 
-		etag, err := c.UploadPart(dst.Bucket, dst.Key, uploadID, partNumber, io.LimitReader(body, chunk), chunk)
+		etag, err := c.UploadPart(ctx, dst.Bucket, dst.Key, uploadID, partNumber, io.LimitReader(body, chunk), chunk)
 		if err != nil {
 			return nil, fmt.Errorf("part %d: %w", partNumber, err)
 		}
@@ -116,8 +117,8 @@ func uploadParts(c *client.Client, body io.Reader, size int64, dst Location, upl
 // returns how many bytes landed. The file is written to a temporary name and
 // renamed, so an interrupted transfer never leaves a truncated file where a
 // complete one is expected.
-func download(c *client.Client, src Location, path string, progress io.Writer) (int64, error) {
-	obj, err := c.GetObject(src.Bucket, src.Key)
+func download(ctx context.Context, c *client.Client, src Location, path string, progress io.Writer) (int64, error) {
+	obj, err := c.GetObject(ctx, src.Bucket, src.Key)
 	if err != nil {
 		return 0, err
 	}
@@ -157,19 +158,28 @@ func download(c *client.Client, src Location, path string, progress io.Writer) (
 	return written, nil
 }
 
-// remoteCopy streams an object from one location to another without touching
-// the local disk. The native protocol has no server-side copy, so the bytes go
-// through this process — the progress bar tells the user that.
-func remoteCopy(c *client.Client, src, dst Location, progress io.Writer) error {
-	obj, err := c.GetObject(src.Bucket, src.Key)
+// remoteCopy copies an object from one location to another without touching
+// the local disk. The server does it in place when it can; a jay that predates
+// CopyObject answers UnknownOp, and then the bytes go through this process —
+// the progress bar is what tells the user which one happened.
+func remoteCopy(ctx context.Context, c *client.Client, src, dst Location, progress io.Writer) error {
+	_, err := c.CopyObject(ctx, src.Bucket, src.Key, dst.Bucket, dst.Key)
+	if err == nil {
+		return nil
+	}
+	if !client.IsUnknownOp(err) {
+		return err
+	}
+
+	obj, err := c.GetObject(ctx, src.Bucket, src.Key)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = obj.Body.Close() }()
 
 	body := newProgressReader(obj.Body, obj.Size, baseName(src.Key), progress)
-	opts := &client.PutOptions{ContentType: obj.ContentType}
-	if _, err := c.PutObject(dst.Bucket, dst.Key, body, obj.Size, opts); err != nil {
+	opts := &client.PutOptions{ContentType: obj.ContentType, Metadata: obj.Metadata}
+	if _, err := c.PutObject(ctx, dst.Bucket, dst.Key, body, obj.Size, opts); err != nil {
 		return err
 	}
 	return nil

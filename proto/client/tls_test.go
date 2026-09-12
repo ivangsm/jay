@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -140,10 +141,7 @@ func TestNativeTLS_RoundTrip(t *testing.T) {
 	env := startNativeServer(t, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
 	env.pool = pool
 
-	c, err := DialWithOptions(env.addr, env.tokenID, env.secret, Options{
-		PoolSize:  2,
-		TLSConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-	})
+	c, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithPoolSize(2), WithTLS(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}))
 	if err != nil {
 		t.Fatalf("dial over TLS: %v", err)
 	}
@@ -152,14 +150,14 @@ func TestNativeTLS_RoundTrip(t *testing.T) {
 	// A handshake proves authentication; a real object proves the framing and
 	// the body copy survive the TLS wrapper — the GetObject path gives up
 	// sendfile(2) under TLS and that is where a regression would land.
-	if _, err := c.CreateBucket("bucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "bucket"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	body := bytes.Repeat([]byte("payload"), 1000)
-	if _, err := c.PutObject("bucket", "k", bytes.NewReader(body), int64(len(body)), nil); err != nil {
+	if _, err := c.PutObject(context.Background(), "bucket", "k", bytes.NewReader(body), int64(len(body)), nil); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	obj, err := c.GetObject("bucket", "k")
+	obj, err := c.GetObject(context.Background(), "bucket", "k")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -247,7 +245,7 @@ func TestNativeTLS_SecretIsNotReadableOnTheWire(t *testing.T) {
 		env := startNativeServer(t, nil)
 		proxy := newRecordingProxy(t, env.addr)
 
-		c, err := Dial(proxy.addr, env.tokenID, env.secret, 1)
+		c, err := Dial(context.Background(), proxy.addr, env.tokenID, env.secret, WithPoolSize(1))
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
@@ -264,11 +262,7 @@ func TestNativeTLS_SecretIsNotReadableOnTheWire(t *testing.T) {
 		env := startNativeServer(t, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
 		proxy := newRecordingProxy(t, env.addr)
 
-		c, err := DialWithOptions(proxy.addr, env.tokenID, env.secret, Options{
-			PoolSize: 1,
-			// The proxy forwards to 127.0.0.1, which the certificate covers.
-			TLSConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-		})
+		c, err := Dial(context.Background(), proxy.addr, env.tokenID, env.secret, WithPoolSize(1), WithTLS(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}))
 		if err != nil {
 			t.Fatalf("dial over TLS: %v", err)
 		}
@@ -296,9 +290,7 @@ func TestNativeTLS_NoSilentDowngrade(t *testing.T) {
 		env := startNativeServer(t, nil)
 		_, pool := selfSignedCert(t)
 
-		_, err := DialWithOptions(env.addr, env.tokenID, env.secret, Options{
-			TLSConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-		})
+		_, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithTLS(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}))
 		if err == nil {
 			t.Fatal("a TLS client must not succeed against a plaintext listener")
 		}
@@ -308,7 +300,7 @@ func TestNativeTLS_NoSilentDowngrade(t *testing.T) {
 		cert, _ := selfSignedCert(t)
 		env := startNativeServer(t, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
 
-		_, err := Dial(env.addr, env.tokenID, env.secret, 1)
+		_, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithPoolSize(1))
 		if err == nil {
 			t.Fatal("a plaintext client must not succeed against a TLS listener")
 		}
@@ -320,9 +312,7 @@ func TestNativeTLS_NoSilentDowngrade(t *testing.T) {
 
 		// A pool that trusts a DIFFERENT certificate: verification must fail.
 		_, otherPool := selfSignedCert(t)
-		_, err := DialWithOptions(env.addr, env.tokenID, env.secret, Options{
-			TLSConfig: &tls.Config{RootCAs: otherPool, MinVersion: tls.VersionTLS12},
-		})
+		_, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithTLS(&tls.Config{RootCAs: otherPool, MinVersion: tls.VersionTLS12}))
 		if err == nil {
 			t.Fatal("a certificate signed by an untrusted key must be refused")
 		}
@@ -335,7 +325,7 @@ func TestNativeTLS_NoSilentDowngrade(t *testing.T) {
 func TestHandshakeErrors_AreDistinguishable(t *testing.T) {
 	env := startNativeServer(t, nil)
 
-	_, err := Dial(env.addr, "tok", "wrong-secret", 1)
+	_, err := Dial(context.Background(), env.addr, "tok", "wrong-secret", WithPoolSize(1))
 	if !errors.Is(err, ErrAuthFailed) {
 		t.Errorf("bad secret: got %v, want ErrAuthFailed", err)
 	}
@@ -356,7 +346,7 @@ func TestHandshakeErrors_AreDistinguishable(t *testing.T) {
 		_ = proto.WriteHandshakeResponse(conn, 0x7F)
 	}()
 
-	_, err = Dial(ln.Addr().String(), "tok", "secret", 1)
+	_, err = Dial(context.Background(), ln.Addr().String(), "tok", "secret", WithPoolSize(1))
 	if err == nil {
 		t.Fatal("expected an error for an unknown handshake status")
 	}
@@ -365,12 +355,12 @@ func TestHandshakeErrors_AreDistinguishable(t *testing.T) {
 	}
 }
 
-// TestDial_MatchesDialWithOptions guards the compatibility of the original
-// four-argument constructor, which falco and the CLI both call.
-func TestDial_MatchesDialWithOptions(t *testing.T) {
+// TestDial_PoolSizeOption pins that WithPoolSize sizes the pool and that a
+// Dial without WithTLS stays in the clear.
+func TestDial_PoolSizeOption(t *testing.T) {
 	env := startNativeServer(t, nil)
 
-	c, err := Dial(env.addr, env.tokenID, env.secret, 3)
+	c, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithPoolSize(3))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -387,7 +377,7 @@ func TestDial_MatchesDialWithOptions(t *testing.T) {
 func TestDialWithOptions_ZeroPoolSizeDefaults(t *testing.T) {
 	env := startNativeServer(t, nil)
 
-	c, err := DialWithOptions(env.addr, env.tokenID, env.secret, Options{})
+	c, err := Dial(context.Background(), env.addr, env.tokenID, env.secret)
 	if err != nil {
 		t.Fatalf("DialWithOptions: %v", err)
 	}
@@ -409,26 +399,26 @@ func TestDialWithOptions_ZeroPoolSizeDefaults(t *testing.T) {
 func TestLastModified_SameFormatOnEveryPath(t *testing.T) {
 	env := startNativeServer(t, nil)
 
-	c, err := Dial(env.addr, env.tokenID, env.secret, 1)
+	c, err := Dial(context.Background(), env.addr, env.tokenID, env.secret, WithPoolSize(1))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer func() { _ = c.Close() }()
 
-	if _, err := c.CreateBucket("bucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "bucket"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	body := []byte("hello")
-	if _, err := c.PutObject("bucket", "k", bytes.NewReader(body), int64(len(body)), nil); err != nil {
+	if _, err := c.PutObject(context.Background(), "bucket", "k", bytes.NewReader(body), int64(len(body)), nil); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
-	head, err := c.HeadObject("bucket", "k")
+	head, err := c.HeadObject(context.Background(), "bucket", "k")
 	if err != nil {
 		t.Fatalf("head: %v", err)
 	}
 
-	list, err := c.ListObjects("bucket", &ListOptions{})
+	list, err := c.ListObjects(context.Background(), "bucket", &ListOptions{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/ivangsm/jay/proto"
@@ -33,7 +34,7 @@ type ListResult struct {
 }
 
 // ListObjects lists objects in a bucket with optional filtering.
-func (c *Client) ListObjects(bucket string, opts *ListOptions) (*ListResult, error) {
+func (c *Client) ListObjects(ctx context.Context, bucket string, opts *ListOptions) (*ListResult, error) {
 	var prefix, delimiter, startAfter string
 	var maxKeys int
 	if opts != nil {
@@ -47,7 +48,7 @@ func (c *Client) ListObjects(bucket string, opts *ListOptions) (*ListResult, err
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	status, respMeta, err := c.doRequest(proto.OpListObjects, meta)
+	status, respMeta, err := c.doRequest(ctx, proto.OpListObjects, meta)
 	if err != nil {
 		return nil, err
 	}

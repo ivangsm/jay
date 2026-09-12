@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -51,7 +52,7 @@ func runLs(opts Options, args []string) error {
 	}
 
 	var objects, bytes int64
-	err = walkObjects(c, loc.Bucket, loc.Key, delimiter, func(page *client.ListResult) error {
+	err = walkObjects(opts.context(), c, loc.Bucket, loc.Key, delimiter, func(page *client.ListResult) error {
 		for _, p := range page.CommonPrefixes {
 			printf(opts.out(), "%29s %s\n", "PRE", p)
 		}
@@ -80,10 +81,10 @@ func runLs(opts Options, args []string) error {
 // walkObjects pages through a listing, calling visit once per page. Paging is
 // the caller's only correct option: ListObjects caps a response, and stopping
 // at the first page would under-report every bucket over listPageSize keys.
-func walkObjects(c *client.Client, bucket, prefix, delimiter string, visit func(*client.ListResult) error) error {
+func walkObjects(ctx context.Context, c *client.Client, bucket, prefix, delimiter string, visit func(*client.ListResult) error) error {
 	startAfter := ""
 	for {
-		page, err := c.ListObjects(bucket, &client.ListOptions{
+		page, err := c.ListObjects(ctx, bucket, &client.ListOptions{
 			Prefix:     prefix,
 			Delimiter:  delimiter,
 			StartAfter: startAfter,

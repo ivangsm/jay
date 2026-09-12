@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -219,13 +220,13 @@ func setupNativeBench(b *testing.B) *benchNativeEnv {
 	}
 	b.Cleanup(func() { _ = shutdown() })
 
-	c, err := client.Dial(addr, "bench-token", secret, 16)
+	c, err := client.Dial(context.Background(), addr, "bench-token", secret, client.WithPoolSize(16))
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = c.Close() })
 
-	if _, err := c.CreateBucket("benchbucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "benchbucket"); err != nil {
 		b.Fatal(err)
 	}
 
@@ -583,7 +584,7 @@ func BenchmarkNativePutObject(b *testing.B) {
 			i := 0
 			for b.Loop() {
 				key := fmt.Sprintf("obj-put-%d", i)
-				_, err := env.client.PutObject("benchbucket", key,
+				_, err := env.client.PutObject(context.Background(), "benchbucket", key,
 					bytes.NewReader(data), sz.size, nil)
 				if err != nil {
 					b.Fatal(err)
@@ -611,7 +612,7 @@ func BenchmarkNativePutObjectSkipETag(b *testing.B) {
 			i := 0
 			for b.Loop() {
 				key := fmt.Sprintf("obj-put-skipetag-%d", i)
-				_, err := env.client.PutObject("benchbucket", key,
+				_, err := env.client.PutObject(context.Background(), "benchbucket", key,
 					bytes.NewReader(data), sz.size, &client.PutOptions{SkipETag: true})
 				if err != nil {
 					b.Fatal(err)
@@ -628,7 +629,7 @@ func BenchmarkNativeGetObject(b *testing.B) {
 	for _, sz := range objectSizes {
 		data := makeData(sz.size)
 		key := "obj-get-" + sz.name
-		_, err := env.client.PutObject("benchbucket", key,
+		_, err := env.client.PutObject(context.Background(), "benchbucket", key,
 			bytes.NewReader(data), sz.size, nil)
 		if err != nil {
 			b.Fatal(err)
@@ -638,7 +639,7 @@ func BenchmarkNativeGetObject(b *testing.B) {
 			b.SetBytes(sz.size)
 			b.ResetTimer()
 			for b.Loop() {
-				result, err := env.client.GetObject("benchbucket", key)
+				result, err := env.client.GetObject(context.Background(), "benchbucket", key)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -653,7 +654,7 @@ func BenchmarkNativeHeadObject(b *testing.B) {
 	env := setupNativeBench(b)
 
 	data := makeData(1 << 10)
-	_, err := env.client.PutObject("benchbucket", "obj-head",
+	_, err := env.client.PutObject(context.Background(), "benchbucket", "obj-head",
 		bytes.NewReader(data), int64(len(data)), nil)
 	if err != nil {
 		b.Fatal(err)
@@ -661,7 +662,7 @@ func BenchmarkNativeHeadObject(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		_, err := env.client.HeadObject("benchbucket", "obj-head")
+		_, err := env.client.HeadObject(context.Background(), "benchbucket", "obj-head")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -678,14 +679,14 @@ func BenchmarkNativeDeleteObject(b *testing.B) {
 	for b.Loop() {
 		b.StopTimer()
 		key := fmt.Sprintf("obj-del-%d", i)
-		_, err := env.client.PutObject("benchbucket", key,
+		_, err := env.client.PutObject(context.Background(), "benchbucket", key,
 			bytes.NewReader(data), int64(len(data)), nil)
 		if err != nil {
 			b.Fatal(err)
 		}
 		b.StartTimer()
 
-		if err := env.client.DeleteObject("benchbucket", key); err != nil {
+		if err := env.client.DeleteObject(context.Background(), "benchbucket", key); err != nil {
 			b.Fatal(err)
 		}
 		i++
@@ -697,7 +698,7 @@ func BenchmarkNativeListObjects(b *testing.B) {
 
 	for i := range 100 {
 		key := fmt.Sprintf("list-obj-%03d", i)
-		_, err := env.client.PutObject("benchbucket", key,
+		_, err := env.client.PutObject(context.Background(), "benchbucket", key,
 			strings.NewReader("x"), 1, nil)
 		if err != nil {
 			b.Fatal(err)
@@ -706,7 +707,7 @@ func BenchmarkNativeListObjects(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		_, err := env.client.ListObjects("benchbucket", nil)
+		_, err := env.client.ListObjects(context.Background(), "benchbucket", nil)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -729,14 +730,14 @@ func BenchmarkNativeMultipartUpload(b *testing.B) {
 	for b.Loop() {
 		key := fmt.Sprintf("mp-obj-%d", i)
 
-		uploadID, err := env.client.CreateMultipartUpload("benchbucket", key, nil)
+		uploadID, err := env.client.CreateMultipartUpload(context.Background(), "benchbucket", key, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
 
 		cparts := make([]client.CompletePart, numParts)
 		for p := range numParts {
-			etag, err := env.client.UploadPart("benchbucket", key, uploadID, p+1,
+			etag, err := env.client.UploadPart(context.Background(), "benchbucket", key, uploadID, p+1,
 				bytes.NewReader(parts[p]), partSize)
 			if err != nil {
 				b.Fatal(err)
@@ -744,7 +745,7 @@ func BenchmarkNativeMultipartUpload(b *testing.B) {
 			cparts[p] = client.CompletePart{PartNumber: p + 1, ETag: etag}
 		}
 
-		if _, err := env.client.CompleteMultipartUpload("benchbucket", key, uploadID, cparts); err != nil {
+		if _, err := env.client.CompleteMultipartUpload(context.Background(), "benchbucket", key, uploadID, cparts); err != nil {
 			b.Fatal(err)
 		}
 		i++
@@ -766,7 +767,7 @@ func BenchmarkNativePutObjectConcurrent(b *testing.B) {
 				// Create per-goroutine clients so connections don't serialize
 				clients := make([]*client.Client, conc)
 				for i := range conc {
-					c, err := client.Dial(env.addr, env.tokenID, env.secret, 2)
+					c, err := client.Dial(context.Background(), env.addr, env.tokenID, env.secret, client.WithPoolSize(2))
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -796,7 +797,7 @@ func BenchmarkNativePutObjectConcurrent(b *testing.B) {
 						for range iterCh {
 							n := counter.Add(1)
 							key := fmt.Sprintf("conc-put-%d", n)
-							_, err := c.PutObject("benchbucket", key,
+							_, err := c.PutObject(context.Background(), "benchbucket", key,
 								bytes.NewReader(data), sz.size, nil)
 							if err != nil {
 								b.Error(err)
@@ -819,7 +820,7 @@ func BenchmarkNativeGetObjectConcurrent(b *testing.B) {
 		data := makeData(sz.size)
 		for j := range 16 {
 			key := fmt.Sprintf("conc-get-%s-%d", sz.name, j)
-			_, err := env.client.PutObject("benchbucket", key,
+			_, err := env.client.PutObject(context.Background(), "benchbucket", key,
 				bytes.NewReader(data), sz.size, nil)
 			if err != nil {
 				b.Fatal(err)
@@ -831,7 +832,7 @@ func BenchmarkNativeGetObjectConcurrent(b *testing.B) {
 				b.SetBytes(sz.size)
 				clients := make([]*client.Client, conc)
 				for i := range conc {
-					c, err := client.Dial(env.addr, env.tokenID, env.secret, 2)
+					c, err := client.Dial(context.Background(), env.addr, env.tokenID, env.secret, client.WithPoolSize(2))
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -859,7 +860,7 @@ func BenchmarkNativeGetObjectConcurrent(b *testing.B) {
 						for range iterCh {
 							n := counter.Add(1)
 							key := fmt.Sprintf("conc-get-%s-%d", sz.name, n%16)
-							result, err := c.GetObject("benchbucket", key)
+							result, err := c.GetObject(context.Background(), "benchbucket", key)
 							if err != nil {
 								b.Error(err)
 								return

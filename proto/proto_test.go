@@ -2,6 +2,7 @@ package proto_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -107,7 +108,7 @@ func setup(t *testing.T) *testEnv {
 
 func dial(t *testing.T, env *testEnv) *client.Client {
 	t.Helper()
-	c, err := client.Dial(env.addr, env.tokenID, env.secret, 2)
+	c, err := client.Dial(context.Background(), env.addr, env.tokenID, env.secret, client.WithPoolSize(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +120,7 @@ func TestPing(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -129,7 +130,7 @@ func TestBucketLifecycle(t *testing.T) {
 	c := dial(t, env)
 
 	// Create
-	info, err := c.CreateBucket("test-bucket")
+	info, err := c.CreateBucket(context.Background(), "test-bucket")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +139,7 @@ func TestBucketLifecycle(t *testing.T) {
 	}
 
 	// Head
-	info, err = c.HeadBucket("test-bucket")
+	info, err = c.HeadBucket(context.Background(), "test-bucket")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,13 +148,13 @@ func TestBucketLifecycle(t *testing.T) {
 	}
 
 	// Duplicate
-	_, err = c.CreateBucket("test-bucket")
+	_, err = c.CreateBucket(context.Background(), "test-bucket")
 	if err == nil {
 		t.Fatal("expected error for duplicate bucket")
 	}
 
 	// List
-	buckets, err := c.ListBuckets()
+	buckets, err := c.ListBuckets(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,12 +163,12 @@ func TestBucketLifecycle(t *testing.T) {
 	}
 
 	// Delete
-	if err := c.DeleteBucket("test-bucket"); err != nil {
+	if err := c.DeleteBucket(context.Background(), "test-bucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Head after delete
-	_, err = c.HeadBucket("test-bucket")
+	_, err = c.HeadBucket(context.Background(), "test-bucket")
 	if err == nil {
 		t.Fatal("expected error for deleted bucket")
 	}
@@ -177,13 +178,13 @@ func TestObjectLifecycle(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("mybucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "mybucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Put
 	content := "hello native protocol!"
-	result, err := c.PutObject("mybucket", "greeting.txt",
+	result, err := c.PutObject(context.Background(), "mybucket", "greeting.txt",
 		strings.NewReader(content), int64(len(content)),
 		&client.PutOptions{ContentType: "text/plain"})
 	if err != nil {
@@ -197,7 +198,7 @@ func TestObjectLifecycle(t *testing.T) {
 	}
 
 	// Get
-	getResult, err := c.GetObject("mybucket", "greeting.txt")
+	getResult, err := c.GetObject(context.Background(), "mybucket", "greeting.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +212,7 @@ func TestObjectLifecycle(t *testing.T) {
 	}
 
 	// Head
-	info, err := c.HeadObject("mybucket", "greeting.txt")
+	info, err := c.HeadObject(context.Background(), "mybucket", "greeting.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,12 +221,12 @@ func TestObjectLifecycle(t *testing.T) {
 	}
 
 	// Delete
-	if err := c.DeleteObject("mybucket", "greeting.txt"); err != nil {
+	if err := c.DeleteObject(context.Background(), "mybucket", "greeting.txt"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Get deleted
-	_, err = c.GetObject("mybucket", "greeting.txt")
+	_, err = c.GetObject(context.Background(), "mybucket", "greeting.txt")
 	if err == nil {
 		t.Fatal("expected error for deleted object")
 	}
@@ -235,21 +236,21 @@ func TestObjectOverwrite(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("mybucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "mybucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	v1 := "version1"
-	if _, err := c.PutObject("mybucket", "data.bin", strings.NewReader(v1), int64(len(v1)), nil); err != nil {
+	if _, err := c.PutObject(context.Background(), "mybucket", "data.bin", strings.NewReader(v1), int64(len(v1)), nil); err != nil {
 		t.Fatal(err)
 	}
 
 	v2 := "version2"
-	if _, err := c.PutObject("mybucket", "data.bin", strings.NewReader(v2), int64(len(v2)), nil); err != nil {
+	if _, err := c.PutObject(context.Background(), "mybucket", "data.bin", strings.NewReader(v2), int64(len(v2)), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := c.GetObject("mybucket", "data.bin")
+	result, err := c.GetObject(context.Background(), "mybucket", "data.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +265,7 @@ func TestLargeObject(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("bigbucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "bigbucket"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -273,12 +274,12 @@ func TestLargeObject(t *testing.T) {
 	data := make([]byte, size)
 	rand.Read(data)
 
-	_, err := c.PutObject("bigbucket", "large.bin", bytes.NewReader(data), size, nil)
+	_, err := c.PutObject(context.Background(), "bigbucket", "large.bin", bytes.NewReader(data), size, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := c.GetObject("bigbucket", "large.bin")
+	result, err := c.GetObject(context.Background(), "bigbucket", "large.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,18 +295,18 @@ func TestListObjects(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("listbucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "listbucket"); err != nil {
 		t.Fatal(err)
 	}
 
 	for _, key := range []string{"photos/a.jpg", "photos/b.jpg", "docs/readme.md", "root.txt"} {
-		if _, err := c.PutObject("listbucket", key, strings.NewReader("data"), 4, nil); err != nil {
+		if _, err := c.PutObject(context.Background(), "listbucket", key, strings.NewReader("data"), 4, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// List all
-	result, err := c.ListObjects("listbucket", nil)
+	result, err := c.ListObjects(context.Background(), "listbucket", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +315,7 @@ func TestListObjects(t *testing.T) {
 	}
 
 	// List with prefix
-	result, err = c.ListObjects("listbucket", &client.ListOptions{Prefix: "photos/"})
+	result, err = c.ListObjects(context.Background(), "listbucket", &client.ListOptions{Prefix: "photos/"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +324,7 @@ func TestListObjects(t *testing.T) {
 	}
 
 	// List with delimiter
-	result, err = c.ListObjects("listbucket", &client.ListOptions{Delimiter: "/"})
+	result, err = c.ListObjects(context.Background(), "listbucket", &client.ListOptions{Delimiter: "/"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,14 +340,14 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("notempty"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "notempty"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.PutObject("notempty", "file.txt", strings.NewReader("data"), 4, nil); err != nil {
+	if _, err := c.PutObject(context.Background(), "notempty", "file.txt", strings.NewReader("data"), 4, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	err := c.DeleteBucket("notempty")
+	err := c.DeleteBucket(context.Background(), "notempty")
 	if err == nil {
 		t.Fatal("expected error deleting non-empty bucket")
 	}
@@ -362,7 +363,7 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 func TestAuthFailure(t *testing.T) {
 	env := setup(t)
 
-	_, err := client.Dial(env.addr, "bad-token", "bad-secret", 1)
+	_, err := client.Dial(context.Background(), env.addr, "bad-token", "bad-secret", client.WithPoolSize(1))
 	if err == nil {
 		t.Fatal("expected auth failure")
 	}
@@ -375,11 +376,11 @@ func TestUserMetadata(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("metabucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "metabucket"); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := c.PutObject("metabucket", "file.txt", strings.NewReader("data"), 4,
+	_, err := c.PutObject(context.Background(), "metabucket", "file.txt", strings.NewReader("data"), 4,
 		&client.PutOptions{
 			Metadata: map[string]string{"x-custom": "value123"},
 		})
@@ -387,7 +388,7 @@ func TestUserMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	info, err := c.HeadObject("metabucket", "file.txt")
+	info, err := c.HeadObject(context.Background(), "metabucket", "file.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +401,7 @@ func TestConnectionReuse(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("reuse"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "reuse"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -408,13 +409,13 @@ func TestConnectionReuse(t *testing.T) {
 	for i := range 10 {
 		data := "iteration"
 		key := "obj-" + string(rune('0'+i))
-		_, err := c.PutObject("reuse", key, strings.NewReader(data), int64(len(data)), nil)
+		_, err := c.PutObject(context.Background(), "reuse", key, strings.NewReader(data), int64(len(data)), nil)
 		if err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
 
-	result, err := c.ListObjects("reuse", nil)
+	result, err := c.ListObjects(context.Background(), "reuse", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,37 +442,37 @@ func TestMultipartRejectsWrongBucketOrKeyAndKeepsConnection(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("owner"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "owner"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.CreateBucket("other"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "other"); err != nil {
 		t.Fatal(err)
 	}
 
-	uploadID, err := c.CreateMultipartUpload("owner", "image.bin", nil)
+	uploadID, err := c.CreateMultipartUpload(context.Background(), "owner", "image.bin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = c.UploadPart("other", "image.bin", uploadID, 1, strings.NewReader("data"), 4)
+	_, err = c.UploadPart(context.Background(), "other", "image.bin", uploadID, 1, strings.NewReader("data"), 4)
 	requireClientErrorCode(t, err, "NoSuchUpload")
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(context.Background()); err != nil {
 		t.Fatalf("connection should remain reusable after rejected upload part: %v", err)
 	}
 
-	_, err = c.UploadPart("owner", "other.bin", uploadID, 1, strings.NewReader("data"), 4)
+	_, err = c.UploadPart(context.Background(), "owner", "other.bin", uploadID, 1, strings.NewReader("data"), 4)
 	requireClientErrorCode(t, err, "NoSuchUpload")
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(context.Background()); err != nil {
 		t.Fatalf("connection should remain reusable after rejected upload part: %v", err)
 	}
 
-	if _, err := c.ListParts("other", "image.bin", uploadID); err != nil {
+	if _, err := c.ListParts(context.Background(), "other", "image.bin", uploadID); err != nil {
 		requireClientErrorCode(t, err, "NoSuchUpload")
 	} else {
 		t.Fatal("expected wrong-bucket list parts to fail")
 	}
 
-	parts, err := c.ListParts("owner", "image.bin", uploadID)
+	parts, err := c.ListParts(context.Background(), "owner", "image.bin", uploadID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +485,7 @@ func TestMultipartHonorsBucketPolicyDeny(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("owner"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "owner"); err != nil {
 		t.Fatal(err)
 	}
 	policy := auth.BucketPolicy{
@@ -504,18 +505,18 @@ func TestMultipartHonorsBucketPolicyDeny(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	uploadID, err := c.CreateMultipartUpload("owner", "private/image.bin", nil)
+	uploadID, err := c.CreateMultipartUpload(context.Background(), "owner", "private/image.bin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = c.UploadPart("owner", "private/image.bin", uploadID, 1, strings.NewReader("data"), 4)
+	_, err = c.UploadPart(context.Background(), "owner", "private/image.bin", uploadID, 1, strings.NewReader("data"), 4)
 	requireClientErrorCode(t, err, "AccessDenied")
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(context.Background()); err != nil {
 		t.Fatalf("connection should remain reusable after policy-denied upload part: %v", err)
 	}
 
-	parts, err := c.ListParts("owner", "private/image.bin", uploadID)
+	parts, err := c.ListParts(context.Background(), "owner", "private/image.bin", uploadID)
 	requireClientErrorCode(t, err, "AccessDenied")
 	if parts != nil {
 		t.Fatalf("policy-denied list should not return parts: %v", parts)
@@ -526,14 +527,14 @@ func TestMultipartCompleteFailureLeavesUploadRetryable(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("owner"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "owner"); err != nil {
 		t.Fatal(err)
 	}
 	bucket, err := env.db.GetBucket("owner")
 	if err != nil {
 		t.Fatal(err)
 	}
-	uploadID, err := c.CreateMultipartUpload("owner", "image.bin", nil)
+	uploadID, err := c.CreateMultipartUpload(context.Background(), "owner", "image.bin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +548,7 @@ func TestMultipartCompleteFailureLeavesUploadRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = c.CompleteMultipartUpload("owner", "image.bin", uploadID, []client.CompletePart{{PartNumber: 1}})
+	_, err = c.CompleteMultipartUpload(context.Background(), "owner", "image.bin", uploadID, []client.CompletePart{{PartNumber: 1}})
 	requireClientErrorCode(t, err, "InternalError")
 
 	upload, err := env.db.GetMultipartUpload(uploadID)
@@ -572,10 +573,10 @@ func TestUploadPartStoreFailureKeepsConnection(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("mpbucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "mpbucket"); err != nil {
 		t.Fatal(err)
 	}
-	uploadID, err := c.CreateMultipartUpload("mpbucket", "image.bin", nil)
+	uploadID, err := c.CreateMultipartUpload(context.Background(), "mpbucket", "image.bin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,11 +588,11 @@ func TestUploadPartStoreFailureKeepsConnection(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(tmpDir, 0o755) })
 
 	body := "payload that must be drained"
-	_, err = c.UploadPart("mpbucket", "image.bin", uploadID, 1, strings.NewReader(body), int64(len(body)))
+	_, err = c.UploadPart(context.Background(), "mpbucket", "image.bin", uploadID, 1, strings.NewReader(body), int64(len(body)))
 	requireClientErrorCode(t, err, "InternalError")
 
 	// Same connection must still be correctly framed.
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(context.Background()); err != nil {
 		t.Fatalf("connection desynced after store failure: %v", err)
 	}
 
@@ -599,7 +600,7 @@ func TestUploadPartStoreFailureKeepsConnection(t *testing.T) {
 	if err := os.Chmod(tmpDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.UploadPart("mpbucket", "image.bin", uploadID, 1, strings.NewReader(body), int64(len(body))); err != nil {
+	if _, err := c.UploadPart(context.Background(), "mpbucket", "image.bin", uploadID, 1, strings.NewReader(body), int64(len(body))); err != nil {
 		t.Fatalf("upload after store recovery: %v", err)
 	}
 }
@@ -647,10 +648,10 @@ func TestUploadPartMetaFailureAfterBodyConsumedKeepsConnection(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if _, err := c.CreateBucket("mpbucket"); err != nil {
+	if _, err := c.CreateBucket(context.Background(), "mpbucket"); err != nil {
 		t.Fatal(err)
 	}
-	uploadID, err := c.CreateMultipartUpload("mpbucket", "image.bin", nil)
+	uploadID, err := c.CreateMultipartUpload(context.Background(), "mpbucket", "image.bin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,11 +680,11 @@ func TestUploadPartMetaFailureAfterBodyConsumedKeepsConnection(t *testing.T) {
 	}
 
 	size := int64(len(body.first) + len(body.rest))
-	_, err = c.UploadPart("mpbucket", "image.bin", uploadID, 1, body, size)
+	_, err = c.UploadPart(context.Background(), "mpbucket", "image.bin", uploadID, 1, body, size)
 	requireClientErrorCode(t, err, "InternalError")
 
 	// The error response was delivered and the connection stays usable.
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(context.Background()); err != nil {
 		t.Fatalf("connection desynced after meta failure: %v", err)
 	}
 }
@@ -695,7 +696,7 @@ func TestShutdownWithHungConnection(t *testing.T) {
 	env := setup(t)
 	c := dial(t, env)
 
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 

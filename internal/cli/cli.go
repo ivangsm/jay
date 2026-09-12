@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/ivangsm/jay/internal/version"
 )
@@ -20,6 +23,19 @@ type Options struct {
 
 	Stdout io.Writer
 	Stderr io.Writer
+
+	// ctx bounds every network operation the command makes. Run installs one
+	// that ends on SIGINT/SIGTERM, so Ctrl-C aborts an in-flight transfer
+	// instead of waiting for the socket deadline; tests leave it nil and get
+	// context.Background.
+	ctx context.Context
+}
+
+func (o Options) context() context.Context {
+	if o.ctx == nil {
+		return context.Background()
+	}
+	return o.ctx
 }
 
 func (o Options) out() io.Writer {
@@ -74,6 +90,10 @@ func Run(opts Options, args []string) int {
 		usage(opts.errOut())
 		return 2
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	opts.ctx = ctx
 
 	if err := cmd(opts, args[1:]); err != nil {
 		if errors.Is(err, errUsage) {

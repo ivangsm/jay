@@ -35,7 +35,7 @@ func runBucket(opts Options, args []string) error {
 		return listBuckets(opts, c)
 	case "mb":
 		return oneBucket(rest, "mb", func(name string) error {
-			if _, err := c.CreateBucket(name); err != nil {
+			if _, err := c.CreateBucket(opts.context(), name); err != nil {
 				return err
 			}
 			printf(opts.out(), "created %s%s\n", Scheme, name)
@@ -43,7 +43,7 @@ func runBucket(opts Options, args []string) error {
 		})
 	case "rb":
 		return oneBucket(rest, "rb", func(name string) error {
-			if err := c.DeleteBucket(name); err != nil {
+			if err := c.DeleteBucket(opts.context(), name); err != nil {
 				return err
 			}
 			printf(opts.out(), "deleted %s%s\n", Scheme, name)
@@ -73,7 +73,7 @@ func oneBucket(args []string, verb string, do func(string) error) error {
 }
 
 func listBuckets(opts Options, c *client.Client) error {
-	buckets, err := c.ListBuckets()
+	buckets, err := c.ListBuckets(opts.context())
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -134,9 +135,9 @@ func walkLocal(root string) ([]localFile, error) {
 
 // remoteIndex maps each key under a prefix to its stored SHA-256. The prefix is
 // normalized to a directory so a sibling like "assets2" is never pulled in.
-func remoteIndex(c *client.Client, loc Location) (map[string]string, error) {
+func remoteIndex(ctx context.Context, c *client.Client, loc Location) (map[string]string, error) {
 	index := map[string]string{}
-	err := walkObjects(c, loc.Bucket, DirPrefix(loc.Key), "", func(page *client.ListResult) error {
+	err := walkObjects(ctx, c, loc.Bucket, DirPrefix(loc.Key), "", func(page *client.ListResult) error {
 		for _, o := range page.Objects {
 			index[o.Key] = o.ChecksumSHA256
 		}
@@ -160,7 +161,7 @@ func mirrorUp(opts Options, c *client.Client, src, dst Location, mode transferMo
 
 	var index map[string]string
 	if mode == modeSync {
-		if index, err = remoteIndex(c, dst); err != nil {
+		if index, err = remoteIndex(opts.context(), c, dst); err != nil {
 			return err
 		}
 	}
@@ -183,7 +184,7 @@ func mirrorUp(opts Options, c *client.Client, src, dst Location, mode transferMo
 		}
 
 		target := Location{Remote: true, Bucket: dst.Bucket, Key: key}
-		if _, err := upload(c, f.abs, target, progress); err != nil {
+		if _, err := upload(opts.context(), c, f.abs, target, progress); err != nil {
 			tally.failed.Add(1)
 			printf(opts.errOut(), "upload %s: %v\n", f.abs, err)
 			return
@@ -197,7 +198,7 @@ func mirrorUp(opts Options, c *client.Client, src, dst Location, mode transferMo
 }
 
 func mirrorDown(opts Options, c *client.Client, src, dst Location, mode transferMode, parallel int, progress io.Writer) error {
-	index, err := remoteIndex(c, src)
+	index, err := remoteIndex(opts.context(), c, src)
 	if err != nil {
 		return err
 	}
@@ -236,7 +237,7 @@ func mirrorDown(opts Options, c *client.Client, src, dst Location, mode transfer
 		}
 
 		object := Location{Remote: true, Bucket: src.Bucket, Key: key}
-		written, err := download(c, object, target, progress)
+		written, err := download(opts.context(), c, object, target, progress)
 		if err != nil {
 			tally.failed.Add(1)
 			printf(opts.errOut(), "download %s: %v\n", object, err)

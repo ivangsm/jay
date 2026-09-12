@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,11 +44,15 @@ func newFlagSet(name string, opts Options) *flag.FlagSet {
 
 // dial opens a pooled connection to the native protocol.
 func (o Options) dial() (*client.Client, error) {
+	return o.dialContext(o.context())
+}
+
+func (o Options) dialContext(ctx context.Context) (*client.Client, error) {
 	if o.TokenID == "" || o.TokenSecret == "" {
 		return nil, errNoCredentials
 	}
 	addr := normalizeAddr(o.Addr)
-	c, err := client.Dial(addr, o.TokenID, o.TokenSecret, poolSize)
+	c, err := client.Dial(ctx, addr, o.TokenID, o.TokenSecret, client.WithPoolSize(poolSize))
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", addr, err)
 	}
