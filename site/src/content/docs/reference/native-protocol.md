@@ -149,6 +149,8 @@ Requests:
 | GetObject, HeadObject, DeleteObject | `bucket`, `key` |
 | PutObject | `bucket`, `key`, `content_type`, `metadata` map, `skip_etag` bool † |
 | ListObjects | `bucket`, `prefix`, `delimiter`, `start_after`, `max_keys` i32 |
+| GetObjectRange ‡ | `bucket`, `key`, `offset` i64, `length` i64 |
+| CopyObject ‡ | `src_bucket`, `src_key`, `dst_bucket`, `dst_key` |
 | CreateMultipartUpload | `bucket`, `key`, `content_type` |
 | UploadPart | `bucket`, `key`, `upload_id`, `part_number` i32 |
 | CompleteMultipartUpload | `bucket`, `key`, `upload_id`, `part_numbers` int list |
@@ -160,7 +162,8 @@ Responses:
 | Message | Fields, in order |
 |---|---|
 | PutObject, UploadPart | `etag`, `checksum` |
-| GetObject, HeadObject | `content_type`, `size` i64, `etag`, `checksum`, `last_modified`, `metadata` map |
+| GetObject, HeadObject, GetObjectRange ‡ | `content_type`, `size` i64, `etag`, `checksum`, `last_modified`, `metadata` map |
+| CopyObject ‡ | `etag`, `checksum`, `size` i64, `last_modified` |
 | ListObjects | `[2B count]` × (`key`, `size` i64, `etag`, `checksum`, `last_modified`, `content_type`), `common_prefixes` string list, `is_truncated` bool, `next_start_after` |
 | ListBuckets | `[2B count]` × (`name`, `created_at`) |
 | HeadBucket | `bucket_id`, `name`, `created_at`, `visibility` |
@@ -179,6 +182,24 @@ after `metadata` decodes it as `false`. See
 [Compatibility](#compatibility) for why that direction is safe and the other
 one is not.
 
+‡ `GetObjectRange` and `CopyObject` arrived after v1 shipped, as **new
+opcodes** — the one compatible way to extend the protocol. A server that does
+not know them answers `UnknownOp`; their layouts are as frozen as the others.
+
+For `GetObjectRange`, `length <= 0` means "to the end of the object", and a
+length past the end is clamped. The response metadata describes the **whole**
+object (`size` is the full size) and the frame's `data_len` is the number of
+bytes served. A range that does not intersect the object — `offset` at or past
+the end, or any range on an empty object — is `BadRequest` / `InvalidRange`
+with no body: the counterpart of HTTP 416.
+
+`CopyObject` copies on the server; the bytes never cross the wire. Content type
+and user metadata carry over from the source. The token needs `object:get` on
+the source and `object:put` on the destination, and a bucket policy that denies
+reading the source denies the copy. A not-found or access error carries the
+side it is about (`source:` / `destination:`) at the front of its `message`,
+because the error model has no resource field; the `code` is the usual one.
+
 ## Opcodes
 
 | Code | Operation |
@@ -192,6 +213,8 @@ one is not.
 | `0x12` | HeadObject |
 | `0x13` | DeleteObject |
 | `0x14` | ListObjects |
+| `0x15` | GetObjectRange |
+| `0x16` | CopyObject |
 | `0x20` | CreateMultipartUpload |
 | `0x21` | UploadPart |
 | `0x22` | CompleteMultipartUpload |
@@ -229,6 +252,7 @@ These codes are part of v1. A client may branch on them:
 | `InternalError` | Internal | — |
 | `InvalidArgument` | Bad request | Undecodable metadata, or a value out of range |
 | `InvalidBucketName` | Bad request | — |
+| `InvalidRange` | Bad request | The range does not intersect the object (HTTP 416) |
 | `NoSuchBucket` | Not found | — |
 | `NoSuchKey` | Not found | — |
 | `NoSuchUpload` | Not found | Unknown or expired multipart upload |
@@ -307,8 +331,10 @@ The rules, in the order they matter:
 
 1. **Adding an opcode is compatible.** A server that does not know an opcode
    answers `BadRequest` / `UnknownOp` and **keeps the connection open**. That
-   is the supported path for new operations — Range, Copy and Presign will
-   arrive this way, without touching the version.
+   is the supported path for new operations, and the one `GetObjectRange`
+   (`0x15`) and `CopyObject` (`0x16`) took, without touching the version.
+   Presigned URLs needed no opcode at all: the SigV4 form is an HMAC over the
+   token secret the client already holds, so the client signs locally.
 2. **Changing the layout of an existing message is not compatible**, in any
    direction, including appending a field. The encoding is positional, so a
    peer that reads one field too many consumes the next message's bytes and a

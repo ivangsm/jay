@@ -38,7 +38,7 @@ admin and native listeners on loopback.
 ## go install
 
 ```bash
-go install github.com/ivangsm/jay@latest
+go install github.com/ivangsm/jay/cmd/jay@latest
 go install github.com/ivangsm/jay/cmd/jay-admin@latest
 go install github.com/ivangsm/jay/cmd/jay-config@latest
 go install github.com/ivangsm/jay/cmd/jay-rekey@latest
@@ -57,7 +57,7 @@ behind the readiness probe, and it does not exist there.
 
 ```bash
 git clone https://github.com/ivangsm/jay.git && cd jay
-go build -o jay .
+go build -o jay ./cmd/jay
 ```
 
 Go 1.27 or newer.

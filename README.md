@@ -19,6 +19,9 @@ Two protocols share the same storage and the same authorization layer: an
 **binary protocol** with a Go client for callers that would rather not pay for
 HTTP framing, XML and a per-request signature.
 
+It is also a **Go library**: `jay.Open(dir)` gives a program the same engine
+in-process, with no listener and no token.
+
 **📖 Documentation: <https://ivangsm.github.io/jay/>**
 
 ---
@@ -35,13 +38,13 @@ docker run -d --name jay \
   ghcr.io/ivangsm/jay:latest
 
 # Go
-go install github.com/ivangsm/jay@latest
+go install github.com/ivangsm/jay/cmd/jay@latest
 go install github.com/ivangsm/jay/cmd/jay-admin@latest
 go install github.com/ivangsm/jay/cmd/jay-config@latest
 go install github.com/ivangsm/jay/cmd/jay-rekey@latest
 
 # Source
-git clone https://github.com/ivangsm/jay.git && cd jay && go build -o jay .
+git clone https://github.com/ivangsm/jay.git && cd jay && go build -o jay ./cmd/jay
 ```
 
 Prebuilt archives for `linux/amd64`, `linux/arm64` and `darwin/arm64` are on the
@@ -75,6 +78,23 @@ key and the secret as the secret key.
 
 Step by step: [Quickstart](https://ivangsm.github.io/jay/quickstart/).
 
+## Embedding
+
+```go
+import "github.com/ivangsm/jay"
+
+s, err := jay.Open("/var/lib/myapp/objects")
+defer s.Close()
+
+_ = s.CreateBucket(ctx, "photos")
+_, err = s.Put(ctx, "photos", "cat.jpg", file, &jay.PutOptions{ContentType: "image/jpeg"})
+info, body, err := s.Get(ctx, "photos", "cat.jpg")
+```
+
+Same bbolt metadata, atomic writes, checksums, recovery and scrubbing as the
+server; none of the accounts, tokens or policies. A directory written by one is
+valid for the other. [The guide](https://ivangsm.github.io/jay/guides/embedded/).
+
 ## Ports
 
 | Port | Purpose | Exposure |
@@ -94,6 +114,7 @@ Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
 | [Authentication](https://ivangsm.github.io/jay/reference/authentication/) | Accounts, tokens, scopes, SigV4, presigned URLs, bucket policies |
 | [S3 compatibility](https://ivangsm.github.io/jay/reference/s3-compatibility/) | The complete operation list and what answers `501` |
 | [Native protocol](https://ivangsm.github.io/jay/reference/native-protocol/) | Frame layout, opcodes, the Go client |
+| [Embedding Jay in Go](https://ivangsm.github.io/jay/guides/embedded/) | `jay.Open`: the engine as a library, without a listener |
 | [Deploying Jay](https://ivangsm.github.io/jay/guides/deployment/) | TLS, reverse proxies, disk, health probes |
 | [Backup and restore](https://ivangsm.github.io/jay/guides/backup-and-restore/) | **Jay backs up metadata, not your objects.** What to copy, and the restore procedure |
 | [Performance](https://ivangsm.github.io/jay/internals/performance/) | Measured benchmarks and the design behind them |

@@ -43,6 +43,7 @@ export default defineConfig({
 					items: [
 						{ label: 'The S3 API', slug: 'guides/s3-api' },
 						{ label: 'The native protocol', slug: 'guides/native-protocol' },
+						{ label: 'Embedding Jay in Go', slug: 'guides/embedded' },
 						{ label: 'Command-line client', slug: 'guides/cli' },
 						{ label: 'Deploying Jay', slug: 'guides/deployment' },
 						{ label: 'Backup and restore', slug: 'guides/backup-and-restore' },
