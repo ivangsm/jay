@@ -105,7 +105,7 @@ func deviceOf(path string) (uint64, error) {
 	if err := syscall.Stat(path, &st); err != nil {
 		return 0, fmt.Errorf("stat %s: %w", path, err)
 	}
-	return uint64(st.Dev), nil
+	return deviceNumber(&st), nil
 }
 
 // Run creates a consistent snapshot of the bbolt database and verifies it.

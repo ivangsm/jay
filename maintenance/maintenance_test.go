@@ -661,7 +661,7 @@ func findPathOnAnotherFilesystem(t *testing.T, ref string) string {
 		if err := syscall.Stat(candidate, &st); err != nil {
 			continue
 		}
-		if uint64(st.Dev) != uint64(refStat.Dev) {
+		if deviceNumber(&st) != deviceNumber(&refStat) {
 			return candidate
 		}
 	}
