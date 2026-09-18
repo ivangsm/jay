@@ -3,6 +3,7 @@ package proto
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -57,11 +58,11 @@ func assertWire(t *testing.T, name string, got, want []byte) {
 	}
 
 	var msg strings.Builder
-	msg.WriteString("\n=== WIRE FORMAT CHANGED: " + name + " ===\n\n")
-	msg.WriteString("want (" + itoa(len(want)) + " bytes): " + hex.EncodeToString(want) + "\n")
-	msg.WriteString("got  (" + itoa(len(got)) + " bytes): " + hex.EncodeToString(got) + "\n")
+	fmt.Fprintf(&msg, "\n=== WIRE FORMAT CHANGED: %s ===\n\n", name)
+	fmt.Fprintf(&msg, "want (%d bytes): %s\n", len(want), hex.EncodeToString(want))
+	fmt.Fprintf(&msg, "got  (%d bytes): %s\n", len(got), hex.EncodeToString(got))
 	if off := firstDiff(got, want); off >= 0 {
-		msg.WriteString("first difference at byte " + itoa(off) + "\n")
+		fmt.Fprintf(&msg, "first difference at byte %d\n", off)
 	}
 	msg.WriteString(`
 This is not a test you fix by copying the new bytes in.
@@ -103,18 +104,6 @@ func firstDiff(a, bb []byte) int {
 		return n
 	}
 	return -1
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var digits []byte
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	return string(digits)
 }
 
 // --- Handshake ---------------------------------------------------------

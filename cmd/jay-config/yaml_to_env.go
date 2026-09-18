@@ -40,7 +40,10 @@ func runYAMLToEnv(args []string, stdout, stderr io.Writer) error {
 
 	bw := bufio.NewWriter(out)
 	for _, l := range lines {
-		if _, err := bw.WriteString(l + "\n"); err != nil {
+		if _, err := bw.WriteString(l); err != nil {
+			return err
+		}
+		if err := bw.WriteByte('\n'); err != nil {
 			return err
 		}
 	}
