@@ -114,17 +114,39 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
+# The generated part of the release body: the commits since the previous tag,
+# grouped by type. It is an appendix. The part a person reads first is the
+# CHANGELOG.md section for the version, which the release workflow extracts
+# with scripts/release-notes.sh and passes as --release-header — and refuses
+# to publish without.
 changelog:
   sort: asc
+  abbrev: 7
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
+      # Scoped forms too: "^docs:" alone let "docs(site): …" through.
+      - "^docs(\\(.*\\))?:"
+      - "^test(\\(.*\\))?:"
       - "^chore\\(deps\\):"
+      - "^chore: bump version"
+  groups:
+    - title: Breaking changes
+      regexp: '^.*?(feat|fix|refactor)(\(.+\))?!:.+$'
+      order: 0
+    - title: Features
+      regexp: '^.*?feat(\(.+\))?:.+$'
+      order: 1
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))?:.+$'
+      order: 2
+    - title: Other
+      order: 999
 
 release:
   draft: false
   prerelease: auto
+  # The header is supplied per release from CHANGELOG.md (see above); nothing
+  # is hard-coded here so a release can never ship with a stale one.
   footer: |
     ## Container image
 
