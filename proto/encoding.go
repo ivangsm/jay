@@ -17,9 +17,9 @@ import (
 var errShortBuffer = errors.New("proto: short buffer")
 
 // Wire-format limits. Strings are length-prefixed with a uint16, and maps /
-// slices are count-prefixed with a uint16, so neither can exceed 65535.
-// Exceeding either used to wrap silently and produce a frame the peer would
-// decode as garbage; the Encoder now records an error instead.
+// slices are count-prefixed with a uint16, so neither can exceed 65535. The
+// Encoder records an error past either limit: a wrapped prefix is a frame the
+// peer decodes as garbage.
 const (
 	maxWireStringLen = math.MaxUint16 // 65535 bytes
 	maxWireCount     = math.MaxUint16 // 65535 elements
@@ -191,15 +191,9 @@ const (
 )
 
 // count reads a uint16 element count and validates it against the bytes that
-// are actually left, given the smallest possible encoding of one element.
-//
-// Without that check, a count was believed on sight: two bytes of hostile
-// input made the decoder allocate for 65535 elements before discovering there
-// was nothing behind them. On a ListObjects response that is 5.7 MB of
-// allocation bought with 2 bytes — an amplification of roughly 2.9 million to
-// one, reachable by any peer that can answer a request. The count still has to
-// be read to stay on the wire format; what changed is that it is no longer
-// trusted before it is spent.
+// are actually left, given the smallest possible encoding of one element. The
+// check runs before any allocation: a count believed on sight lets two hostile
+// bytes buy an allocation for 65535 elements with nothing behind them.
 //
 // minElemSize must be at least 1; every caller passes one of the minWire*
 // constants or a sum of them.
@@ -388,12 +382,10 @@ func EncodePutObjectRequest(bucket, key, contentType string, metadata map[string
 
 // DecodePutObjectRequest decodes a PutObject request.
 //
-// skipETag is trailing and optional on the wire: a request encoded by a
-// client that predates this field simply ends after metadata, and HasMore
-// reports false, so skipETag decodes to false — the same "always compute the
-// ETag" behavior every client got before this field existed. A newer client
-// talking to an older server that doesn't call this decoder's skipETag path
-// at all is equally safe: the trailing byte is just never read.
+// skipETag is trailing and optional on the wire: a request that ends after
+// metadata decodes it as false (HasMore reports false), which is the "always
+// compute the ETag" default. A server that does not know the field never reads
+// the trailing byte, so the skew is safe in both directions.
 func DecodePutObjectRequest(data []byte) (bucket, key, contentType string, metadata map[string]string, skipETag bool, err error) {
 	d := NewDecoder(data)
 	bucket = d.String()

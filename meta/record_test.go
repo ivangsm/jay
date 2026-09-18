@@ -23,14 +23,10 @@ func corruptRecord(t *testing.T, db *DB, bucket []byte, key string) {
 	}
 }
 
-// TestListRecords_CorruptRecordIsLoudNotSilent fija la decisión del refactor:
-// un registro corrupto se omite del listado (una sola fila podrida no puede
-// tumbar la operación entera), pero NUNCA en silencio — dispara el hook de
-// fallo de decodificación, que main.go apunta al contador
-// MetadataDecodeFailures del admin API.
-//
-// Antes esto era un `return nil` pelado: la lista salía "exitosa" con filas
-// de menos y no quedaba rastro en ningún lado.
+// TestListRecords_CorruptRecordIsLoudNotSilent: a corrupt record is skipped
+// from the listing (one rotten row must not fail the whole operation) but
+// fires the decode-failure hook, which main.go points at the
+// MetadataDecodeFailures counter.
 func TestListRecords_CorruptRecordIsLoudNotSilent(t *testing.T) {
 	db := openExtraTestDB(t)
 
@@ -95,9 +91,8 @@ func TestUpdateRecord_MutateErrorRollsBack(t *testing.T) {
 	}
 }
 
-// TestGetRecord_MissingBucketIsNotFound: un handle de DB sin el bbolt bucket
-// (fixture armado a mano) devuelve el error de "no encontrado", no un panic
-// por nil-deref como pasaba antes del refactor.
+// TestGetRecord_MissingBucketIsNotFound: a DB handle without the bbolt bucket
+// (hand-built fixture) returns the not-found error, not a nil-deref panic.
 func TestGetRecord_MissingBucketIsNotFound(t *testing.T) {
 	db := openExtraTestDB(t)
 	if _, err := db.getRecord[Token]([]byte("bucket-que-no-existe"), "x", ErrTokenNotFound); err != ErrTokenNotFound {

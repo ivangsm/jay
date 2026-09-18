@@ -120,10 +120,9 @@ func (s *Store) absPath(locationRef string) string {
 // other digest the caller wanted (an ETag's MD5, a client-declared CRC) has
 // already been fed by the same reader, so it can be checked here too.
 //
-// The alternative — verifying after WriteObject returns and deleting the object
-// file — leaves a real object on disk for the duration, and a crash inside that
-// window hands recovery/ an orphan to quarantine over an upload that was
-// refused. This hook exists so that window does not exist.
+// Verifying after WriteObject returns does not work: a real object would sit
+// on disk until deleted, and a crash in that window hands recovery/ an orphan
+// to quarantine over an upload that was refused.
 type WriteVerifier func(sha256Hex string, size int64) error
 
 // WriteObject streams body to a temp file, computes SHA-256, then atomically

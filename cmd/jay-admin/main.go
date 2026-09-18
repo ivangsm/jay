@@ -317,9 +317,8 @@ func presign(addr, token string, args []string) error {
 	if expires == "" {
 		expires = "3600"
 	}
-	// expires_seconds is a number on the wire. Sending it as the string the
-	// flag arrived as made the admin API answer 400 "invalid request body" on
-	// every single presign, because its decoder rejects a string for an int.
+	// expires_seconds is a number on the wire: the admin API's strict decoder
+	// answers 400 to a string where it expects an int.
 	expiresSeconds, err := strconv.Atoi(expires)
 	if err != nil || expiresSeconds <= 0 {
 		return fmt.Errorf("-expires must be a positive number of seconds, got %q", expires)

@@ -15,11 +15,9 @@ type PutOptions struct {
 
 	// SkipETag asks jay to skip computing the MD5 ETag for this upload.
 	// ChecksumSHA256 on the returned PutResult is unaffected — jay always
-	// computes that one. Only set this when nothing reads PutResult.ETag:
-	// jay's S3 HTTP API always returns a real ETag regardless of this field,
-	// since that surface's clients expect one; this only saves the native
-	// protocol's own MD5 pass, which profiling showed costs more CPU per
-	// upload than the SHA-256 checksum jay computes either way.
+	// computes that one. Only set this when nothing reads PutResult.ETag. It
+	// saves the native protocol's own MD5 pass; jay's S3 HTTP API always
+	// returns a real ETag regardless.
 	SkipETag bool
 }
 

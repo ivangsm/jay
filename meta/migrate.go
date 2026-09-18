@@ -9,11 +9,9 @@ import (
 // actually rewritten, false if it was already in binary format, missing, or
 // the bucket no longer exists.
 //
-// Designed to be called from the scrubber after a healthy checksum verify so
-// we only persist re-encoded values for records we have just validated. A
-// single write transaction per object keeps bbolt writer contention low; at
-// the scrub throttle rates (default 10% / 6h) total migration finishes in a
-// handful of cycles without a dedicated batch job.
+// Called from the scrubber after a healthy checksum verify, so re-encoded
+// values are only persisted for records just validated. One write transaction
+// per object keeps bbolt writer contention low; no dedicated batch job exists.
 //
 // Does not touch bucket statistics — the record's logical content is
 // unchanged, only its on-disk envelope.

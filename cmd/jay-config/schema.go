@@ -63,10 +63,9 @@ func specByEnvKey(key string) (fieldSpec, bool) {
 	return fieldSpec{}, false
 }
 
-// The accepted YAML shape is derived from fieldSpecs, never written twice.
-// A second hand-maintained list is what let backup.dir, min_free_bytes and
-// max_object_size sit in the server's bindings for months while yaml-to-env
-// warned "unknown YAML key" and dropped them on the floor.
+// The accepted YAML shape is derived from fieldSpecs, never written twice: a
+// second hand-maintained list drifts, and a key missing from it makes
+// yaml-to-env warn "unknown YAML key" and drop a setting the server reads.
 var (
 	topLevelKnownKeys = derivedTopLevelKeys()
 	nestedKnownKeys   = derivedNestedKeys()

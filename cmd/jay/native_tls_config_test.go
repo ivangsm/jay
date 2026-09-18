@@ -55,13 +55,9 @@ func writeTestKeyPair(t *testing.T) (certPath, keyPath string) {
 	return certPath, keyPath
 }
 
-// TestNativeTLSConfig_HalfConfiguredIsAnError is the point of the whole
-// setting. The native handshake sends "token_id:secret" in the clear, so an
-// operator who typed one of the two variables and got a running server would
-// be publishing the credential of every client that connects — while the
-// server looked, from outside, exactly like a working one.
-//
-// Failing to start is the correct outcome, not a warning and plaintext.
+// TestNativeTLSConfig_HalfConfiguredIsAnError: the native handshake sends
+// "token_id:secret" in the clear, so a half-configured pair must fail the boot,
+// never warn and serve plaintext.
 func TestNativeTLSConfig_HalfConfiguredIsAnError(t *testing.T) {
 	certPath, keyPath := writeTestKeyPair(t)
 
@@ -114,9 +110,8 @@ func TestNativeTLSConfig_BothLoads(t *testing.T) {
 	}
 }
 
-// TestNativeTLSConfig_BadPathFailsAtStartup: loading here rather than inside
-// the listener is what turns a typo into a failed boot instead of a failure on
-// the first client to connect, hours later.
+// TestNativeTLSConfig_BadPathFailsAtStartup: the pair is loaded at boot, not
+// by the listener, so a typo fails the boot instead of the first client.
 func TestNativeTLSConfig_BadPathFailsAtStartup(t *testing.T) {
 	_, err := nativeTLSConfig(Config{
 		NativeTLSCert: filepath.Join(t.TempDir(), "missing-cert.pem"),
@@ -127,10 +122,8 @@ func TestNativeTLSConfig_BadPathFailsAtStartup(t *testing.T) {
 	}
 }
 
-// TestNativeTLSConfig_DoesNotInheritS3Certificate fixes the decision behind
-// the separate variables: enabling TLS on the S3 port must not silently change
-// the native transport, which would break every client already speaking to it
-// in the clear.
+// TestNativeTLSConfig_DoesNotInheritS3Certificate: enabling TLS on the S3 port
+// must not change the native transport.
 func TestNativeTLSConfig_DoesNotInheritS3Certificate(t *testing.T) {
 	certPath, keyPath := writeTestKeyPair(t)
 

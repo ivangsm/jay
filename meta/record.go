@@ -10,36 +10,27 @@ import (
 	"github.com/ivangsm/jay/internal/jsonx"
 )
 
-// This file holds the CRUD core for bbolt's JSON records: accounts, tokens,
-// buckets, multipart uploads. There used to be roughly fifteen methods that were
-// byte-for-byte identical apart from the type and the bbolt bucket; now there is
-// one core.
-//
-// The *Tx variants below exist for the cases that need several reads inside the
-// SAME transaction — GetBucketByID, for instance, resolves the id→name reverse
-// index and then reads the record, and splitting that across two transactions
-// would lose atomicity.
+// This file holds the one CRUD core for bbolt's JSON records: accounts, tokens,
+// buckets, multipart uploads. The *Tx variants exist for the cases that need
+// several reads inside the SAME transaction — GetBucketByID resolves the
+// id→name reverse index and then reads the record, and splitting that across
+// two transactions would lose atomicity.
 
 // SetDecodeFailureHook registers a callback fired whenever a metadata record
-// fails to decode. main.go's wiring points it at the
-// contador MetadataDecodeFailures de maintenance.Metrics.
-//
-// meta cannot import maintenance — maintenance already imports meta — so the
-// dependency is inverted with a hook, exactly like tokenInvalidateHook.
-// Pasar nil lo limpia.
+// fails to decode; main.go points it at maintenance.Metrics'
+// MetadataDecodeFailures counter. meta cannot import maintenance (it imports
+// meta), so the dependency is inverted with a hook, like tokenInvalidateHook.
+// Passing nil clears it.
 func (db *DB) SetDecodeFailureHook(fn func(bucket, key string)) {
 	db.hookMu.Lock()
 	db.decodeFailureHook = fn
 	db.hookMu.Unlock()
 }
 
-// reportDecodeFailure deja constancia de un registro ilegible.
-//
-// A corrupt record is skipped — one rotten row must not take down a whole
-// listing — but NOT silently: it is logged at error level with the key and
-// se incrementa un contador expuesto en /metrics. Un jay.db degradándose tiene
-// has to be visible. This used to be a bare `return nil` that handed back a
-// "successful" listing with rows missing from it.
+// reportDecodeFailure records an unreadable record. A corrupt record is
+// skipped — one rotten row must not take down a whole listing — but never
+// silently: it is logged at error level with the key and counted in /metrics,
+// so a degrading jay.db is visible.
 func (db *DB) reportDecodeFailure(bucket []byte, key string, err error) {
 	slog.Error("meta: registro de metadata ilegible, se omite",
 		"bucket", string(bucket), "key", key, "err", err)

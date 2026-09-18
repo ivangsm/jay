@@ -1,8 +1,6 @@
 // Package ratelimit implements the token-bucket rate limiter shared between
-// the HTTP S3 API and the native TCP protocol. Both transports used to have
-// separate limiters (sliding window in proto, token bucket in api). The proto
-// side tracked a rateBurst field but never applied it. This package is the
-// single source of truth — both transports import it and burst is now real.
+// the HTTP S3 API and the native TCP protocol. Both transports import it; a
+// second limiter would be a second definition of burst.
 //
 // Keys are transport-specific: the HTTP middleware limits by "ip:<client>"
 // before authentication and by "<token_id>" after it; the proto server limits
@@ -20,8 +18,7 @@ import (
 //
 // Rate is requests per second. If Rate <= 0 the limiter is disabled (Allow
 // always returns true). Burst is the maximum token-bucket capacity; if Burst
-// <= 0 it defaults to 2 * Rate (matching the historical api/ratelimit.go
-// behaviour so operators don't see a silent capacity change).
+// <= 0 it defaults to 2 * Rate.
 type Config struct {
 	Rate  float64
 	Burst int

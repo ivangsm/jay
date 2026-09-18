@@ -147,10 +147,6 @@ func (s *Scrubber) loop() {
 	}
 }
 
-// RunIncremental checks up to maxPerRun objects per bucket, starting from
-// where the last run left off. When a bucket is fully scanned the cursor
-// wraps around. Once all buckets wrap, lastFullScan is updated.
-// Buckets are processed in parallel using a bounded worker pool.
 // bucketScrubResult is what scrubbing one bucket produced, before the results
 // of all buckets are folded together under the lock.
 type bucketScrubResult struct {

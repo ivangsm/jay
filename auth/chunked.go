@@ -11,12 +11,10 @@ import (
 // the payload arrives as `<hex-size>;chunk-signature=<sig>\r\n<data>\r\n`
 // repeated until a zero-length chunk.
 //
-// jay has no decoder for that framing. Recognising the mode and then reading
-// the body verbatim is what stored the framing AS the object: a 15-byte file
-// uploaded with `mc` became 187 bytes, the ETag and the SHA-256 were computed
-// over the corrupted bytes, and the scrubber therefore certified them healthy
-// forever. Until a decoder exists, the framing has to be refused — accepting it
-// undecoded is the one option that must not stay.
+// jay has no decoder for that framing, so it is refused: reading the body
+// verbatim would store the framing AS the object, with the ETag and SHA-256
+// computed over it and the scrubber certifying it healthy.
+// TODO(PND-0188): implement the decoder and lift the refusal.
 var ErrChunkedBodyUnsupported = errors.New("aws-chunked request body is not supported")
 
 // streamingPayloadPrefix is what a client writes in x-amz-content-sha256 to
@@ -30,20 +28,11 @@ const streamingPayloadPrefix = "STREAMING-"
 // than a bool so the rejection can name what it saw.
 //
 // Three independent signals are checked, because the declared payload hash is
-// not the only one and not the most reliable:
-//
-//   - x-amz-content-sha256: STREAMING-* is what minio-go and the AWS SDKs
-//     declare, and what the signature actually covers.
-//   - x-amz-decoded-content-length exists ONLY in this mode: it carries the
-//     real body length while Content-Length counts the framing. That makes its
-//     presence proof of framing even from a client that never declares the
-//     STREAMING-* literal.
-//   - Content-Encoding: aws-chunked is what the SigV4 streaming spec tells
-//     clients to send, and it may be combined with other codings
-//     ("aws-chunked,gzip"), so the value is matched per token.
-//
-// None of the three has any other meaning in S3, so there is no request that
-// legitimately carries one and is not framed.
+// not the only one: x-amz-content-sha256 STREAMING-* (what the signature
+// covers), x-amz-decoded-content-length (exists only in this mode, even from
+// a client that never declares the literal) and Content-Encoding: aws-chunked
+// (matched per token, since it combines with other codings). None of the three
+// has any other meaning in S3.
 func ChunkedBodyIndicator(r *http.Request) string {
 	if strings.HasPrefix(
 		strings.ToUpper(strings.TrimSpace(r.Header.Get("x-amz-content-sha256"))),

@@ -18,26 +18,18 @@ import (
 	"github.com/ivangsm/jay/store"
 )
 
-// These tests assert the LISTENER, not the Config field. An empty
-// JAY_NATIVE_ADDR used to reach defaultConfig() as if it had never been set,
-// so the config looked fine while the native protocol came up on :4444 —
-// wide open, carrying token secrets in the clear. Asserting cfg.NativeAddr
-// alone would have gone green on the way to that.
+// These tests assert the LISTENER, not the Config field: cfg.NativeAddr can
+// look right while the native protocol still comes up on :4444.
 //
-// Every address here is "127.0.0.1:0" and no test dials a fixed port. That is
-// deliberate: startDataListeners calls abortStartup — os.Exit(1) — when a
-// listener fails to bind, so a test that reserves an ephemeral port and then
-// races another process for it does not fail, it kills the whole test binary
-// with no test name attached to the failure. The two facts that matter survive
-// without a fixed port: whether ListenAndServe was reached at all (its
-// shutdown function comes back nil when it was not), and what the server said
-// it did.
+// Every address is "127.0.0.1:0" and no test dials a fixed port:
+// startDataListeners calls abortStartup (os.Exit(1)) when a bind fails, so a
+// port race would kill the whole test binary with no test name attached. What
+// matters survives without a fixed port: whether ListenAndServe was reached
+// (its shutdown function is nil when it was not) and what the server logged.
 
-// syncBuffer collects log output that is written from more than one
-// goroutine. startServer logs "server listening" from the goroutine it spawns,
-// so a plain bytes.Buffer read by the test is a data race — one the race
-// detector reports without naming a failing test, because it fires after the
-// test body has moved on.
+// syncBuffer collects log output written from more than one goroutine:
+// startServer logs "server listening" from the goroutine it spawns, so a plain
+// bytes.Buffer read by the test is a data race.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer

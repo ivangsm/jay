@@ -21,12 +21,11 @@ type Bucket struct {
 	OwnerAccountID string    `json:"owner_account_id"`
 	CreatedAt      time.Time `json:"created_at"`
 	Visibility     string    `json:"visibility"` // "private", "public-read"
-	// omitzero, not omitempty: on a raw-JSON field the two diverge. v1 with
-	// omitempty omits the empty slice but writes the literal `null`; v2 with
-	// omitempty omits the `null` — which would change the bytes on disk. With
-	// omitzero the two agree across all four possible states
-	// (nil → omitido, `null` → escrito, valor → escrito, vacío-no-nil → error).
-	// Lo cubre TestJSONWireCompatV1V2.
+	// omitzero, not omitempty: on a raw-JSON field v1 and v2 diverge under
+	// omitempty (v1 writes a literal `null`, v2 omits it), which would change
+	// the bytes on disk. Under omitzero they agree on all four states: nil is
+	// omitted, `null` and a value are written, empty-non-nil is an error.
+	// Pinned by TestJSONWireCompatV1V2.
 	PolicyJSON jsontext.Value `json:"policy_json,omitzero"`
 	Status     string         `json:"status"` // "active", "deleting"
 }

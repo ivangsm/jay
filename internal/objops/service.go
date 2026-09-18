@@ -126,7 +126,7 @@ func (s *Service) authorize(
 		// Cross-account gate. checkTokenAction above answers what the token is
 		// scoped to; this answers whether its account may reach this bucket at
 		// all. A token with "*" and no BucketScope passes the former for every
-		// bucket in the store (PND-0185).
+		// bucket in the store.
 		//
 		// Only for an authenticated caller: a nil token here is the anonymous
 		// read of a public-read bucket, which the transport already gated.
@@ -223,17 +223,11 @@ type PutOptions struct {
 	Checksum *ChecksumVerifier
 
 	// SkipETag skips computing the MD5 ETag for this upload when true.
-	// ChecksumSHA256 is always computed regardless — this only drops the
-	// second, S3-only hash. Only honored when Checksum is nil: a caller that
-	// declared a checksum to verify keeps getting MD5 computed in case that
-	// verification needs it, since correctness of a check the caller
-	// explicitly asked for outranks the optimization.
+	// ChecksumSHA256 is always computed regardless. Only honored when Checksum
+	// is nil: a declared Content-MD5 may need the MD5 to verify against.
 	//
-	// The S3 HTTP handler never sets this — S3 clients expect a real ETag.
-	// It exists for the native protocol, which never promised S3 ETag
-	// semantics and, for a caller that doesn't use the ETag field at all,
-	// pays for a hash (MD5, no hardware acceleration on most CPUs) that costs
-	// more than the SHA-256 jay computes anyway for its own integrity check.
+	// The S3 HTTP handler never sets this — S3 clients expect a real ETag. It
+	// exists for the native protocol, which never promised S3 ETag semantics.
 	SkipETag bool
 }
 
@@ -250,8 +244,7 @@ type PutResult struct {
 // An upload that is over the size ceiling, or whose bytes do not hash to the
 // digest the client declared (opts.Checksum), is refused before the store
 // renames the temp file into place: nothing is written and no metadata is
-// committed. Answering 200 to a client that asked jay to verify its bytes, and
-// verifying nothing, is the defect this path exists to prevent.
+// committed.
 //
 // The caller is responsible for setting Content-Length / Content-Type headers
 // on HTTP responses — PutObject only fills *meta.Object and returns it.

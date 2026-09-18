@@ -746,13 +746,12 @@ func TestEncoder_CollectionTooLarge(t *testing.T) {
 	}
 }
 
-// DecodePutObjectRequest must accept a message encoded before skipETag
-// existed on the wire — the trailing field is optional, not required, so an
-// older client's request cannot start failing on a newer server.
+// DecodePutObjectRequest must accept a message without the trailing skipETag
+// byte: the field is optional, so a v1 client's request cannot fail on a newer
+// server.
 func TestDecodePutObjectRequest_PreSkipETagWireFormat(t *testing.T) {
-	// Hand-build a request the same way EncodePutObjectRequest did before the
-	// skipETag field was added: bucket, key, contentType, metadata, and
-	// nothing else.
+	// Hand-built without the trailing field: bucket, key, contentType,
+	// metadata, and nothing else.
 	e := proto.NewEncoder(nil)
 	e.String("bucket")
 	e.String("key")

@@ -1,8 +1,6 @@
 package api
 
-// PND-0194: `aws s3api copy-object --checksum-algorithm CRC32` answered 200 and
-// returned no checksum at all. The header reached the server, jay computed
-// nothing, and the response said the request had been served.
+// `aws s3api copy-object --checksum-algorithm X` must return the digest for X.
 //
 // Nothing here asserts a status code on its own. The check is the VALUE of the
 // digest in the response body, against numbers this file does not get from jay:

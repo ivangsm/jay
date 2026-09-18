@@ -913,8 +913,8 @@ func TestAuthorizeBucketOwnership_Owner(t *testing.T) {
 
 func TestAuthorizeBucketOwnership_OtherAccountDenied(t *testing.T) {
 	a := New(openTestDB(t))
-	// Full permissions, no bucket scope — exactly the token that used to be
-	// able to delete another tenant's bucket.
+	// Full permissions, no bucket scope: the widest token another tenant can
+	// hold.
 	tok := &meta.Token{TokenID: "t", AccountID: "acct-a", AllowedActions: []string{"*"}}
 	b := &meta.Bucket{Name: "photos", OwnerAccountID: "acct-b"}
 	if err := a.AuthorizeBucketOwnership(tok, b); !errors.Is(err, ErrAccessDenied) {
@@ -962,8 +962,7 @@ func TestAuthorizeBucketOwnership_NilArgs(t *testing.T) {
 // ---- account status revalidation -------------------------------------------
 
 // A suspended account must be rejected immediately, even though the token is
-// still in the positive auth cache (which is what used to keep a suspended
-// account working for up to authCacheTTL).
+// still in the positive auth cache for up to authCacheTTL.
 func TestValidateToken_SuspendedAccountRejectedOnCachedPath(t *testing.T) {
 	db := openTestDB(t)
 	acc, _ := seedToken(t, db, "susp-tok", "pass", []string{"*"})
@@ -1185,10 +1184,8 @@ func TestAuthenticateSigV4_UnsignedPayloadSkipsVerification(t *testing.T) {
 }
 
 // STREAMING-* means the body is aws-chunked, and jay has no decoder for that
-// framing. This test used to assert the opposite — that the mode was accepted
-// and verification skipped — which is exactly what let the chunk headers and
-// signatures be stored as the object body under a 200. The signature itself
-// still verifies here; what must fail is the payload gate.
+// framing. The signature itself still verifies here; what must fail is the
+// payload gate, so the framing is never stored as the object body.
 func TestAuthenticateSigV4_StreamingPayloadRejected(t *testing.T) {
 	db := openTestDB(t)
 	_, _ = seedToken(t, db, "pay-stream", "sigv4-secret-key", []string{"*"})

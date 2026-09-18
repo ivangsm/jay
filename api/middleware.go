@@ -55,16 +55,10 @@ func generateRequestID() string {
 // middleware installs, so all three carry the same value by construction.
 //
 // It has to be first because a middleware only ever sees the request it was
-// handed. While the ID was minted halfway down the chain (in the old
-// withRequestIDAndAuth), the logger wrapping it kept reading the ORIGINAL
-// request and logged request_id="" on every single line, while the client got
-// a real ID in its header: the one thing a request ID is for — finding the
-// request someone reports by the ID the server gave them — did not work.
-//
-// Minting it here also covers the paths that never reach the credential
-// middleware, all of which used to answer with no ID at all: the pre-auth IP
-// rate limiter's 429, the aws-chunked 501, and a presigned URL that fails to
-// verify.
+// handed: an ID minted further down the chain leaves an outer logger reading
+// the ORIGINAL request and logging request_id="". Minting it here also covers
+// the paths that never reach the credential middleware: the pre-auth IP rate
+// limiter's 429, the aws-chunked 501, and a presigned URL that fails to verify.
 //
 // The ID is always generated, never taken from an inbound header: a client
 // that could choose its own request ID could collide with someone else's or
@@ -102,11 +96,9 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: 200}
 		// Deferred, not written after next() returns: a panic below skips
-		// everything after the call, so the ONE request that broke the process
-		// was the only one with no access line at all. withRecover normally
-		// absorbs the panic before it gets here, but the defer is what makes
-		// that a belt rather than the only strap — including for a panic
-		// raised by withRecover's own re-panic path.
+		// everything after the call, and the request that panicked is the one
+		// that most needs an access line. withRecover normally absorbs the
+		// panic first; the defer also covers its own re-panic path.
 		defer func() {
 			// remote_ip is the key the pre-auth rate limiter buckets by, so
 			// without it a 429 names no one and JAY_TRUST_PROXY_HEADERS cannot
@@ -114,11 +106,9 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 			// limiter derives it, from the same function, so the log cannot
 			// disagree with the decision.
 			//
-			// The token is deliberately NOT logged: withAuth resolves it
-			// further down the chain, into a context this middleware never
-			// sees, and the only way to hoist it back out is the shared mutable
-			// pointer the request-ID fix just removed. An identity in the log is
-			// not worth re-introducing the bug the log line is here to expose.
+			// The token is NOT logged: withAuth resolves it further down the
+			// chain, into a context this middleware never sees, and hoisting
+			// it back out would take a shared mutable pointer across the chain.
 			h.log.Info("request",
 				slog.String("request_id", requestIDFromContext(r.Context())),
 				slog.String("method", r.Method),
@@ -132,30 +122,17 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// withRecover turns a panic below it into a 500 that names the request.
+// withRecover turns a panic below it into a 500 that names the request. Left
+// to net/http, a panic closes the connection with no response and writes its
+// stack as plain text to the package-level `log`. Here the client gets an S3
+// error document with the same <RequestId> as its header, one Error line goes
+// out in the JSON stream with the panic value and the stack, and the counter
+// moves. It sits INSIDE withLogging, so the access line still comes out with
+// status 500 through the same statusWriter.
 //
-// Three things have to happen and none of them happened before: net/http's own
-// recovery closes the connection with no response at all, and writes its stack
-// to the package-level `log` — plain text on a stream that is JSON everywhere
-// else, which a collector that parses JSON drops on the floor. So the request
-// that broke the process was the only one leaving no trace, on exactly the
-// occasion when knowing which request it was matters most.
-//
-//   - The client gets a real S3 error document whose <RequestId> is the same
-//     string as the x-amz-request-id header it already received.
-//   - One Error line goes out in the same JSON stream as everything else,
-//     carrying the request id, the panic value and the stack.
-//   - The counter moves, so /_jay/metrics shows a process that is panicking.
-//
-// It sits INSIDE withLogging, so the access line still comes out and carries
-// status 500 — the recovered response goes through the same statusWriter.
-//
-// Recovering keeps the process alive with state that may be inconsistent, which
-// in an object store is a real trade rather than an obvious win. It is taken
-// deliberately: dying takes every other in-flight request down as well and
-// still explains nothing, whereas this answers the broken request honestly,
-// counts it, and leaves /health/ready as the thing that decides whether this
-// instance keeps taking traffic.
+// Recovering keeps the process alive with state that may be inconsistent:
+// /health/ready and the panic counter decide whether this instance keeps
+// taking traffic.
 func (h *Handler) withRecover(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {

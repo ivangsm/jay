@@ -42,16 +42,9 @@ func (h *connHandler) handlePutObject(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	// objops authorizes internally; on auth failure the body may still be
-	// fully consumed because PutObject streams it into the store before
-	// returning. Authorization happens BEFORE streaming though (authorize
-	// runs immediately after bucket resolution), so an auth rejection aborts
-	// early and we drain the remainder of the frame.
-	//
-	// However, the current objops.PutObject does the authorize BEFORE writing
-	// bytes but does NOT drain req.data if authorize fails — so we handle
-	// that here. We call HeadObject-style auth first? No — simpler: let
-	// PutObject run; if it returns an auth error before reading, we drain.
+	// objops.PutObject authorizes before it reads a byte and never drains
+	// req.data on failure, so whatever it left unread is drained below to keep
+	// the frame boundary.
 	obj, err := h.objops.PutObject(
 		context.TODO(), h.token,
 		bucket, key, contentType,
@@ -335,10 +328,9 @@ func drainData(req *request) error {
 	return err
 }
 
-// emptyReader is used by multipart upload handling when a part carries no
-// body bytes. Kept here (not moved to objops) because the proto multipart
-// handlers still pass a raw reader to store.WritePart directly — they do not
-// route through objops yet.
+// emptyReader is the body of a multipart part that carries no bytes. It lives
+// here because the proto multipart handlers pass a raw reader to
+// store.WritePart directly instead of going through objops.
 type emptyReader struct{}
 
 func (e *emptyReader) Read(p []byte) (int, error) { return 0, io.EOF }

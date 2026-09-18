@@ -13,9 +13,8 @@ import (
 
 // The request ID is only useful if the value the client is handed is the value
 // that appears in the server's log. These tests assert exactly that identity —
-// header == access log line == <RequestId> of the error document — instead of
-// asserting that a header merely exists, which is what let the ID be empty in
-// every log line of a production jay while every response carried a real one.
+// header == access log line == <RequestId> of the error document — never that
+// a header merely exists.
 
 // captureLog swaps the handler's logger for one writing JSON lines into a
 // buffer, so a test can read back what the server logged.
@@ -115,7 +114,7 @@ func TestRequestID_RejectedRequest_HeaderMatchesLogAndBody(t *testing.T) {
 }
 
 // Presigned URLs are dispatched by withPresigned, which bypasses the
-// credential middleware entirely. That branch used to mint its own ID.
+// credential middleware entirely and must not mint an ID of its own.
 func TestRequestID_PresignedRequest_HeaderMatchesLog(t *testing.T) {
 	h, _, tok, secret := presignSetup(t)
 	buf := captureLog(h)
@@ -134,7 +133,7 @@ func TestRequestID_PresignedRequest_HeaderMatchesLog(t *testing.T) {
 }
 
 // A presigned URL that does not verify is answered by rejectPresigned, which
-// never had an ID at all: it runs before the middleware that used to mint one.
+// runs before the credential middleware and still has to carry the ID.
 func TestRequestID_PresignedRejection_HeaderMatchesLogAndBody(t *testing.T) {
 	h, _, tok, secret := presignSetup(t)
 	buf := captureLog(h)
@@ -181,7 +180,7 @@ func TestRequestID_ChunkedRejection_HeaderMatchesBothLogLines(t *testing.T) {
 }
 
 // The pre-auth IP limiter answers before any credential is looked at. Its 429
-// used to leave x-amz-request-id empty in both the header and the body.
+// must still carry x-amz-request-id in both the header and the body.
 func TestRequestID_RateLimited_HeaderMatchesLogAndBody(t *testing.T) {
 	h, _, tok, secret := setupTestHandler(t)
 	// Burst of 1 with a rate low enough that the bucket cannot refill inside

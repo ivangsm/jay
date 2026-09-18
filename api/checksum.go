@@ -14,24 +14,15 @@ import (
 // checksumHeader is the S3 header carrying the SHA-256 digest of an object.
 const checksumHeader = "x-amz-checksum-sha256"
 
-// setChecksumHeader emits x-amz-checksum-sha256 for a whole object.
+// setChecksumHeader emits x-amz-checksum-sha256 for a whole object. jay stores
+// the digest hex-encoded and S3 defines the header as the raw digest in
+// base64; the hex form is what the scrubber, the native protocol and
+// `jay ls -l` use, so it is converted only on the way out. A digest that is not
+// a well-formed SHA-256 yields no header: an unverifiable checksum makes the
+// client reject correct bytes.
 //
-// jay stores the digest hex-encoded (store.WriteObject), but S3 defines every
-// x-amz-checksum-* header as the RAW digest in base64, and the AWS CLI verifies
-// it on each download: a hex value aborts the transfer with "Expected checksum
-// ... did not match calculated checksum" even though the bytes are intact.
-//
-// This is the single conversion point of the HTTP edge. The hex form is what
-// the scrubber compares, what the native protocol carries and what `jay ls -l`
-// prints, so it is never rewritten in place — only on the way out.
-//
-// A digest that is not a well-formed SHA-256 yields no header at all. An
-// unverifiable checksum is worse than none: the client would reject bytes that
-// are in fact correct.
-//
-// Only call this for a response whose body is the ENTIRE object. S3 scopes the
-// header to the bytes it returns, so a 206 must not carry the full-object
-// digest — see handleGetObject.
+// Only call this for a response whose body is the ENTIRE object: a 206 must
+// not carry the full-object digest — see handleGetObject.
 func setChecksumHeader(w http.ResponseWriter, hexDigest string) {
 	if value := checksumBase64(hexDigest); value != "" {
 		w.Header().Set(checksumHeader, value)
@@ -63,12 +54,9 @@ func checksumBase64(hexDigest string) string {
 // ── Client-declared checksums (inbound) ───────────────────────────────────
 //
 // Everything above is about the digest jay reports. Everything below is about
-// the digest the CLIENT reports, which is a different promise: sending
-// Content-MD5 or x-amz-checksum-* on a PUT is the client asking "verify that
-// what reached you is what I sent". Until PND-0189 jay read none of them and
-// answered 200 regardless — an unconditional success to a request that was
-// explicitly about integrity, in the one service whose selling point is
-// integrity.
+// the digest the CLIENT reports: sending Content-MD5 or x-amz-checksum-* on a
+// PUT is the client asking "verify that what reached you is what I sent", and
+// a 200 without that verification is a success reported on work not done.
 
 // The headers a client uses to declare a checksum. Two spellings for the
 // algorithm because S3 uses both: the SDK header on PutObject/UploadPart, the
@@ -84,7 +72,7 @@ const (
 // reserves for a malformed Content-MD5; a malformed x-amz-checksum-* is an
 // InvalidRequest, and a value that is well formed but does not describe the
 // bytes is a BadDigest in both cases (s3ErrBadDigest, declared next to
-// DeleteObjects, which had the only digest check jay used to have).
+// DeleteObjects).
 const (
 	s3ErrInvalidDigest  = "InvalidDigest"
 	s3ErrInvalidRequest = "InvalidRequest"
@@ -108,8 +96,7 @@ var checksumValueHeaders = []struct {
 
 // declaredChecksumAlgorithm returns the algorithm literal the client named and
 // the header that carried it, or ("", checksumAlgorithmHeader) when it named
-// none. The SDK spelling wins when both are present, which is the precedence
-// PutObject has always applied.
+// none. The SDK spelling wins when both are present.
 func declaredChecksumAlgorithm(r *http.Request) (value, header string) {
 	if v := strings.TrimSpace(r.Header.Get(sdkChecksumAlgorithmHeader)); v != "" {
 		return v, sdkChecksumAlgorithmHeader
@@ -129,8 +116,7 @@ func parseChecksumRequest(r *http.Request) (objops.ChecksumRequest, error) {
 	}
 
 	// Exactly one digest header, S3's rule. Two of them describe the same bytes
-	// two ways, and honouring one while ignoring the other is the same silent
-	// pass this whole file removes.
+	// two ways, and honouring one while ignoring the other is a silent pass.
 	var seen string
 	for _, candidate := range checksumValueHeaders {
 		value := strings.TrimSpace(r.Header.Get(candidate.header))
@@ -223,10 +209,8 @@ func (h *Handler) writeChecksumError(w http.ResponseWriter, r *http.Request, err
 // ── CopyObject ────────────────────────────────────────────────────────────
 //
 // A copy is the same family of promise as an upload, through another door. The
-// client cannot declare a digest — the bytes never left the server, so it has
-// nothing to hash — but it can name an algorithm, and until PND-0194 jay read
-// the header, computed nothing, and answered 200 with no checksum anywhere. The
-// request was attended halfway and reported as complete.
+// client cannot declare a digest — the bytes never left the server — but it
+// can name an algorithm, and then the response must carry that digest.
 
 // copyChecksumRequest reads the algorithm a CopyObject asked jay to compute.
 //

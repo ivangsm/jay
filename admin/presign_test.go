@@ -231,8 +231,8 @@ func TestPresign_AWSStyle_ExplicitHostOverridesListenAddr(t *testing.T) {
 }
 
 func TestPresign_JayStyle_KeepsWorkingWithAHostlessListenAddr(t *testing.T) {
-	// The jay form does not sign the host, so a hostless listen address is not
-	// a reason to start failing a call that used to answer.
+	// The jay form does not sign the host, so a hostless listen address must
+	// not fail it.
 	f := newPresignFixture(t, testListenAddrNH)
 
 	code, resp, body := f.callPresign(t,
@@ -269,9 +269,9 @@ func TestPresign_RejectsExpiryBeyondSevenDays(t *testing.T) {
 	}
 }
 
-// TestPresign_ExpiresSecondsIsANumber pins the wire type. jay-admin used to
-// send it as a JSON string, which the strict decoder refused — every single
-// `jay-admin presign` answered 400 "invalid request body".
+// TestPresign_ExpiresSecondsIsANumber pins the wire type: the strict decoder
+// refuses a JSON string where it expects an int, and jay-admin sends this
+// field from a string flag.
 func TestPresign_ExpiresSecondsIsANumber(t *testing.T) {
 	f := newPresignFixture(t, "jay.test:9000")
 

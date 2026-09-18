@@ -74,8 +74,7 @@ func TestChecksumVerifier_AcceptsEveryAlgorithmS3Defines(t *testing.T) {
 	}
 }
 
-// A wrong digest for every algorithm has to fail. This is the assertion that
-// would have caught PND-0189: before it, every one of these was a 200.
+// A wrong digest for every algorithm has to fail.
 func TestChecksumVerifier_RejectsEveryWrongDigest(t *testing.T) {
 	// The CRC64NVME digest, offered as if it were each algorithm's — well
 	// formed base64, wrong bytes, and the right length only for its own.

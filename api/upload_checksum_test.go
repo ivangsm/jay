@@ -15,10 +15,9 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
-// These tests assert the two halves of PND-0189 together, and the second half
-// is the one that is easy to get wrong: the status code AND the absence of
-// bytes. A test that only checked for 400 would have stayed green with the
-// object already written and metadata already committed.
+// These tests assert both halves of a refused upload: the status code AND the
+// absence of bytes. A 400 alone can coexist with an object already written
+// and metadata already committed.
 
 // helloWorldCRC64NVMEBase64 is the CRC-64/NVME of "hello world" as the AWS CLI
 // computes it — the algorithm it declares on every upload it makes.

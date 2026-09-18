@@ -278,19 +278,13 @@ func (a *Auth) Authorize(token *meta.Token, action, bucketName, objectKey string
 
 // AuthorizeBucketOwnership checks that the token is entitled to operate on an
 // EXISTING bucket's metadata (delete, head, and any other cross-account
-// sensitive bucket operation).
+// sensitive bucket operation). It runs in addition to Authorize, which only
+// says what the token is scoped to: "bucket:write-meta" with no BucketScope
+// passes Authorize for every bucket name, other accounts' included.
 //
-// Authorize alone is not enough: a token with "bucket:write-meta" and no
-// BucketScope is allowed to act on *every* bucket name, including buckets
-// owned by a different account. This is the tenant-isolation check that must
-// run in addition to Authorize, after the bucket has been loaded from meta.
-//
-// Access is granted when any of the following holds:
-//   - the token's account owns the bucket;
-//   - the bucket has no owner (legacy buckets created before ownership was
-//     recorded — refusing these would break existing deployments);
-//   - the token's BucketScope explicitly names the bucket, which is how an
-//     operator delegates cross-account access via the admin API.
+// Access is granted when the token's account owns the bucket, when the bucket
+// has no recorded owner, or when the token's BucketScope names the bucket
+// explicitly (how an operator delegates cross-account access).
 func (a *Auth) AuthorizeBucketOwnership(token *meta.Token, bucket *meta.Bucket) error {
 	return authorizeBucketOwnership(token, bucket)
 }
@@ -317,41 +311,25 @@ func authorizeBucketOwnership(token *meta.Token, bucket *meta.Bucket) error {
 
 // AuthorizeBucketAccess is the cross-account gate for an EXISTING bucket, and
 // the single place where "may this token touch this bucket at all?" is decided.
-//
-// Authorize answers a different question: what the token is scoped to. A token
-// with "*" actions and no BucketScope passes it for every bucket name in the
-// store, including buckets of other accounts — which is exactly how object
-// operations ended up reachable across accounts while the bucket operations
-// were safe (PND-0185). Every path that has resolved a bucket calls this, so a
-// handler added tomorrow inherits the check instead of having to remember it.
+// Authorize answers a different question — what the token is scoped to — and
+// "*" with no BucketScope passes it for every bucket in the store. Every path
+// that has resolved a bucket calls this, so a new handler inherits the check.
 //
 // Access is granted when, in this order:
 //
-//  1. the token's account owns the bucket, the bucket has no recorded owner
-//     (legacy), or the token's BucketScope names it explicitly — see
-//     AuthorizeBucketOwnership;
-//  2. the bucket is public-read and the action is a read of object data. This
-//     mirrors the anonymous rule the HTTP layer already applies: it would be
-//     absurd for a bucket that answers strangers with no credentials at all to
-//     refuse the same read to an authenticated token of another account;
+//  1. the token's account owns the bucket, the bucket has no recorded owner,
+//     or the token's BucketScope names it — see AuthorizeBucketOwnership;
+//  2. the bucket is public-read and the action is a read of object data (the
+//     same rule that lets an anonymous caller read it);
 //  3. a bucket policy carries an explicit allow that matches the subject, the
 //     action, the prefix and the IP conditions.
 //
-// Otherwise: denied. The default is deny and a missing or malformed policy
-// never opens anything — a policy that cannot be parsed is refused, not
-// ignored.
+// Otherwise denied: a bucket with no policy, or a policy that cannot be
+// parsed, has nothing to grant. Deny statements are evaluated afterwards by
+// the caller and always win.
 //
-// Order matters and is deliberate. Running the account check BEFORE the policy
-// would make a cross-account allow statement unreachable, and the policy is the
-// only mechanism the README offers for sharing a bucket. Running the policy
-// FIRST would mean a bucket without a policy has nothing to say about a
-// stranger, and "nothing to say" must never read as yes. So: ownership, then
-// the documented public-read door, then an explicit grant — and deny statements
-// are still evaluated afterwards by the caller, so a deny always wins.
-//
-// This is a package-level function, not a method, because the decision needs no
-// database: everything it reads is already in the token and the bucket the
-// caller resolved. That is what lets objops and both transports share it.
+// A package-level function, not a method: the decision needs no database, which
+// is what lets objops and both transports share it.
 func AuthorizeBucketAccess(token *meta.Token, bucket *meta.Bucket, action, objectKey, sourceIP string) error {
 	if bucket == nil {
 		return ErrAccessDenied
@@ -382,11 +360,9 @@ func AuthorizeBucketAccess(token *meta.Token, bucket *meta.Bucket, action, objec
 // with no policy returns (nil, nil) — the caller decides what that means, and
 // for AuthorizeBucketAccess it means deny.
 //
-// Lenient rather than v2's defaults: bucket policies are written by hand, and
-// v1 matched field names case-insensitively. Under v2's case-sensitive defaults
-// an AWS-style policy ("Effect"/"Statements") would stop parsing and its Deny
-// statement would vanish silently — opening access where it used to be refused.
-// Lenient preserves v1's matching.
+// Decoded with jsonx.Lenient, not json/v2's defaults: policies are written by
+// hand, and under case-sensitive matching an AWS-style document
+// ("Effect"/"Statements") would parse with its Deny statement silently gone.
 //
 // This is the only unmarshalling of a bucket policy in the tree: two of them
 // would be two dialects.

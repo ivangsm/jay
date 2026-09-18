@@ -656,8 +656,7 @@ var (
 
 // handshakeError translates a non-OK handshake status into an error a caller
 // can match. An unknown status is reported with its number rather than folded
-// into one of the known ones: a future server may add statuses, and guessing
-// which one it meant is how "version mismatch" came to mean everything.
+// into one of the known ones: a future server may add statuses.
 func handshakeError(status byte) error {
 	switch status {
 	case proto.HandshakeAuthFailed:

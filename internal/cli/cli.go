@@ -65,9 +65,9 @@ var commands = map[string]func(Options, []string) error{
 
 // IsCommand reports whether arg should be handled by the client CLI. Anything
 // that is not a flag counts, including a misspelling: dispatching only on
-// known names meant `jay lss` fell through and booted a server instead of
-// reporting the typo. `jay` with no arguments, or with only flags like
-// --config-file, still starts the server — the container ENTRYPOINT needs it.
+// known names would let `jay lss` boot a server instead of reporting the typo.
+// `jay` with no arguments, or with only flags like --config-file, still starts
+// the server — the container ENTRYPOINT needs it.
 func IsCommand(arg string) bool {
 	if arg == "-h" || arg == "--help" {
 		return true

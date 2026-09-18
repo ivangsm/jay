@@ -8,15 +8,9 @@ const (
 
 	// Version is the protocol version. It travels in the handshake ONLY — the
 	// per-frame header has no version byte — so it pins the dialect for the
-	// whole connection and cannot signal a mid-connection change.
-	//
-	// The practical consequence, and the reason this comment is worth reading:
-	// changing the layout of any Encode*/Decode* pair is invisible to the
-	// handshake, so a version bump does NOT protect against wire skew. What
-	// protects against it is the golden tests in wire_golden_test.go. Add a
-	// field to an existing struct and they fail on purpose.
-	//
-	// A peer whose version is not recognised is refused rather than guessed at.
+	// whole connection. A changed Encode*/Decode* layout is invisible to it: a
+	// version bump does NOT protect against wire skew, the golden tests in
+	// wire_golden_test.go do. An unrecognised version is refused, not guessed at.
 	Version byte = 0x01
 
 	// HeaderSize is the fixed size of a request/response frame header.
@@ -76,14 +70,10 @@ const (
 	StatusInternal   byte = 0x05
 )
 
-// Handshake status codes.
-//
-// Every one of these is a deliberate diagnosis, not a catch-all. The server
-// used to answer HandshakeVersionMismatch for ANY handshake failure — a cut
-// socket, a client that dialled the wrong port, a full server — so the one
-// thing the client reported was the one thing that was almost never true.
-// Adding a status is backward compatible: an older client falls through to
-// its default branch and reports the raw number, which still beats a lie.
+// Handshake status codes. Each one is a specific diagnosis, never a catch-all:
+// HandshakeVersionMismatch is not the answer to a cut socket or a full server.
+// Adding a status is backward compatible: an older client falls through to its
+// default branch and reports the raw number.
 const (
 	// HandshakeOK means the connection is authenticated and ready for frames.
 	HandshakeOK byte = 0x00
@@ -98,10 +88,9 @@ const (
 	// one this server does not speak. It now means ONLY that.
 	HandshakeVersionMismatch byte = 0x02
 
-	// HandshakeServerBusy means the connection limit was reached. Before this
-	// status existed the server closed the socket without writing anything, so
-	// a client at capacity saw a bare EOF — indistinguishable from a dead
-	// server or a severed network, and therefore retried the wrong way.
+	// HandshakeServerBusy means the connection limit was reached. It is written
+	// before the socket closes so a client can tell a full server from a dead
+	// one, and back off instead of failing over.
 	HandshakeServerBusy byte = 0x03
 
 	// HandshakeMalformed means the bytes were not a Jay handshake at all: bad

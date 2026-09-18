@@ -73,9 +73,8 @@ type AdminConfig struct {
 
 // NewHandler creates a new admin API handler.
 func NewHandler(cfg AdminConfig) *Handler {
-	// Without a logger, the first unauthorised request nil-dereferenced inside
-	// authenticateAdmin — the handler blew up on exactly the path nobody
-	// exercises before production.
+	// authenticateAdmin logs every unauthorised request, so a nil logger
+	// would panic on exactly the path nobody exercises before production.
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
@@ -222,9 +221,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // routeBucket dispatches the bucket-configuration surface: the policy and the
-// visibility, which are the two things that decide who can reach a bucket and
-// which had no endpoint at all until PND-0187. See admin/buckets.go for why
-// they live here rather than on the S3 port.
+// visibility, the two things that decide who can reach a bucket. See
+// admin/buckets.go for why they live here rather than on the S3 port.
 func (h *Handler) routeBucket(w http.ResponseWriter, r *http.Request, path string) {
 	name, sub, ok := bucketRoute(path)
 	if !ok {
@@ -471,13 +469,10 @@ type presignResponse struct {
 	Style string `json:"style"`
 }
 
-// handlePresign mints a presigned URL in one of two forms.
-//
-// The default is "jay", not "aws": `jay-admin presign` and falco already
-// consume the X-Jay-* form, and flipping the default would change what they get
-// without them asking. AWS-style presigning is opt-in until it has run in
-// production long enough to be the safe default, which is exactly what
-// PND-0161 deferred with "default aws cuando se estabilice".
+// handlePresign mints a presigned URL in one of two forms. The default is
+// "jay", not "aws": `jay-admin presign` and falco consume the X-Jay-* form,
+// and flipping the default would change what they get without them asking.
+// TODO(revisar): make "aws" the default once it has run in production.
 func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
 	var req presignRequest
 	if err := jsonv2.UnmarshalRead(r.Body, &req, jsonx.Strict); err != nil {
@@ -572,8 +567,8 @@ func (h *Handler) handlePresign(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeJSONError answers with a JSON error body whose message is safely quoted.
-// fmt.Sprintf into a JSON literal broke the response as soon as the message
-// contained a quote — which the presign errors do, since they quote the host.
+// Never fmt.Sprintf into a JSON literal: the presign errors quote the host,
+// and an unescaped quote breaks the document.
 func writeJSONError(w http.ResponseWriter, status int, message string) {
 	body, err := jsonv2.Marshal(map[string]string{"error": message})
 	if err != nil {

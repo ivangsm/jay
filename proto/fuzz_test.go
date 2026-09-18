@@ -179,8 +179,7 @@ func FuzzReadHandshake(f *testing.F) {
 		if err != nil {
 			// A protocol disagreement must be classifiable as the specific
 			// thing that is wrong, because the server answers with a status
-			// derived from it. Getting this wrong is what made every failure
-			// — including a severed socket — report "version mismatch".
+			// derived from it.
 			if len(data) >= HandshakeSize {
 				switch {
 				case binary.BigEndian.Uint32(data[0:4]) != Magic:
@@ -317,13 +316,11 @@ func FuzzRoundTrip(f *testing.F) {
 	})
 }
 
-// TestDecoderDoesNotTrustCounts is the regression test for the allocation
-// amplification the fuzz work turned up: a 2-byte count was believed before
-// anything checked whether the data behind it existed, so 2 bytes of input
-// bought 5.7 MB of allocation on a ListObjects response.
+// TestDecoderDoesNotTrustCounts: a 2-byte count must be checked against the
+// bytes left before anything is allocated for it.
 //
 // It asserts bytes allocated rather than a returned capacity, because the
-// decoders return nil on error — the allocation happened before the failure
+// decoders return nil on error — the allocation happens before the failure
 // and a capacity check could not see it.
 func TestDecoderDoesNotTrustCounts(t *testing.T) {
 	maxCount := []byte{0xFF, 0xFF} // 65535 elements promised, none delivered

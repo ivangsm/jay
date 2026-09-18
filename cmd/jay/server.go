@@ -15,11 +15,9 @@ import (
 // nativeTLSConfig builds the TLS config for the native listener, or nil when
 // the transport is meant to stay in the clear.
 //
-// Supplying one half of the pair is an error, never a fallback to plaintext.
-// The native handshake sends "token_id:secret" unencrypted, so an operator who
-// typed only JAY_NATIVE_TLS_CERT and got a working-looking server would be
-// publishing the credential of every client that connects. This is the config
-// case where degrading quietly is worse than not starting.
+// Supplying one half of the pair is an error, never a fallback to plaintext:
+// the native handshake sends "token_id:secret" unencrypted, so a half-configured
+// server that came up in the clear would publish every client's credential.
 func nativeTLSConfig(cfg Config) (*tls.Config, error) {
 	switch {
 	case cfg.NativeTLSCert == "" && cfg.NativeTLSKey == "":
@@ -54,9 +52,8 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 		Addr:    addr,
 		Handler: handler,
 		// ReadTimeout covers headers plus body, and a 5 GiB PUT needs those
-		// five minutes. ReadHeaderTimeout bounds the header phase separately:
-		// without it, a slowloris dribbling one header byte at a time held the
-		// connection for the full five minutes.
+		// five minutes. ReadHeaderTimeout bounds the header phase separately so
+		// a slowloris cannot hold the connection for the full five minutes.
 		ReadHeaderTimeout: 20 * time.Second,
 		ReadTimeout:       5 * time.Minute,
 		WriteTimeout:      5 * time.Minute,
@@ -68,16 +65,11 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 		// with its own map entry. 500 is the stdlib default and is plenty for
 		// any real S3 client.
 		MaxHeaderValueCount: http.DefaultMaxHeaderValueCount,
-		// Everything net/http reports on its own — the stack of a panic it
-		// recovered outside jay's middleware, a rejected TLS handshake, a write
-		// that failed after the headers went out — goes through a *log.Logger.
-		// Left unset that is the package-level default: plain text on stderr, in
-		// the middle of a stream that is JSON everywhere else, which a collector
-		// that parses JSON drops. This routes it through the same slog handler
-		// as every other line, so nothing the process emits leaves the format.
-		//
-		// It covers the admin listener too (health probes, the admin API,
-		// pprof), which has no middleware chain of its own.
+		// Everything net/http reports on its own (a panic recovered outside
+		// jay's middleware, a rejected TLS handshake, a failed write) goes
+		// through a *log.Logger; unset, that is plain text on stderr in a
+		// stream that is JSON everywhere else. This keeps it in the same slog
+		// handler, for the admin listener too, which has no middleware chain.
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelError),
 	}
 
@@ -99,24 +91,13 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 }
 
 // mountPprof hangs net/http/pprof off mux under /debug/pprof/, wrapped in
-// guard. In jay the mux is the admin listener's (:4011) and the guard is
-// JAY_ADMIN_TOKEN authentication: profiles leak function names and the process's
-// memory layout, and /debug/pprof/profile burns CPU on demand, so they are never
-// served unauthenticated.
+// guard. In jay the mux is the admin listener's and the guard is JAY_ADMIN_TOKEN
+// authentication: profiles leak function names and the process's memory
+// layout, and /debug/pprof/profile burns CPU on demand.
 //
-// Note: net/http/pprof's init() registers the same handlers on
-// http.DefaultServeMux, unauthenticated, merely by being imported — there is no
-// way to prevent that. It is harmless as long as jay NEVER serves the
-// DefaultServeMux, and today it does not: startServer always receives an
-// explicit mux. If anyone ever passes nil or http.DefaultServeMux to
-// startServer, pprof is open to the internet. Registering the handlers by hand
-// here is what keeps the authenticated copy the only reachable one.
-//
-// The profile that justifies all of this is /debug/pprof/goroutineleak, new in
-// Go 1.27: it lists goroutines that are stuck forever. Two known candidates in
-// jay — health.go's readiness probe leaves one goroutine per check for as long
-// as bbolt does not answer, and main.go's shutdown watchdog abandons its own
-// whenever the time.After wins.
+// Importing net/http/pprof also registers the same handlers, unauthenticated,
+// on http.DefaultServeMux. That stays harmless only while nothing serves the
+// DefaultServeMux: startServer must always receive an explicit mux.
 func mountPprof(mux *http.ServeMux, guard func(http.Handler) http.Handler) {
 	pprofMux := http.NewServeMux()
 	pprofMux.HandleFunc("/debug/pprof/", pprof.Index)

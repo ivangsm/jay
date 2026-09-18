@@ -13,11 +13,8 @@ import (
 	"github.com/ivangsm/jay/proto/client"
 )
 
-// Cross-account isolation over the native protocol (PND-0185).
-//
-// falco is the only consumer in the monorepo and it talks this protocol, so the
-// hole was here too — the HTTP surface is simply where it was measured. Every
-// assertion reads the database after the attempt, never the returned error.
+// Cross-account isolation over the native protocol. Every assertion reads the
+// database after the attempt, never the returned error.
 
 const (
 	protoBucket  = "owned"

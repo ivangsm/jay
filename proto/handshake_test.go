@@ -10,10 +10,8 @@ import (
 	"time"
 )
 
-// Tests for the handshake's diagnosis, which used to be a single lie: every
-// failure — a cut socket, a wrong port, a full server — was answered as
-// "protocol version mismatch", so the one thing a client reported was the one
-// thing that was almost never true.
+// Tests for the handshake's diagnosis: a cut socket, a wrong port and a full
+// server each get their own status, never a blanket "version mismatch".
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -114,9 +112,8 @@ func TestReadHandshake_ClassifiesFailures(t *testing.T) {
 	})
 }
 
-// TestServer_RejectsWithServerBusy covers the status that did not exist: at
-// the connection limit the server used to close without writing anything, so
-// a client saw a bare EOF and could not tell a full server from a dead one.
+// TestServer_RejectsWithServerBusy: at the connection limit the server writes
+// a status before closing, so a client can tell a full server from a dead one.
 func TestServer_RejectsWithServerBusy(t *testing.T) {
 	// maxConns of zero rejects every connection in the accept loop, before
 	// anything touches the database — which is why this test needs no store.

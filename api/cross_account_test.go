@@ -10,7 +10,7 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
-// Cross-account isolation (PND-0185).
+// Cross-account isolation.
 //
 // Every assertion here reads the DATABASE after the attempt, not the status
 // code. A handler that answers 403 and writes the object anyway would pass a

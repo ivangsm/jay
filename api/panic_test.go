@@ -1,13 +1,9 @@
 package api
 
-// A panic used to be the one request that left no trace (PND-0193): net/http
-// recovered it, closed the connection with no response, and wrote the stack to
-// the package-level logger — plain text in a stream that is JSON everywhere
-// else, which the collector drops.
-//
-// Every assertion here is about the EVIDENCE, not about the process staying
-// alive. "The server did not crash" passes just as well with the log still
-// missing, and the log is the half that matters.
+// A recovered panic must leave evidence in the JSON stream: net/http's own
+// recovery closes the connection with no response and writes the stack as
+// plain text to the package-level logger. Every assertion here is about that
+// evidence, not about the process staying alive.
 
 import (
 	"bufio"
@@ -134,7 +130,7 @@ func TestPanicInHandler_Answers500AndLogsBothLines(t *testing.T) {
 			"reports would not find the request", got, header)
 	}
 
-	// The error line: the trace that did not exist before.
+	// The error line.
 	errLine := f.findLine(t, "panic recovered")
 	if errLine["level"] != "ERROR" {
 		t.Fatalf("panic line logged at level %v, want ERROR", errLine["level"])
@@ -156,8 +152,8 @@ func TestPanicInHandler_Answers500AndLogsBothLines(t *testing.T) {
 		t.Fatalf("response_started = %v, want false", errLine["response_started"])
 	}
 
-	// The access line: it used to be skipped entirely, because withLogging
-	// wrote it after next() returned and a panic jumps over that.
+	// The access line: withLogging writes it from a defer, so a panic that
+	// jumps over the code after next() still produces it.
 	accessLine := f.findLine(t, "request")
 	if accessLine["request_id"] != header {
 		t.Fatalf("access line request_id = %v, want %q", accessLine["request_id"], header)

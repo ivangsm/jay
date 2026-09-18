@@ -61,12 +61,9 @@ var concurrencyLevels = []int{1, 4, 16}
 
 // benchHTTPClient gives the S3 benchmarks the connection reuse a real S3 client
 // gets. Go's default transport keeps only 2 idle connections per host, so a
-// 16-way parallel benchmark closes 14 of every 16 connections, spends most of
-// its time in TCP handshakes and eventually exhausts the ephemeral port range
-// (macOS fails with "can't assign requested address"). That measures the dial
-// path, not the server, and it understates HTTP against the native client,
-// which pools connections by design. Sizing the pool above the highest
-// concurrency level keeps the comparison about the server.
+// parallel benchmark would measure TCP handshakes (and exhaust the ephemeral
+// port range) instead of the server. The pool is sized above the highest
+// concurrency level so the comparison against the pooled native client holds.
 var benchHTTPClient = &http.Client{
 	Transport: &http.Transport{
 		MaxIdleConns:        256,

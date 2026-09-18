@@ -2,11 +2,9 @@
 #
 # conformance.sh — exercise jay's S3 surface with S3 clients jay did not write.
 #
-# Why this exists: the README claims S3 compatibility, and ~640 Go tests prove
-# only that jay agrees with itself. A test that builds the request with the same
-# code that parses it measures internal consistency, not compatibility. So this
-# script boots a throwaway jay and drives it with the real thing: aws-cli
-# (botocore), mc and warp (both minio-go).
+# The Go tests prove only that jay agrees with itself. This script boots a
+# throwaway jay and drives it with real clients: aws-cli (botocore), mc and
+# warp (both minio-go).
 #
 # What it does NOT do: fix anything, or paper over a failure. Every check either
 # asserts an effect (bytes on the wire, an object present or absent, a status
@@ -192,7 +190,7 @@ json_str() {
 }
 
 # b64sha256 FILE — the digest exactly as S3 defines x-amz-checksum-sha256:
-# raw SHA-256, base64. Not hex. This is the shape PND-0184 got wrong.
+# raw SHA-256, base64. Not hex.
 b64sha256() { openssl dgst -sha256 -binary "$1" | openssl base64 -A; }
 
 # hexsha256 FILE — for comparing two local files byte for byte.
@@ -385,8 +383,8 @@ info "jay is up on $S3 (admin $ADMIN) and $TLS_S3"
 #
 # Account A comes from the seed variables. Account B and the prefix-scoped
 # token come from the admin API, because the suite needs three distinct
-# authorities: a full one, one that belongs to a different account (PND-0185)
-# and one that can only reach part of a bucket (the partial batch delete).
+# authorities: a full one, one that belongs to a different account and one
+# that can only reach part of a bucket (the partial batch delete).
 # ---------------------------------------------------------------------------
 
 admin_post() {
@@ -433,8 +431,8 @@ printf 'jay conformance fixture\n' >"$FIX/small.txt"
 printf 'one\n' >"$FIX/syncdir/a.txt"
 printf 'two\n' >"$FIX/syncdir/nested/b.txt"
 # 12 MiB: above the AWS CLI's 8 MiB threshold, so the upload becomes multipart
-# and the download becomes ranged GETs. Both halves matter — the checksum
-# defect of PND-0184 only ever showed up on the way down.
+# and the download becomes ranged GETs. Both halves matter: the checksum
+# header is verified on the way down.
 dd if=/dev/urandom of="$FIX/big.bin" bs=1048576 count=12 >/dev/null 2>&1 ||
 	die "could not create the 12 MiB fixture"
 
@@ -532,9 +530,8 @@ else
 	got_len="$(aws_a s3api head-object --bucket "$BUCKET_A" --key small.txt --query ContentLength --output text 2>/dev/null)"
 	assert_eq "HeadObject reports the stored length" "$(file_size "$FIX/small.txt")" "$got_len"
 
-	# PND-0184: S3 defines every x-amz-checksum-* header as the raw digest in
-	# base64. jay stored it hex and shipped it hex, so every aws-cli download
-	# aborted on a checksum mismatch over bytes that were in fact intact.
+	# S3 defines every x-amz-checksum-* header as the raw digest in base64;
+	# aws-cli aborts a download whose header is hex, over intact bytes.
 	got_sum="$(aws_a s3api head-object --bucket "$BUCKET_A" --key small.txt --query ChecksumSHA256 --output text 2>/dev/null)"
 	assert_eq "x-amz-checksum-sha256 is base64, not hex (PND-0184)" "$SMALL_B64" "$got_sum"
 
@@ -567,11 +564,10 @@ else
 
 	# --- the algorithm the client asked for is the one it gets back --------
 	#
-	# --checksum-algorithm is the client saying "verify my bytes with THIS".
-	# jay used to ignore it and answer ChecksumSHA256 whatever was asked, which
-	# botocore tolerates and a client that checks the algorithm does not. Every
-	# algorithm S3 defines for objects is exercised, because jay implements all
-	# five and a gap would otherwise go unnoticed until someone hit it.
+	# --checksum-algorithm is the client saying "verify my bytes with THIS";
+	# answering ChecksumSHA256 whatever was asked is tolerated by botocore and
+	# not by a client that checks the algorithm. All five S3 algorithms are
+	# exercised so a gap cannot go unnoticed.
 	for alg in CRC32 CRC32C CRC64NVME SHA1 SHA256; do
 		field="Checksum$alg"
 		got_alg="$(aws_a s3api put-object --bucket "$BUCKET_A" --key "sum-$alg.txt" \
@@ -585,12 +581,12 @@ else
 			continue
 		fi
 
-		# The same promise through the other door (PND-0194). A copy has no
-		# digest to verify — the bytes never left the server — but the client can
-		# still ask for one, and jay used to answer 200 with none at all. The
-		# expected value is the digest put-object just returned for the SAME
-		# bytes, so a copy that hashed the wrong thing, or answered in hex where
-		# S3 wants base64, fails even though the response looks checksum-shaped.
+		# The same promise through the other door. A copy has no digest to
+		# verify — the bytes never left the server — but the client can still
+		# ask for one. The expected value is the digest put-object just returned
+		# for the SAME bytes, so a copy that hashed the wrong thing, or answered
+		# in hex where S3 wants base64, fails even though the response looks
+		# checksum-shaped.
 		copied_alg="$(aws_a s3api copy-object --bucket "$BUCKET_A" --key "copy-sum-$alg.txt" \
 			--copy-source "$BUCKET_A/sum-$alg.txt" --checksum-algorithm "$alg" \
 			--query "CopyObjectResult.$field" --output text 2>"$LOGS/aws-copysum-$alg.log")"
@@ -654,7 +650,7 @@ else
 		fail "rm --recursive empties the prefix" "still there: $left"
 	fi
 
-	# --- presigned URL, minted by the client (PND-0161) --------------------
+	# --- presigned URL, minted by the client ------------------------------
 	purl="$(aws_a s3 presign "s3://$BUCKET_A/small.txt" --expires-in 300 2>"$LOGS/aws-presign.log")"
 	if [ -z "$purl" ]; then
 		fail "SigV4 presigned GET (PND-0161)" "$(tail -2 "$LOGS/aws-presign.log")"
@@ -677,7 +673,7 @@ else
 		fail "an expired presigned URL is refused" "http=$ecode"
 	fi
 
-	# --- operations that answered 501 until PND-0165 -----------------------
+	# --- bucket-level operations ------------------------------------------
 	if aws_a s3api get-bucket-location --bucket "$BUCKET_A" >"$LOGS/aws-location.log" 2>&1; then
 		pass "GetBucketLocation (PND-0165)"
 	else
@@ -703,7 +699,7 @@ else
 		fi
 	fi
 
-	# --- batch delete, whole and partial (PND-0165) ------------------------
+	# --- batch delete, whole and partial ----------------------------------
 	aws_a s3 cp "$FIX/small.txt" "s3://$BUCKET_A/batch/one.txt" --quiet >/dev/null 2>&1
 	aws_a s3 cp "$FIX/small.txt" "s3://$BUCKET_A/batch/two.txt" --quiet >/dev/null 2>&1
 	aws_a s3api delete-objects --bucket "$BUCKET_A" \
@@ -757,13 +753,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# GROUP: integrity — a checksum the client declares is verified (PND-0189)
+# GROUP: integrity — a checksum the client declares is verified
 #
-# Until 2026-09-02 jay read none of them. A PUT carrying a deliberately wrong
-# x-amz-checksum-sha256 answered 200, stored the object, and echoed back the
-# digest it had computed itself — an unconditional success to the one request
-# that is explicitly about integrity. The AWS CLI declares a CRC64NVME on every
-# upload it makes, so this was not an edge case: it was every upload.
+# The AWS CLI declares a CRC64NVME on every upload it makes, so a PUT whose
+# declared digest is wrong must be refused, not stored under a 200.
 #
 # Driven with curl and the bearer form on purpose. These assertions have to run
 # even when no S3 client is installed, and they need to send a digest that is
@@ -826,9 +819,8 @@ refused_and_absent() {
 if [ "$(curl_a PUT "/$BUCKET_INT")" != "200" ]; then
 	skip "whole group" "could not create $BUCKET_INT: $(cat "$WORK/int.body" | tr -d '\n' | cut -c1-160)"
 else
-	# The one that also counts the files on disk. A rejection that leaves the
-	# object (or a temp file) behind is the failure mode this whole change is
-	# about, and the response cannot show it.
+	# The one that also counts the files on disk: a rejection that leaves the
+	# object (or a temp file) behind is invisible in the response.
 	files_before="$(data_files)"
 	refused_and_absent "a wrong x-amz-checksum-sha256 is refused" wrong-sha256.txt BadDigest \
 		-H "x-amz-checksum-sha256: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -889,13 +881,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# GROUP: cross-account (PND-0185)
+# GROUP: cross-account
 #
-# Until 2026-09-02 a token of account B could read, write and delete inside a
-# bucket of account A: only DeleteBucket, HeadBucket and GetBucketLocation
-# checked ownership. Every check here asserts the EFFECT as account A, not just
-# the error message account B received — a 403 that still wrote the object
-# would be worse than no 403 at all.
+# A token of account B must not read, write or delete inside a bucket of
+# account A. Every check here asserts the EFFECT as account A, not just the
+# error message account B received — a 403 that still wrote the object would
+# be worse than no 403 at all.
 # ---------------------------------------------------------------------------
 
 say ""
@@ -1025,7 +1016,7 @@ else
 	fi
 
 	# minio-go mints a SigV4 query-string URL of its own — a second, independent
-	# implementation of the form PND-0161 added.
+	# implementation of the presigned form.
 	share="$(mc_ share download --expire 5m jayhttp/"$BUCKET_A"/small.txt 2>"$LOGS/mc-share.log" | sed -n 's/^Share: //p')"
 	if [ -z "$share" ]; then
 		fail "SigV4 presigned GET minted by minio-go (PND-0161)" "$(tail -2 "$LOGS/mc-share.log")"
@@ -1043,11 +1034,10 @@ else
 	# Over plain HTTP minio-go signs every PutObject with the SigV4 *streaming*
 	# signature and frames the body as aws-chunked. jay has no decoder for that
 	# framing and refuses the request with 501 rather than storing the framing
-	# as the object, which is what it used to do (PND-0186).
+	# as the object.
 	#
-	# The day the decoder lands (PND-0188) this check goes red on purpose: the
-	# upload will succeed and the assertion below will stop holding, forcing
-	# whoever implements it to come back here and to the README.
+	# TODO(PND-0188): when the decoder lands this check goes red on purpose;
+	# update it and the README together.
 	mc_ cp "$FIX/small.txt" jayhttp/"$BUCKET_A"/via-mc.txt >"$LOGS/mc-cp.log" 2>&1
 	mc_rc=$?
 	if [ "$mc_rc" -ne 0 ] &&
@@ -1130,8 +1120,8 @@ else
 	fi
 
 	# And the real smoke test: the same tool, over TLS, doing PUT/GET/DELETE/STAT
-	# concurrently for ten seconds. The number it prints is the one PND-0176 can
-	# publish; the assertion is that it ran with zero errors.
+	# concurrently for ten seconds. The number it prints is informational; the
+	# assertion is that it ran with zero errors.
 	run_limited 180 "$WARP_BIN" mixed --host="127.0.0.1:$TLS_S3_PORT" --tls --insecure \
 		--access-key="$TLS_ID" --secret-key="$TLS_SECRET" --bucket=warp-tls \
 		--duration=10s --obj.size=256KiB --concurrent=4 --no-color \

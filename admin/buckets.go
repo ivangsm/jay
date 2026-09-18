@@ -1,23 +1,14 @@
 package admin
 
-// Bucket policy and visibility (PND-0187).
+// Bucket policy and visibility.
 //
-// Both knobs were fully implemented and completely unreachable: the evaluator
-// in auth is real and tested, CreateBucket leaves every bucket private, and
-// nothing in the tree ever called meta.UpdateBucketPolicy. The only way to
-// install a policy was to stop jay and write the bucket record into bbolt with
-// a program written for the occasion. The README documented a feature nobody
-// could turn on.
-//
-// The door is here rather than on the S3 port on purpose. Jay's policy dialect
-// is its own — `subjects`/`prefixes`/`actions`, not AWS's
-// `Principal`/`Resource`/`Action` — so serving S3's PutBucketPolicy would mean
-// either translating between two models that do not line up, or answering an
-// S3 operation with a document no S3 client can read. And `visibility` has no
-// S3 operation at all: the closest is PutBucketAcl, which is a different model
-// again and stays in unimplementedBucketSubresources with the rest. The admin
-// API already is the operator plane — accounts, tokens, quarantine — already
-// carries JAY_ADMIN_TOKEN, and already never faces the internet.
+// They are configured here rather than on the S3 port because jay's policy
+// dialect is its own (`subjects`/`prefixes`/`actions`, not AWS's
+// `Principal`/`Resource`/`Action`): serving S3's PutBucketPolicy would mean
+// translating between two models that do not line up, or answering an S3
+// operation with a document no S3 client can read. `visibility` has no S3
+// operation at all; the closest, PutBucketAcl, is a different model again and
+// stays in unimplementedBucketSubresources.
 
 import (
 	"encoding/json/jsontext"
@@ -53,11 +44,9 @@ func bucketRoute(path string) (name, sub string, ok bool) {
 	return name, sub, true
 }
 
-// bucketResponse is what GET /_jay/buckets/{name} answers.
-//
-// It reports the policy and the visibility together because they are the two
-// halves of one question — "who can reach this bucket?" — and reading one
-// without the other has already been enough to mislead someone.
+// bucketResponse is what GET /_jay/buckets/{name} answers. Policy and
+// visibility come together because they are the two halves of one question:
+// who can reach this bucket.
 type bucketResponse struct {
 	Name           string         `json:"name"`
 	OwnerAccountID string         `json:"owner_account_id"`

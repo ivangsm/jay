@@ -61,10 +61,8 @@ var awsChunkedBody = "f;chunk-signature=" + strings.Repeat("a", 64) + "\r\n" +
 	"hola desde jay\n" + "\r\n" +
 	"0;chunk-signature=" + strings.Repeat("b", 64) + "\r\n\r\n"
 
-// Every entry point that accepts a body must refuse aws-chunked framing. One
-// closed door is worth nothing while the one next to it is open: PutObject was
-// how the corruption was found, but UploadPart frames its parts exactly the
-// same way, and that is where a 20 MiB upload gained 29 KiB of chunk headers.
+// Every entry point that accepts a body must refuse aws-chunked framing:
+// UploadPart frames its parts exactly like PutObject frames an object.
 func TestChunkedBodyRejected_AllBodyEntryPoints(t *testing.T) {
 	tests := []struct {
 		name    string

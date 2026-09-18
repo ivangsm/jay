@@ -81,9 +81,8 @@ type Server struct {
 // NewServer creates a new native protocol server.
 //
 // rateLimit is requests per second per connection key; rateBurst is the
-// token-bucket capacity. rateLimit <= 0 disables the limiter entirely.
-// Pre-existing callers pass (100, 200) from config; those defaults are
-// preserved by internal/ratelimit.New when Burst <= 0.
+// token-bucket capacity. rateLimit <= 0 disables the limiter entirely, and
+// rateBurst <= 0 takes internal/ratelimit.New's default.
 func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, rateLimit, rateBurst int) *Server {
 	return &Server{
 		db:       db,
@@ -265,23 +264,14 @@ func handshakeRejection(err error) (status byte, respond bool) {
 	}
 }
 
-// logRecoveredPanic writes the one thing a panic must always leave behind: a
-// line in the same JSON stream as everything else, plus a counter that moves.
+// logRecoveredPanic writes what a panic must always leave behind: a line in
+// the same JSON stream as everything else, plus a counter that moves. Every
+// native connection is a bare goroutine, so an unrecovered panic here takes the
+// whole process down, not one request.
 //
-// The native server needs this more than the HTTP one does. net/http recovers a
-// panicking handler per connection, so there the cost of no middleware was one
-// unexplained request; here every connection is a bare goroutine, and an
-// unrecovered panic in a handler does not lose a request — it takes the whole
-// process down, every other connection with it, leaving a stack on stderr that
-// no JSON collector keeps.
-//
-// stack is passed in rather than taken here because runtime/debug.Stack only
-// sees the panicking frames while the deferred function that recovered is still
-// running; capturing it at the defer site keeps that unambiguous.
-//
-// log may be nil in a fixture. Falling back to the default logger matters more
-// here than anywhere else: this function runs while a panic is being handled,
-// and a nil dereference inside it would be a panic with nothing left to catch it.
+// stack is passed in because runtime/debug.Stack only sees the panicking frames
+// while the deferred function that recovered is still running. log may be nil
+// in a fixture, and a nil dereference here would be a panic nothing catches.
 func logRecoveredPanic(log *slog.Logger, metrics *maintenance.Metrics, rec any, stack []byte, attrs ...any) {
 	metrics.RecordPanicRecovered()
 	if log == nil {
@@ -296,14 +286,11 @@ func logRecoveredPanic(log *slog.Logger, metrics *maintenance.Metrics, rec any, 
 func (s *Server) handleConn(nc net.Conn) {
 	defer func() { _ = nc.Close() }()
 
-	// Registered after the close above, so it runs BEFORE it: the connection is
-	// still closed either way, and the panic never reaches the top frame of this
-	// goroutine, where the runtime would kill the process.
-	//
-	// handleOneRequest recovers first and with better context (it knows the
-	// opcode). This one is what covers the handshake, authentication and the
-	// deadline plumbing around the loop — the part where there is no request to
-	// name yet, and the part a future edit is most likely to forget.
+	// Registered after the close above, so it runs BEFORE it: the connection
+	// is still closed, and the panic never reaches the top frame of this
+	// goroutine, where the runtime would kill the process. handleOneRequest
+	// recovers first with the opcode; this one covers the handshake,
+	// authentication and the deadline plumbing around the loop.
 	defer func() {
 		if rec := recover(); rec != nil {
 			logRecoveredPanic(s.log, s.metrics, rec, debug.Stack(),
@@ -454,17 +441,11 @@ func (h *connHandler) handleOneRequest() (err error) {
 		return err
 	}
 
-	// The frame is identified from here on, so a panic can name the operation
-	// that caused it: "a connection died" and "op 0x11 on stream 7 panicked"
-	// are not the same diagnosis, and the first is indistinguishable from a
-	// client that simply hung up.
-	//
-	// The connection is NOT kept alive afterwards. The handler may have consumed
-	// part of its own frame before panicking, so the byte stream is of unknown
-	// alignment and the next ReadHeader would parse whatever came next as a
-	// header. Returning an error closes the connection, which is the honest
-	// answer: the client sees the request fail instead of receiving replies that
-	// belong to a different frame.
+	// The frame is identified from here on, so a panic can name the opcode and
+	// stream that caused it. The connection is NOT kept alive afterwards: the
+	// handler may have consumed part of its own frame, so the stream is of
+	// unknown alignment and the next ReadHeader would parse body bytes as a
+	// header. Returning an error closes the connection.
 	defer func() {
 		if rec := recover(); rec != nil {
 			logRecoveredPanic(h.log, h.metrics, rec, debug.Stack(),

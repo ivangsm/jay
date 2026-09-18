@@ -54,11 +54,10 @@ func (e *ChecksumError) Unwrap() error { return e.Kind }
 // ChecksumAlgorithm names one of the digests a client may declare on an upload.
 //
 // The set is closed and complete: these five are every algorithm S3 defines for
-// object payloads, and jay computes all five. That is deliberate — the
-// alternative (accepting an algorithm and answering with a SHA-256 nobody asked
-// for) is the defect this file exists to remove, and answering 501 instead
-// would break the reference client, which declares CRC64NVME on every single
-// upload it makes.
+// object payloads, and jay computes all five. Answering 501 to one of them
+// would break the AWS CLI, which declares CRC64NVME on every upload; accepting
+// it and answering with a SHA-256 nobody asked for is a verification that never
+// happened.
 type ChecksumAlgorithm string
 
 // The algorithms S3 defines for object checksums.
@@ -124,12 +123,9 @@ func (a ChecksumAlgorithm) newHash() hash.Hash {
 	case ChecksumCRC64NVME:
 		return crc64.New(crc64NVMETable)
 	case ChecksumSHA1:
-		// Semgrep's weak-crypto rule flags this, and it is right about SHA-1 in
-		// general and wrong about it here: S3 defines x-amz-checksum-sha1 as
-		// SHA-1, so the only way to "fix" it would be to answer a different
-		// algorithm than the client asked for. No nolint directive: gosec is
-		// not in the lint gate, and a directive that suppresses nothing is
-		// worse than the comment that explains why.
+		// Not a security choice: S3 defines x-amz-checksum-sha1 as SHA-1, and
+		// the only way to "fix" a weak-crypto finding here would be to answer
+		// a different algorithm than the client asked for.
 		return sha1.New()
 	case ChecksumSHA256, "":
 		return nil
@@ -221,7 +217,7 @@ func NewChecksumVerifier(req ChecksumRequest) (*ChecksumVerifier, error) {
 	} else if req.Digest != "" {
 		// Unreachable through the HTTP parser, which always sets both. Guarded
 		// anyway: a digest with no algorithm cannot be checked against
-		// anything, and accepting it would be the silent pass this file removes.
+		// anything, and must not pass silently.
 		return nil, &ChecksumError{
 			Header: checksumHeaderPrefix + "*",
 			Kind:   ErrUnknownChecksumAlgorithm,

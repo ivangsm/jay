@@ -35,13 +35,10 @@ type HealthChecker struct {
 }
 
 // Durability is the readiness probe's answer to "what of my data does this
-// instance have a recovery path for".
-//
-// It is on the probe rather than only in the documentation because the probe is
-// where an operator looks during an incident, and because a page nobody opened
-// is not a disclosure. Every field is a statement jay can back up: metadata has
-// an hourly verified snapshot, object bytes have nothing, and the snapshot
-// directory either shares a fate with the data or does not.
+// instance have a recovery path for". It is on the probe, not only in the
+// documentation, because the probe is where an operator looks during an
+// incident. Every field is a statement jay can back up: metadata has an hourly
+// verified snapshot, object bytes have nothing.
 type Durability struct {
 	// MetadataBackup describes the hourly snapshot in one line.
 	MetadataBackup string `json:"metadata_backup"`

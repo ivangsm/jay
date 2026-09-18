@@ -10,15 +10,11 @@ import (
 	"github.com/ivangsm/jay/internal/jsonx"
 )
 
-// TestWireMatchesV1 es la guarda del helper compartido. jsonx.Wire está copiado
-// VERBATIM en los cinco repos del monorepo y su único trabajo es emitir los
-// mismos bytes que emitía encoding/json v1; si una de sus cinco opciones se
-// cae, todo lo que jay tiene persistido en bbolt cambia de formato.
-//
-// El corpus de meta/ prueba Wire contra los tipos reales, pero no puede cubrir
-// las opciones que ningún tipo de jay ejercita hoy (por ejemplo un mapa nil sin
-// `omitempty`). Este test cubre las cinco de frente, con tipos sintéticos, para
-// que la copia del helper esté protegida aunque los tipos de jay cambien.
+// TestWireMatchesV1 guards the shared helper: jsonx.Wire must emit the same
+// bytes as encoding/json v1, or everything jay persists in bbolt changes
+// format. The meta/ corpus covers Wire against the real types; this one covers
+// each of the five options directly, with synthetic types, so the guard holds
+// even when jay's types stop exercising one of them.
 func TestWireMatchesV1(t *testing.T) {
 	type todo struct {
 		SliceNil   []string          `json:"slice_nil"`
@@ -97,11 +93,9 @@ func TestStrictRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-// TestLenientAceptaLoQueV1AceptabaSinChistar fija por qué las políticas de
-// bucket se leen con Lenient y no con los defaults de v2: v1 hacía matching de
-// nombres CASE-INSENSITIVE. Con los defaults de v2 una política escrita al
-// estilo AWS ("Effect") dejaría de parsearse y su Deny desaparecería en
-// silencio — que en jay significa dar acceso donde antes se negaba.
+// TestLenientAcceptsWhatV1AcceptedSilently pins why bucket policies are read
+// with Lenient and not v2's defaults: under case-sensitive matching an
+// AWS-style policy ("Effect") parses with its Deny silently gone.
 func TestLenientAcceptsWhatV1AcceptedSilently(t *testing.T) {
 	type statement struct {
 		Effect string `json:"effect"`

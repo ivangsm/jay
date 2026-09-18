@@ -86,9 +86,8 @@ func TestBucketStats_IgnoresDeletedAndQuarantined(t *testing.T) {
 }
 
 // TestRebuildBucketStats_GobRecords verifies that RebuildBucketStats decodes
-// objects persisted with the current binary (gob) codec. A previous version
-// used json.Unmarshal directly, silently skipping every gob record and
-// rebuilding the counter as (0,0).
+// objects persisted with the current binary (gob) codec: a JSON-only decode
+// would skip every gob record and rebuild the counter as (0,0).
 func TestRebuildBucketStats_GobRecords(t *testing.T) {
 	db := openBucketsTestDB(t)
 	b := &Bucket{ID: uuid.New().String(), Name: "rebuild", Visibility: "private", Status: "active"}

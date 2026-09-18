@@ -36,11 +36,8 @@ func (h *Handler) denyMultipartPolicy(w http.ResponseWriter, r *http.Request, bu
 		return false
 	}
 
-	// Lenient rather than v2's defaults: bucket policies are written by hand,
-	// and v1 matched field names case-insensitively. Under v2's case-sensitive
-	// defaults an AWS-style policy ("Effect"/"Statements") would stop parsing
-	// and its Deny statement would vanish silently — opening access where it
-	// used to be refused. Lenient preserves v1's matching.
+	// Lenient, not v2's defaults: under case-sensitive matching an AWS-style
+	// policy ("Effect"/"Statements") parses with its Deny silently gone.
 	var policy auth.BucketPolicy
 	if err := jsonv2.Unmarshal(bucket.PolicyJSON, &policy, jsonx.Lenient); err != nil {
 		h.log.Warn("multipart: malformed bucket policy, failing closed", "bucket", bucket.Name, "err", err)
@@ -297,11 +294,9 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	// A checksum declared here describes the ASSEMBLED object, and S3 computes
 	// it by composing the part digests rather than by hashing the result. jay
-	// does not implement that composition, and accepting the header would mean
-	// answering 200 to a verification that never happened — the exact defect
-	// PND-0189 removed from PutObject. 501, the same answer every other
-	// unimplemented S3 feature gets here. No measured client sends it: the AWS
-	// CLI's CompleteMultipartUpload carries part numbers and ETags only.
+	// does not implement that composition, so the header gets 501 like every
+	// other unimplemented S3 feature, never a 200 over a verification that did
+	// not happen. The AWS CLI does not send it.
 	for _, candidate := range checksumValueHeaders {
 		if strings.TrimSpace(r.Header.Get(candidate.header)) == "" {
 			continue

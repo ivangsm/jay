@@ -1,14 +1,9 @@
 package admin
 
-// PND-0187: bucket policies and visibility were implemented and unreachable.
-// The evaluator was real and tested; installing one required stopping jay and
-// writing the bucket record into bbolt with a purpose-built program.
-//
-// So no test here asserts that the endpoint answered 200. Every one of them
-// asks the S3 handler the SAME question before and after the admin call and
-// requires the ANSWER to change — a request that was refused and is now served
-// with the right bytes, or the reverse. A 200 from the admin API proves the
-// route exists; only the flipped decision proves the policy is installed.
+// No test here asserts that the endpoint answered 200. Every one of them asks
+// the S3 handler the SAME question before and after the admin call and
+// requires the ANSWER to change: a 200 from the admin API proves the route
+// exists; only the flipped decision proves the policy is installed.
 
 import (
 	"encoding/json/jsontext"
@@ -213,8 +208,7 @@ func TestPutBucketPolicy_AllowOpensACrossAccountRead(t *testing.T) {
 	f := newPolicyFixture(t)
 	stranger := bearer(strangerTokenID, strangerSecret)
 
-	// Before: the widest possible token of another account is refused, which is
-	// the behaviour PND-0185 established and this must not change.
+	// Before: the widest possible token of another account is refused.
 	if code, body := f.get(t, stranger); code == http.StatusOK || body == policyBody {
 		t.Fatalf("the stranger could already read the object (%d, %q) — the test "+
 			"would prove nothing", code, body)
@@ -224,8 +218,8 @@ func TestPutBucketPolicy_AllowOpensACrossAccountRead(t *testing.T) {
 		t.Fatalf("install policy: want 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// After: the SAME request now succeeds and returns the object's bytes. This
-	// is the assertion the pendiente is about — the endpoint changed a decision.
+	// After: the SAME request succeeds and returns the object's bytes — the
+	// endpoint changed a decision.
 	code, body := f.get(t, stranger)
 	if code != http.StatusOK {
 		t.Fatalf("after installing the allow the stranger still gets %d: %s", code, body)

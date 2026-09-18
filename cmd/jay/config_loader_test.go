@@ -385,13 +385,12 @@ func TestLoadConfigFromSources_BackupDirEnvOverridesYAML(t *testing.T) {
 	}
 }
 
-// --- the metadata_backup.dir rename ------------------------------------------
+// --- the metadata_backup.dir alias -------------------------------------------
 //
-// backup.dir became metadata_backup.dir because the old name promised a copy of
-// the objects and jay only ever copied the metadata. The old spelling has to
-// keep working — a deployment that pointed JAY_BACKUP_DIR at a separate volume
-// must not silently start writing snapshots back onto the data disk — and it
-// has to say that it is the old spelling, or the rename never reaches anyone.
+// backup.dir / JAY_BACKUP_DIR is the deprecated spelling of metadata_backup.dir.
+// It has to keep working (dropping it would send a separate-volume deployment
+// back to the data disk without a word) and it has to warn that it is the old
+// name.
 
 func TestLoadConfigFromSources_MetadataBackupDirCanonicalEnv(t *testing.T) {
 	clearJAYEnv(t)
@@ -578,10 +577,9 @@ func TestLoadConfigFromSources_MaxObjectSizeInvalidEnvKeepsDefault(t *testing.T)
 // clearJAYEnv unsets every env var the config loader consumes so the test's
 // baseline is known. t.Setenv restores the original value on cleanup.
 //
-// The list comes from bindings() rather than being written out again. A
-// hand-copied one had already gone stale — JAY_NATIVE_TLS_CERT and its key were
-// missing — and a variable the suite forgets to clear makes every test that
-// asserts a default depend on the developer's shell.
+// The list comes from bindings(), never from a hand-copied one: a variable the
+// suite forgets to clear makes every test that asserts a default depend on the
+// developer's shell.
 func clearJAYEnv(t *testing.T) {
 	t.Helper()
 	// JAY_CONFIG_FILE is read directly by main, not through a binding.
@@ -631,8 +629,8 @@ func equalAny(got, want any) bool {
 
 // --- empty values: "unset" for every key but native_addr ---------------------
 
-// An empty JAY_NATIVE_ADDR is the documented off switch. It used to be
-// discarded as "unset", so the native protocol came up on the :4444 default.
+// An empty JAY_NATIVE_ADDR is the documented off switch, not an unset value:
+// treating it as unset brings the native protocol up on the :4444 default.
 func TestLoadConfigFromSources_EmptyNativeAddrEnvDisablesNative(t *testing.T) {
 	clearJAYEnv(t)
 	t.Setenv("JAY_NATIVE_ADDR", "")
@@ -800,16 +798,12 @@ func TestLoadConfigFromSources_EmptySecretEnvKeepsYAMLSecret(t *testing.T) {
 
 // The documented YAML template is written with ${VAR:-} on the optional keys,
 // so an ordinary boot interpolates several of them to "". Those must load
-// without a single warning: an empty tls_cert is the same as no tls_cert, and
-// seven lines of noise per boot is how operators learn to skip the one warning
-// that means something.
+// without a single warning: an empty tls_cert is the same as no tls_cert.
 func TestLoadConfigFromSources_EmptyYAMLValueOnOptionalKeysIsSilent(t *testing.T) {
 	clearJAYEnv(t)
 	path := filepath.Join(t.TempDir(), "jay.yaml")
-	// backup.dir is in here on purpose alongside its replacement: an empty
-	// deprecated key is a template that interpolated to nothing, and warning
-	// "you used the old name" about a value that did nothing is the same noise
-	// this test exists to keep out.
+	// backup.dir is here alongside its replacement: an empty deprecated key is
+	// a template that interpolated to nothing, and must not warn either.
 	body := "tls_cert: \"\"\ntls_key: \"\"\nbackup:\n  dir: \"\"\nmetadata_backup:\n  dir: \"\"\nseed_token:\n  account: \"\"\n  id: \"\"\n  secret: \"\"\nclient:\n  token_id: \"\"\n  token_secret: \"\"\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write yaml: %v", err)

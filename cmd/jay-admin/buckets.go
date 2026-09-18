@@ -1,11 +1,6 @@
 package main
 
-// Bucket policy and visibility, the operator side of PND-0187.
-//
-// The endpoints alone would already be a way in, but jay-admin is what the docs
-// tell an operator to use and what ships in the release archives and the image.
-// A feature reachable only by hand-writing curl is a feature half of its users
-// will not find.
+// Bucket policy and visibility subcommands, over the /_jay/buckets endpoints.
 
 import (
 	"bytes"

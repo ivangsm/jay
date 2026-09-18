@@ -24,18 +24,11 @@ import (
 
 // What the hourly snapshot does and does not contain, written down once so the
 // log line, the readiness payload and the documentation cannot drift apart.
-//
-// This is the whole point of the pair: jay snapshots metadata and nothing else.
-// Object bytes have no copy anywhere — no replication, no sync-out, no remote
-// target — and jay has no object versioning either, so a PUT over an existing
-// key destroys the previous bytes for good. Calling that "the backup" without
-// qualification is a durability guarantee jay does not have, and an operator
-// who believes it finds out during a restore, which is the worst possible
-// moment.
-//
-// The recovery path for object bytes is external and documented in the
-// backup-and-restore guide: copy buckets/ with an ordinary file-level tool,
-// restore it BEFORE the metadata snapshot, and let startup recovery reconcile.
+// jay snapshots metadata and nothing else: object bytes have no copy anywhere
+// and there is no versioning, so a PUT over an existing key destroys the
+// previous bytes for good. Their recovery path is external (the
+// backup-and-restore guide): copy buckets/ with a file-level tool, restore it
+// BEFORE the metadata snapshot, and let startup recovery reconcile.
 const (
 	// SnapshotCovers names what a snapshot file actually holds.
 	SnapshotCovers = "meta/jay.db (bbolt): accounts, buckets, object records, tokens, multipart state"
@@ -172,18 +165,12 @@ func (bm *BackupManager) verifyAndCleanup(backupPath string) (*BackupVerifyResul
 	return result, nil
 }
 
-// Verify opens a backup file and checks that the required bbolt buckets exist
-// and returns basic counts for validation.
-//
-// What it proves: the file opens as a bbolt database, the five required buckets
-// are present, and the records inside can be walked. That is enough to reject a
-// truncated or half-written snapshot, which is what it is for.
-//
-// What it does NOT prove, and cannot: that any of the ObjectCount records has
-// bytes behind it. A snapshot is a copy of the metadata file and has no view of
-// the filesystem. ObjectCount is a count of records, not of recoverable
-// objects — restoring this file over an empty buckets/ directory yields an
-// installation where startup recovery quarantines every one of them.
+// Verify opens a backup file, checks that the five required bbolt buckets
+// exist and that their records can be walked, and returns basic counts. That
+// rejects a truncated or half-written snapshot. It cannot prove that any
+// ObjectCount record has bytes behind it: the count is of records, not of
+// recoverable objects, and restoring the file over an empty buckets/ directory
+// makes startup recovery quarantine every one of them.
 func (bm *BackupManager) Verify(backupPath string) (*BackupVerifyResult, error) {
 	db, err := bolt.Open(backupPath, 0o600, &bolt.Options{
 		ReadOnly: true,

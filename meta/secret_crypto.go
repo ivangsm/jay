@@ -157,13 +157,12 @@ func (db *DB) MigrateTokenSecrets() (migrated int, err error) {
 }
 
 // resecretTokens is the shared core of RekeyTokens and MigrateTokenSecrets: it
-// scans the token bucket in a read transaction, lets rewrite decide which ones to
-// touch and how, and writes every affected one back in a SINGLE
-// transacción de escritura (todo o nada).
+// scans the token bucket in a read transaction, lets rewrite decide which ones
+// to touch and how, and writes every affected one back in a SINGLE write
+// transaction (all or nothing).
 //
-// The scan gets its own transaction on purpose: re-encrypting is CPU work —
-// AES-GCM per token — and holding the write transaction while
-// tanto.
+// The scan gets its own transaction: re-encrypting is AES-GCM per token, and
+// bbolt has one writer, so that CPU work must not run under the write lock.
 func (db *DB) resecretTokens(rewrite func(*Token) (bool, error)) (int, error) {
 	type pending struct {
 		id   string

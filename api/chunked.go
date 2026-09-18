@@ -7,34 +7,16 @@ import (
 )
 
 // withUnframedBody refuses a request whose body carries AWS `aws-chunked`
-// framing, before anything reads a byte of it.
+// framing, before anything reads a byte of it: jay has no decoder for it, and
+// storing the body verbatim would keep the chunk headers as the object.
 //
-// Why it exists: jay never had a decoder for that framing, but SigV4
-// verification recognised the mode well enough to *skip* the payload check. The
-// two together meant `mc cp` of a 15-byte file stored 187 bytes — the chunk
-// headers and signatures kept as the object body — under a 200, with the ETag
-// and the SHA-256 computed over the corrupted bytes. The scrubber then
-// certified them healthy forever and recovery saw nothing inconsistent. A 200
-// on work that did not happen is the failure this repo exists to avoid, so
-// until there is a decoder the mode is refused.
-//
-// Why here, ahead of every other middleware except request ID, logging and the
-// IP rate limiter:
-//
-//   - Nothing is written. The refusal happens before authentication, before
-//     dispatch and before any handler opens a temp file, so a rejected upload
-//     leaves no object, no metadata and no orphan in JAY_DATA_DIR.
-//   - One gate covers every entry point with a body. PutObject, UploadPart,
-//     CompleteMultipartUpload, DeleteObjects and CreateBucket all pass through
-//     here, and so do all three credential forms — Bearer, SigV4 header and
-//     both presigned styles, which branch off later in withPresigned. A gate
-//     per handler is a gate someone forgets on the next handler.
-//   - No work is wasted verifying a signature for a request that cannot be
-//     served. It still sits *inside* withIPRateLimit, so a flood of framed
-//     requests is still rate limited.
-//
-// auth.verifyPayloadHash refuses the same requests a second time, so removing
-// or reordering this middleware cannot silently restore the old behaviour.
+// It sits ahead of every middleware except request ID, logging and the IP
+// rate limiter: the refusal happens before authentication and before any
+// handler opens a temp file, so nothing is written; one gate covers every
+// entry point with a body and all three credential forms, which branch off
+// later in withPresigned; and no signature is verified for a request that
+// cannot be served. auth.verifyPayloadHash refuses the same requests a second
+// time, so reordering this middleware cannot silently let them through.
 func (h *Handler) withUnframedBody(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hdr := auth.ChunkedBodyIndicator(r)
@@ -45,8 +27,7 @@ func (h *Handler) withUnframedBody(next http.HandlerFunc) http.HandlerFunc {
 
 		// The ID comes from withRequestID, the outermost middleware, so this
 		// refusal reports the same one the client reads in x-amz-request-id
-		// and the same one the access log line carries. This middleware used
-		// to mint its own because the ID was generated further down the chain.
+		// and the same one the access log line carries.
 		h.log.Warn("rejected aws-chunked request body",
 			"request_id", requestIDFromContext(r.Context()),
 			"method", r.Method,

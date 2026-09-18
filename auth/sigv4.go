@@ -117,13 +117,11 @@ const maxSignedPayloadSize = 32 << 20 // 32 MiB
 // declared in x-amz-content-sha256, and leaves the body readable by handlers.
 //
 // An aws-chunked body is refused outright, whatever the declared hash says:
-// jay cannot decode the framing, so there is nothing here that could verify it.
-// This used to be a *skip* — STREAMING-* returned nil "because chunk signatures
-// carry their own integrity" — and since nothing downstream decoded the framing
-// either, the framing itself was stored as the object body under a 200.
+// jay cannot decode the framing, so nothing here could verify it, and skipping
+// the check would store the framing as the object body.
 //
-// Verification is skipped, honestly, for UNSIGNED-PAYLOAD and for an absent
-// header, which the canonical request already treats as UNSIGNED-PAYLOAD.
+// Verification is skipped for UNSIGNED-PAYLOAD and for an absent header, which
+// the canonical request already treats as UNSIGNED-PAYLOAD.
 func verifyPayloadHash(r *http.Request, declared string) error {
 	if hdr := ChunkedBodyIndicator(r); hdr != "" {
 		return fmt.Errorf("%w: announced by %s", ErrChunkedBodyUnsupported, hdr)

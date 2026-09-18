@@ -210,32 +210,6 @@ type ListObjectsResult struct {
 	NextStartAfter string
 }
 
-// ListObjects lists objects in a bucket with prefix, delimiter, pagination support.
-//
-// Iteration is split into short read transactions (batchSize keys each) so that
-// long listings do not starve bbolt writers (bbolt allows a single writer and
-// blocks it for the entire lifetime of any overlapping read tx). Between
-// batches the read tx is released, giving writers a chance to commit; the next
-// batch resumes from the last key seen.
-//
-// Externally observable semantics (returned object set, CommonPrefixes,
-// IsTruncated, delimiter handling, prefix matching, maxKeys cap) are preserved
-// bit-identical to the previous single-tx implementation.
-//
-// NextStartAfter is the last key fully consumed by the page — that is, the last
-// key that either produced an object, produced a CommonPrefix, or was folded
-// into a CommonPrefix already emitted in this page (as well as records skipped
-// because they were corrupt or not active). It is NOT necessarily the key of the
-// last object returned. This is what makes delimiter pagination terminate:
-// startAfter is exclusive, so the next page resumes strictly after the last key
-// this page looked at, which guarantees monotonic progress even when a page ends
-// on (or consists entirely of) CommonPrefixes. Because members of an already
-// emitted CommonPrefix are consumed before the maxKeys check, a prefix group is
-// never split across pages, so no CommonPrefix can be emitted twice.
-//
-// Real S3 uses an opaque NextContinuationToken; a plain "last key seen" cursor
-// is sufficient here and keeps the token human-readable and compatible with
-// start-after.
 // defaultMaxKeys is the page size S3 uses when a client does not ask for one.
 const defaultMaxKeys = 1000
 
@@ -273,6 +247,12 @@ type listCursor struct {
 // The listing is paged internally: bbolt is read in small batches and each batch
 // is processed after its transaction closes, so a large listing never holds a
 // read transaction open long enough to stall writers.
+//
+// NextStartAfter is the last key the page fully consumed (emitted, rolled into
+// a CommonPrefix, or skipped), not necessarily the last object returned;
+// startAfter is exclusive, so the next page always makes progress, even when
+// this one ends on a CommonPrefix. Members of an emitted prefix are consumed
+// before the maxKeys check, so a prefix is never split across pages.
 func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKeys int) (*ListObjectsResult, error) {
 	if maxKeys <= 0 {
 		maxKeys = defaultMaxKeys

@@ -7,9 +7,8 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
-// AuthorizeBucketAccess is the whole cross-account decision (PND-0185). These
-// cases pin the order of the three doors and, above all, that the default is
-// deny — a bucket that says nothing about a stranger says no.
+// AuthorizeBucketAccess is the whole cross-account decision. These cases pin
+// the order of the three doors and that the default is deny.
 
 func ownedBucket(policy string) *meta.Bucket {
 	b := &meta.Bucket{

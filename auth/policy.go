@@ -22,25 +22,12 @@ const (
 )
 
 // ValidatePolicy refuses a document the evaluator could not act on as written.
-//
-// This runs where the policy ENTERS, not where it is evaluated, and that is the
-// whole point: every rule below describes something that silently does nothing
-// at evaluation time, which is the worst possible failure for an access-control
-// document. A policy that is stored and never matches looks installed —
-// `GET /_jay/buckets/{name}` shows it, the operator moves on — and the access it
-// was supposed to grant or deny simply never happens.
-//
-// The three that bite hardest:
-//
-//   - A misspelt action ("object:read") matches nothing, ever. The deny that
-//     was meant to close a prefix leaves it open.
-//   - An empty subjects list matches nothing either, because matchesSubject
-//     iterates and returns false on an empty slice. The statement is inert.
-//   - An unparsable CIDR is worse than inert, and in the dangerous direction:
-//     Compile skips the ones that do not parse, and matchesIPConditionNets
-//     treats an EMPTY network list as "any IP". So `"ip_whitelist": ["10.0.0/8"]`
-//     — one dot short — turns a statement scoped to an internal range into one
-//     that matches the entire internet.
+// It runs where the policy ENTERS, because every rule below is something that
+// silently does nothing at evaluation time: a misspelt action or an empty
+// subjects list matches nothing, and an unparsable CIDR is worse — Compile
+// skips it and matchesIPConditionNets reads an empty network list as "any IP",
+// so `10.0.0/8` (one dot short) opens an internal-only statement to the whole
+// internet.
 func ValidatePolicy(policy *BucketPolicy) error {
 	if policy == nil {
 		return fmt.Errorf("%w: no document", ErrInvalidPolicy)
