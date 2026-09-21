@@ -24,16 +24,19 @@ version="${version#v}"
 changelog="$(dirname "$0")/../CHANGELOG.md"
 
 # From the heading of this version up to (not including) the next "## [" one.
-# The link-reference definitions at the bottom of the file ("[0.16.0]: https://…")
+# The heading is matched on its literal "## [X.Y.Z]" prefix, never as a regex:
+# a "." or a "+" in the version must not match anything but itself. The
+# link-reference definitions at the bottom of the file ("[0.16.0]: https://…")
 # are not part of any section.
-section="$(awk -v v="$version" '
-	/^## \[/ { in_section = ($0 ~ "^## \\[" v "\\]") ; if (in_section) { next } }
+section="$(awk -v heading="## [$version]" '
+	/^## \[/ { in_section = (substr($0, 1, length(heading)) == heading); if (in_section) { next } }
 	/^\[[^]]+\]: / { next }
 	in_section { print }
 ' "$changelog")"
 
-# Drop leading/trailing blank lines so the test for emptiness is honest.
-section="$(printf '%s\n' "$section" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
+# Drop leading and trailing blank lines: the emptiness test below has to be
+# honest, and the section is pasted verbatim as the top of the release body.
+section="$(printf '%s\n' "$section" | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
 if [ -z "$(printf '%s' "$section" | tr -d '[:space:]')" ]; then
 	echo "CHANGELOG.md has no section '## [$version]', or it is empty — write the release notes before tagging" >&2
 	exit 1
