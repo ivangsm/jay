@@ -11,6 +11,21 @@ change bumps the minor version and is called out as such below.
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-09-21
+
+### Fixed
+
+- `scripts/release-notes.sh` matched the version heading as a regular
+  expression, so a `.` or a `+` in the tag stood for any character, and it
+  left a blank line at the top of the extracted section. The heading is now
+  compared literally and the section is trimmed on both ends before it
+  becomes the release header.
+
+### Upgrade notes
+
+- No change in the server, the library or the client: the rest of this
+  release is comment rewrites. Nothing to do.
+
 ## [0.17.0] - 2026-09-17
 
 ### Highlights
@@ -126,6 +141,7 @@ the handshake, which carries the token secret, stops travelling in the clear.
 - If you set `JAY_BACKUP_DIR`, rename it to `JAY_METADATA_BACKUP_DIR` at your
   convenience; the old name keeps working.
 
-[Unreleased]: https://github.com/ivangsm/jay/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/ivangsm/jay/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/ivangsm/jay/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/ivangsm/jay/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/ivangsm/jay/compare/v0.12.0...v0.16.0
