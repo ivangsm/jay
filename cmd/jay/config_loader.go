@@ -126,6 +126,7 @@ func defaultConfig() Config {
 		ListenAddr:       ":9000",
 		AdminAddr:        ":9001",
 		NativeAddr:       ":4444",
+		NativeMaxConns:   1000,
 		LogLevel:         "info",
 		RateLimit:        100,
 		RateBurst:        200,
@@ -157,6 +158,10 @@ func bindings() []yamlKeyBinding {
 		bindString("tls_key", "JAY_TLS_KEY", func(c *Config) *string { return &c.TLSKey }),
 		bindString("native_tls_cert", "JAY_NATIVE_TLS_CERT", func(c *Config) *string { return &c.NativeTLSCert }),
 		bindString("native_tls_key", "JAY_NATIVE_TLS_KEY", func(c *Config) *string { return &c.NativeTLSKey }),
+		// A cap of zero would refuse every client while the listener looks
+		// healthy, so it takes the same positive-only binding as rate_burst.
+		bindPositiveInt("native_max_conns", "JAY_NATIVE_MAX_CONNS", func(c *Config) *int { return &c.NativeMaxConns }),
+		bindNonNegativeInt64("native_token_bytes_per_sec", "JAY_NATIVE_TOKEN_BYTES_PER_SEC", func(c *Config) *int64 { return &c.NativeTokenBytesPerSec }),
 		bindFloat("rate_limit", "JAY_RATE_LIMIT", func(c *Config) *float64 { return &c.RateLimit }),
 		bindPositiveInt("rate_burst", "JAY_RATE_BURST", func(c *Config) *int { return &c.RateBurst }),
 		bindBool("trust_proxy_headers", "JAY_TRUST_PROXY_HEADERS", func(c *Config) *bool { return &c.TrustProxyHeaders }),
@@ -175,6 +180,11 @@ func bindings() []yamlKeyBinding {
 		bindString("metadata_backup.dir", "JAY_METADATA_BACKUP_DIR", func(c *Config) *string { return &c.MetadataBackupDir }),
 		bindMinFreeBytes(),
 		bindMaxObjectSize(),
+
+		// GET /metrics. A secret like admin_token: no default, and a short
+		// one aborts the boot (see checkMetricsAccess).
+		bindString("metrics.token", "JAY_METRICS_TOKEN", func(c *Config) *string { return &c.MetricsToken }),
+		bindBool("metrics.public", "JAY_METRICS_PUBLIC", func(c *Config) *bool { return &c.MetricsPublic }),
 
 		bindString("seed_token.account", "JAY_SEED_TOKEN_ACCOUNT", func(c *Config) *string { return &c.SeedTokenAccount }),
 		bindString("seed_token.id", "JAY_SEED_TOKEN_ID", func(c *Config) *string { return &c.SeedTokenID }),
@@ -477,40 +487,21 @@ func bindScrubMaxPerRun() yamlKeyBinding {
 }
 
 func bindMinFreeBytes() yamlKeyBinding {
-	const env = "JAY_MIN_FREE_BYTES"
-	return yamlKeyBinding{
-		path:   "min_free_bytes",
-		envVar: env,
-		applyYAML: func(cfg *Config, raw any, log *slog.Logger) (string, bool, error) {
-			n, err := toInt64(raw)
-			if err != nil {
-				return "", false, err
-			}
-			if n < 0 {
-				log.Error("invalid min_free_bytes in YAML (must be >= 0), ignoring", "value", n)
-				return "", false, nil
-			}
-			cfg.MinFreeBytes = n
-			return strconv.FormatInt(n, 10), true, nil
-		},
-		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
-			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || parsed < 0 {
-				log.Error("invalid "+env+" (must be >= 0), keeping previous value", "value", value, "err", err)
-				return true
-			}
-			cfg.MinFreeBytes = parsed
-			return true
-		},
-	}
+	return bindNonNegativeInt64("min_free_bytes", "JAY_MIN_FREE_BYTES", func(c *Config) *int64 { return &c.MinFreeBytes })
 }
 
 // bindMaxObjectSize binds the maximum accepted object size (in bytes). 0 means
 // unlimited; negative values are invalid and are ignored (previous value kept).
 func bindMaxObjectSize() yamlKeyBinding {
-	const env = "JAY_MAX_OBJECT_SIZE"
+	return bindNonNegativeInt64("max_object_size", "JAY_MAX_OBJECT_SIZE", func(c *Config) *int64 { return &c.MaxObjectSize })
+}
+
+// bindNonNegativeInt64 binds a byte count or rate whose zero means "off" and
+// whose negative values mean nothing. A negative value is logged and ignored
+// at either door, leaving the previous value in place.
+func bindNonNegativeInt64(path, env string, ptr func(*Config) *int64) yamlKeyBinding {
 	return yamlKeyBinding{
-		path:   "max_object_size",
+		path:   path,
 		envVar: env,
 		applyYAML: func(cfg *Config, raw any, log *slog.Logger) (string, bool, error) {
 			n, err := toInt64(raw)
@@ -518,10 +509,10 @@ func bindMaxObjectSize() yamlKeyBinding {
 				return "", false, err
 			}
 			if n < 0 {
-				log.Error("invalid max_object_size in YAML (must be >= 0), ignoring", "value", n)
+				log.Error("invalid "+path+" in YAML (must be >= 0), ignoring", "value", n)
 				return "", false, nil
 			}
-			cfg.MaxObjectSize = n
+			*ptr(cfg) = n
 			return strconv.FormatInt(n, 10), true, nil
 		},
 		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
@@ -530,7 +521,7 @@ func bindMaxObjectSize() yamlKeyBinding {
 				log.Error("invalid "+env+" (must be >= 0), keeping previous value", "value", value, "err", err)
 				return true
 			}
-			cfg.MaxObjectSize = parsed
+			*ptr(cfg) = parsed
 			return true
 		},
 	}

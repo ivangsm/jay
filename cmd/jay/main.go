@@ -72,6 +72,7 @@ func main() {
 		"admin", cfg.AdminAddr,
 		"native", nativeAddrForLog(cfg.NativeAddr),
 	)
+	announceMetricsAccess(cfg, log)
 
 	// Open metadata database
 	dbPath := filepath.Join(cfg.DataDir, "meta", "jay.db")
@@ -233,6 +234,9 @@ func mustLoadConfig() Config {
 	if len(cfg.SigningSecret) < minSecretLen {
 		log.Fatalf("JAY_SIGNING_SECRET (or signing_secret in YAML) must be set and at least %d chars", minSecretLen)
 	}
+	if err := checkMetricsAccess(cfg); err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	// All three seed fields or none. A partial configuration is operator error:
 	// it would seed nothing while looking like it seeded something.
@@ -381,8 +385,18 @@ func shutdownAll(
 	log.Info("jay: stopped")
 }
 
-// buildAdminMux assembles the admin API, its health probes and pprof, all on the
-// admin port.
+// The health probes. They are declared once because two things need them: the
+// mux that serves them and the access log that keeps them at DEBUG.
+const (
+	healthPath      = "/health"
+	healthLivePath  = "/health/live"
+	healthReadyPath = "/health/ready"
+)
+
+// buildAdminMux assembles the admin API, the Prometheus endpoint, its health
+// probes and pprof, all on the admin port, and wraps the lot in the admin
+// access log (admin.Handler.Trace): every request on this listener gets a
+// request ID and a line, whichever of them answers it.
 //
 // Health lives here rather than on the S3 port on purpose: the readiness probe
 // reports internal state — bbolt responsiveness and free disk — and that is not
@@ -390,13 +404,18 @@ func shutdownAll(
 func buildAdminMux(
 	cfg Config, db *meta.DB, st *store.Store, au *auth.Auth,
 	metrics *maintenance.Metrics, hc *HealthChecker, log *slog.Logger,
-) (*http.ServeMux, *admin.Handler) {
+) (http.Handler, *admin.Handler) {
 	tlsEnabled := cfg.TLSCert != "" && cfg.TLSKey != ""
 	adminHandler := admin.NewHandler(admin.AdminConfig{
 		DB:            db,
 		Store:         st,
 		Auth:          au,
 		AdminToken:    cfg.AdminToken,
+		MetricsToken:  cfg.MetricsToken,
+		MetricsPublic: cfg.MetricsPublic,
+		ExtraMetrics: func() []maintenance.MetricFamily {
+			return append(hc.MetricFamilies(), buildInfoFamily())
+		},
 		Log:           log,
 		Metrics:       metrics,
 		SigningSecret: cfg.SigningSecret,
@@ -406,12 +425,13 @@ func buildAdminMux(
 
 	mux := http.NewServeMux()
 	mux.Handle("/_jay/", adminHandler)
+	mux.Handle("/metrics", adminHandler.PrometheusHandler())
 	mountPprof(mux, adminHandler.RequireAdmin)
-	mux.HandleFunc("/health", hc.ReadinessHandler)
-	mux.HandleFunc("/health/live", hc.LivenessHandler)
-	mux.HandleFunc("/health/ready", hc.ReadinessHandler)
+	mux.HandleFunc(healthPath, hc.ReadinessHandler)
+	mux.HandleFunc(healthLivePath, hc.LivenessHandler)
+	mux.HandleFunc(healthReadyPath, hc.ReadinessHandler)
 
-	return mux, adminHandler
+	return adminHandler.Trace(mux, healthPath, healthLivePath, healthReadyPath), adminHandler
 }
 
 // startMaintenance starts the background jobs that keep the store honest:
@@ -476,8 +496,13 @@ func startDataListeners(
 		return shutdownS3, nil
 	}
 
-	nativeServer := jayproto.NewServer(db, st, au, log, metrics, int(cfg.RateLimit), cfg.RateBurst)
+	// cfg.RateLimit goes in as the float it is. It used to be truncated with
+	// int(), which turned JAY_RATE_LIMIT=0.5 into 0 — no limit at all on this
+	// transport — while the S3 API applied it.
+	nativeServer := jayproto.NewServer(db, st, au, log, metrics, cfg.RateLimit, cfg.RateBurst)
 	nativeServer.SetMaxObjectSize(cfg.MaxObjectSize)
+	nativeServer.SetMaxConns(cfg.NativeMaxConns)
+	nativeServer.SetTokenBytesPerSec(cfg.NativeTokenBytesPerSec)
 
 	nativeTLS, err := nativeTLSConfig(cfg)
 	if err != nil {

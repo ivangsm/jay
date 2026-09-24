@@ -39,13 +39,22 @@ type Config struct {
 	// for real DR. Only metadata goes there: jay never copies object bytes.
 	MetadataBackupDir string
 	MinFreeBytes      int64 // JAY_MIN_FREE_BYTES / min_free_bytes — readiness fails when the DataDir filesystem has less free space; 0 disables the check
-	MaxObjectSize     int64 // JAY_MAX_OBJECT_SIZE / max_object_size — largest accepted object body (and multipart part), in bytes; 0 disables the limit
+
+	// Who may scrape GET /metrics on the admin listener. With neither set, it
+	// takes JAY_ADMIN_TOKEN like every other admin route.
+	MetricsToken  string // JAY_METRICS_TOKEN / metrics.token — read-only bearer for /metrics only; a secret: >= 32 bytes, never equal to AdminToken
+	MetricsPublic bool   // JAY_METRICS_PUBLIC / metrics.public — serve /metrics with no auth at all; explicit opt-in, excludes MetricsToken
+	MaxObjectSize int64  // JAY_MAX_OBJECT_SIZE / max_object_size — largest accepted object body (and multipart part), in bytes; 0 disables the limit
 
 	// Client credentials for the `jay` subcommands (ls, cp, rm, sync). The
 	// server itself never reads them; they live here so they go through
 	// bindings() like every other setting and stay visible to jay-config.
 	ClientTokenID     string // JAY_TOKEN_ID / client.token_id
 	ClientTokenSecret string // JAY_TOKEN_SECRET / client.token_secret
+
+	// Native back-pressure limits. The S3 API has neither.
+	NativeMaxConns         int   // JAY_NATIVE_MAX_CONNS / native_max_conns — connections held at once; the next one is refused with ServerBusy
+	NativeTokenBytesPerSec int64 // JAY_NATIVE_TOKEN_BYTES_PER_SEC / native_token_bytes_per_sec — body bytes per second per token, both directions; 0 = no cap
 }
 
 // LoadConfig is the env-only form of LoadConfigFromSources: no YAML, so the

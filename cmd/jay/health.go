@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -156,14 +157,60 @@ func (hc *HealthChecker) checkFreeSpace() error {
 	if hc.minFreeBytes <= 0 {
 		return nil
 	}
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(hc.dataDir, &st); err != nil {
-		return fmt.Errorf("statfs %s: %w", hc.dataDir, err)
+	free, err := hc.freeBytes()
+	if err != nil {
+		return err
 	}
-	// Bavail/Bsize have different widths across darwin/linux; convert both.
-	free := uint64(st.Bavail) * uint64(st.Bsize)
 	if free < uint64(hc.minFreeBytes) {
 		return fmt.Errorf("low disk space on %s: %d bytes free, need at least %d", hc.dataDir, free, hc.minFreeBytes)
 	}
 	return nil
+}
+
+// freeBytes is the space on the dataDir filesystem available to unprivileged
+// writes — the space jay can actually use.
+func (hc *HealthChecker) freeBytes() (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(hc.dataDir, &st); err != nil {
+		return 0, fmt.Errorf("statfs %s: %w", hc.dataDir, err)
+	}
+	// Bavail/Bsize have different widths across darwin/linux; convert both.
+	return uint64(st.Bavail) * uint64(st.Bsize), nil
+}
+
+// MetricFamilies exposes the two readiness checks as Prometheus gauges, run
+// fresh on every scrape: one statfs and one bbolt read transaction, the same
+// work a readiness probe does, bounded by the same timeout. Nothing is cached,
+// so a scrape never reports a disk or a database that has since changed.
+//
+// A check that cannot produce a reading leaves its gauge out rather than
+// exporting a number that would lie. That is why the bbolt check comes as a
+// pair: jay_metadata_db_up says whether the read transaction completed, and
+// the latency is exported only when it did — a transaction that errors out
+// instantly is not a fast database.
+func (hc *HealthChecker) MetricFamilies() []maintenance.MetricFamily {
+	start := time.Now()
+	pingErr := hc.pingDB(dbPingTimeout)
+	elapsed := time.Since(start)
+
+	up := 0.0
+	if pingErr == nil {
+		up = 1
+	}
+	families := []maintenance.MetricFamily{
+		maintenance.Gauge("jay_metadata_db_up",
+			"1 when a read transaction on the metadata database (bbolt) completed within the readiness timeout during this scrape, 0 when it did not.",
+			up),
+	}
+	if pingErr == nil {
+		families = append(families, maintenance.Gauge("jay_metadata_db_ping_seconds",
+			"How long that read transaction took. Absent when it failed.",
+			elapsed.Seconds()))
+	}
+	if free, err := hc.freeBytes(); err == nil {
+		families = append(families, maintenance.Gauge("jay_data_dir_free_bytes",
+			"Bytes available to jay on the filesystem holding JAY_DATA_DIR. Readiness fails below JAY_MIN_FREE_BYTES. Absent when the filesystem cannot be read.",
+			float64(free)))
+	}
+	return families
 }

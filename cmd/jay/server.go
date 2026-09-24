@@ -69,7 +69,9 @@ func startServer(addr string, handler http.Handler, log *slog.Logger, name, cert
 		// jay's middleware, a rejected TLS handshake, a failed write) goes
 		// through a *log.Logger; unset, that is plain text on stderr in a
 		// stream that is JSON everywhere else. This keeps it in the same slog
-		// handler, for the admin listener too, which has no middleware chain.
+		// handler, on both listeners: what their middleware (api's chain,
+		// admin.Handler.Trace) cannot see — a failed TLS handshake, a write
+		// that broke — still lands in the JSON stream.
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelError),
 	}
 
