@@ -3,6 +3,8 @@ package maintenance
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -79,8 +81,12 @@ func (qm *QuarantineManager) Inspect(bucketID, key string) (*InspectionResult, e
 	if err != nil {
 		return nil, err
 	}
+	return qm.inspectRecord(obj)
+}
 
-	bucket, err := qm.db.GetBucketByID(bucketID)
+// inspectRecord is Inspect for a record already read.
+func (qm *QuarantineManager) inspectRecord(obj *meta.Object) (*InspectionResult, error) {
+	bucket, err := qm.db.GetBucketByID(obj.BucketID)
 	if err != nil {
 		return nil, err
 	}
@@ -128,17 +134,31 @@ func (qm *QuarantineManager) Inspect(bucketID, key string) (*InspectionResult, e
 }
 
 // Revalidate checks if a quarantined object's checksum now matches and restores it if so.
+//
+// It only acts on quarantined objects: anything else is
+// meta.ErrObjectNotQuarantined, never a "restored". The bytes are hashed
+// outside any transaction — that can take as long as the file is large — and
+// the restore then happens only if the record is still the quarantined object
+// that was hashed (meta.RestoreQuarantinedObject checks both in the same
+// transaction that writes).
 func (qm *QuarantineManager) Revalidate(bucketID, key string) (bool, error) {
-	inspection, err := qm.Inspect(bucketID, key)
+	obj, err := qm.db.GetObjectMetaAny(bucketID, key)
 	if err != nil {
 		return false, err
 	}
+	if obj.State != "quarantined" {
+		return false, meta.ErrObjectNotQuarantined
+	}
 
+	inspection, err := qm.inspectRecord(obj)
+	if err != nil {
+		return false, err
+	}
 	if !inspection.FileExists || !inspection.ChecksumMatch {
 		return false, nil
 	}
 
-	if err := qm.db.RestoreObject(bucketID, key); err != nil {
+	if err := qm.db.RestoreQuarantinedObject(bucketID, key, obj.ObjectID); err != nil {
 		return false, err
 	}
 
@@ -149,18 +169,19 @@ func (qm *QuarantineManager) Revalidate(bucketID, key string) (bool, error) {
 	return true, nil
 }
 
-// Purge deletes both the metadata and physical file of a quarantined object.
+// Purge deletes both the file and the record of a quarantined object, and
+// refuses anything that is not quarantined with meta.ErrObjectNotQuarantined.
+//
+// The state check, the file removal and the record deletion happen inside one
+// bbolt write transaction (meta.DeleteQuarantinedObject, which also explains
+// the file-first order). A file that cannot be removed fails the purge and
+// leaves the record where it was; only a file that is already gone counts as
+// removed.
 func (qm *QuarantineManager) Purge(bucketID, key string) error {
-	obj, err := qm.db.GetObjectMetaAny(bucketID, key)
+	_, err := qm.db.DeleteQuarantinedObject(bucketID, key, func(obj *meta.Object) error {
+		return qm.store.DeleteObject(obj.LocationRef)
+	})
 	if err != nil {
-		return err
-	}
-
-	// Delete physical file (ignore not-found)
-	_ = qm.store.DeleteObject(obj.LocationRef)
-
-	// Delete metadata
-	if err := qm.db.DeleteObjectMetaAny(bucketID, key); err != nil {
 		return err
 	}
 
@@ -171,7 +192,33 @@ func (qm *QuarantineManager) Purge(bucketID, key string) error {
 	return nil
 }
 
+// PurgeFailure is one quarantined object that PurgeAll could not remove.
+type PurgeFailure struct {
+	BucketID string `json:"bucket_id"`
+	Key      string `json:"key"`
+	Error    string `json:"error"`
+}
+
+// PurgeAllError is what PurgeAll returns when some objects could not be
+// purged. The others were: PurgeAll still returns their count.
+type PurgeAllError struct {
+	Failed []PurgeFailure
+}
+
+func (e *PurgeAllError) Error() string {
+	return fmt.Sprintf("%d quarantined object(s) could not be purged", len(e.Failed))
+}
+
 // PurgeAll purges all quarantined objects and returns the count purged.
+//
+// It keeps going past a failure — one stuck file should not keep the rest of
+// the quarantine in place — but it never reports a partial purge as a whole
+// one: if anything failed, the error is a *PurgeAllError naming each object
+// and why, alongside the count of the ones that did go.
+//
+// An object that is no longer quarantined by the time its turn comes
+// (revalidated, or purged by someone else) is neither purged nor a failure:
+// there is nothing left in quarantine to act on.
 func (qm *QuarantineManager) PurgeAll() (int, error) {
 	objects, err := qm.ListQuarantined()
 	if err != nil {
@@ -179,16 +226,26 @@ func (qm *QuarantineManager) PurgeAll() (int, error) {
 	}
 
 	count := 0
+	var failed []PurgeFailure
 	for _, obj := range objects {
-		if err := qm.Purge(obj.BucketID, obj.Key); err != nil {
+		err := qm.Purge(obj.BucketID, obj.Key)
+		switch {
+		case err == nil:
+			count++
+		case errors.Is(err, meta.ErrObjectNotQuarantined), errors.Is(err, meta.ErrObjectNotFound),
+			errors.Is(err, meta.ErrBucketNotFound):
+			// Left quarantine on its own between the listing and now.
+		default:
 			qm.log.Error("quarantine: purge failed",
 				"bucket_id", obj.BucketID,
 				"key", obj.Key,
 				"err", err,
 			)
-			continue
+			failed = append(failed, PurgeFailure{BucketID: obj.BucketID, Key: obj.Key, Error: err.Error()})
 		}
-		count++
+	}
+	if len(failed) > 0 {
+		return count, &PurgeAllError{Failed: failed}
 	}
 	return count, nil
 }

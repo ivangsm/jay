@@ -545,6 +545,99 @@ func (db *DB) RestoreObject(bucketID, key string) error {
 	})
 }
 
+// ErrObjectNotQuarantined is returned by the quarantine-only operations when
+// the record exists but is not (or is no longer) the quarantined object they
+// were asked about.
+var ErrObjectNotQuarantined = errors.New("object is not quarantined")
+
+// RestoreQuarantinedObject sets a quarantined object back to "active", but
+// only if the record is still quarantined AND still the object objectID — the
+// one whose bytes the caller verified. Checked in the same write transaction
+// that restores it, so a record overwritten or restored in between is never
+// restored on the strength of another object's checksum.
+func (db *DB) RestoreQuarantinedObject(bucketID, key, objectID string) error {
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return ErrBucketNotFound
+		}
+		data := bk.Get([]byte(key))
+		if data == nil {
+			return ErrObjectNotFound
+		}
+		var obj Object
+		if err := decodeObject(data, &obj); err != nil {
+			return err
+		}
+		if obj.State != "quarantined" || obj.ObjectID != objectID {
+			return ErrObjectNotQuarantined
+		}
+		obj.State = "active"
+		obj.UpdatedAt = time.Now().UTC()
+		updated, err := encodeObject(&obj)
+		if err != nil {
+			return err
+		}
+		if err := bk.Put([]byte(key), updated); err != nil {
+			return err
+		}
+		// Quarantining took the object out of the bucket stats; restoring it
+		// puts it back.
+		return addBucketStat(tx, bucketID, 1, obj.SizeBytes)
+	})
+}
+
+// DeleteQuarantinedObject deletes a quarantined object — its file and its
+// record — and refuses anything that is not quarantined, all inside ONE write
+// transaction.
+//
+// removeFile is called with the record, after the state check and before the
+// record is deleted, while the transaction holds bbolt's single writer lock.
+// Nothing can restore or overwrite the record between the check and the
+// delete, so a live object's file is never removed. The order is file first,
+// record second, and a removeFile error aborts the transaction:
+//
+//   - removeFile fails: nothing changes. The record stays quarantined and
+//     listed, and the purge can be retried.
+//   - removeFile succeeds and the commit fails: the record stays quarantined
+//     with no file behind it — exactly a "record without a file" quarantine,
+//     still listed, and a retry finishes the purge (a missing file is not an
+//     error for removeFile).
+//
+// The reverse order would, on a failed file removal, leave a file with no
+// record. Recovery quarantines such a file into quarantine/ at the next start,
+// where no API lists or purges it: an object reported as purged whose bytes
+// are still on disk, out of reach.
+//
+// The returned object is the record that was deleted.
+func (db *DB) DeleteQuarantinedObject(bucketID, key string, removeFile func(*Object) error) (*Object, error) {
+	var obj Object
+	err := db.bolt.Update(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return ErrBucketNotFound
+		}
+		data := bk.Get([]byte(key))
+		if data == nil {
+			return ErrObjectNotFound
+		}
+		if err := decodeObject(data, &obj); err != nil {
+			return err
+		}
+		if obj.State != "quarantined" {
+			return ErrObjectNotQuarantined
+		}
+		if err := removeFile(&obj); err != nil {
+			return fmt.Errorf("meta: remove the file of quarantined object %s: %w", key, err)
+		}
+		return bk.Delete([]byte(key))
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &obj, nil
+}
+
 // DeleteObjectMetaAny removes object metadata regardless of state.
 func (db *DB) DeleteObjectMetaAny(bucketID, key string) error {
 	return db.bolt.Update(func(tx *bolt.Tx) error {
