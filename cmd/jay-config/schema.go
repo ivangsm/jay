@@ -28,6 +28,8 @@ var fieldSpecs = []fieldSpec{
 	{yamlKey: "tls_key", yamlPath: []string{"tls_key"}, envKey: "JAY_TLS_KEY", kind: typeString},
 	{yamlKey: "native_tls_cert", yamlPath: []string{"native_tls_cert"}, envKey: "JAY_NATIVE_TLS_CERT", kind: typeString},
 	{yamlKey: "native_tls_key", yamlPath: []string{"native_tls_key"}, envKey: "JAY_NATIVE_TLS_KEY", kind: typeString},
+	{yamlKey: "native_max_conns", yamlPath: []string{"native_max_conns"}, envKey: "JAY_NATIVE_MAX_CONNS", kind: typeInt},
+	{yamlKey: "native_token_bytes_per_sec", yamlPath: []string{"native_token_bytes_per_sec"}, envKey: "JAY_NATIVE_TOKEN_BYTES_PER_SEC", kind: typeInt},
 	{yamlKey: "rate_limit", yamlPath: []string{"rate_limit"}, envKey: "JAY_RATE_LIMIT", kind: typeFloat},
 	{yamlKey: "rate_burst", yamlPath: []string{"rate_burst"}, envKey: "JAY_RATE_BURST", kind: typeInt},
 	{yamlKey: "trust_proxy_headers", yamlPath: []string{"trust_proxy_headers"}, envKey: "JAY_TRUST_PROXY_HEADERS", kind: typeBool},
@@ -44,6 +46,10 @@ var fieldSpecs = []fieldSpec{
 	{yamlKey: "metadata_backup.dir", yamlPath: []string{"metadata_backup", "dir"}, envKey: "JAY_METADATA_BACKUP_DIR", kind: typeString},
 	{yamlKey: "min_free_bytes", yamlPath: []string{"min_free_bytes"}, envKey: "JAY_MIN_FREE_BYTES", kind: typeInt},
 	{yamlKey: "max_object_size", yamlPath: []string{"max_object_size"}, envKey: "JAY_MAX_OBJECT_SIZE", kind: typeInt},
+
+	// Who may scrape GET /metrics. The token is a secret; see validateMetrics.
+	{yamlKey: "metrics.token", yamlPath: []string{"metrics", "token"}, envKey: "JAY_METRICS_TOKEN", kind: typeString},
+	{yamlKey: "metrics.public", yamlPath: []string{"metrics", "public"}, envKey: "JAY_METRICS_PUBLIC", kind: typeBool},
 
 	{yamlKey: "seed_token.account", yamlPath: []string{"seed_token", "account"}, envKey: "JAY_SEED_TOKEN_ACCOUNT", kind: typeString},
 	{yamlKey: "seed_token.id", yamlPath: []string{"seed_token", "id"}, envKey: "JAY_SEED_TOKEN_ID", kind: typeString},

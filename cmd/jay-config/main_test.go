@@ -404,3 +404,45 @@ JAY_SCRUB_INTERVAL_HOURS=${INTERVAL}
 		t.Errorf("interpolation on int field not preserved: %s", content)
 	}
 }
+
+// A quoted scalar reaches the server as a string, and the loader parses it
+// with strconv (toBool, toInt64, toFloat64 in cmd/jay), so "true", "5" and
+// "0.5" boot the server, as does a whole float such as 50.0 for an integer
+// key. The validator used to reject all four.
+func TestValidate_ScalarsTheServerAccepts(t *testing.T) {
+	for _, line := range []string{
+		`trust_proxy_headers: "true"`,
+		`trust_proxy_headers: "1"`,
+		`rate_burst: "50"`,
+		`rate_burst: 50.0`,
+		`rate_limit: "0.5"`,
+		`rate_limit: "3"`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			in := filepath.Join(t.TempDir(), "config.yml")
+			writeFile(t, in, validYAML()+line+"\n")
+			if code, _, stderrOut := runCLI(t, "validate", "--input", in); code != 0 {
+				t.Fatalf("%q boots the server but was rejected: %s", line, stderrOut)
+			}
+		})
+	}
+
+	for _, tc := range []struct{ line, want string }{
+		{`trust_proxy_headers: "yes"`, "expected bool for trust_proxy_headers"},
+		{`rate_burst: "fifty"`, "expected int for rate_burst"},
+		{`rate_burst: 50.5`, "expected int for rate_burst"},
+		{`rate_limit: "fast"`, "expected float for rate_limit"},
+	} {
+		t.Run(tc.line, func(t *testing.T) {
+			in := filepath.Join(t.TempDir(), "config.yml")
+			writeFile(t, in, validYAML()+tc.line+"\n")
+			code, _, stderrOut := runCLI(t, "validate", "--input", in)
+			if code == 0 {
+				t.Fatalf("%q validated; the server refuses it", tc.line)
+			}
+			if !strings.Contains(stderrOut, tc.want) {
+				t.Errorf("stderr does not name the problem %q: %s", tc.want, stderrOut)
+			}
+		})
+	}
+}
