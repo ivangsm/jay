@@ -28,6 +28,11 @@ curl -X POST http://localhost:9001/_jay/tokens \
 created — there is no implicit default, and `400 allowed_actions is required` is
 the answer. Use `["*"]` if you really want all of them.
 
+An action that is not in the list below, and not `"*"`, is refused with `400`:
+it would mint a token that fails every request that needs it. `expires_at` (an
+RFC 3339 time in the future) makes the token stop authenticating at that
+instant; see [Admin API](/jay/reference/admin-api/#tokens).
+
 The secret is returned once. It is bcrypt-hashed before storage and cannot be
 read back.
 
@@ -43,6 +48,22 @@ Authorization: Bearer <token_id>:<secret>
 key. Jay validates the timestamp and verifies the signature. Both SigV4 forms
 work — the `Authorization` header and the query-string form used by presigned
 URLs.
+
+The signature only covers the payload hash the client *declared*, so Jay checks
+the body against it too:
+
+| `x-amz-content-sha256` | How the body is verified |
+|---|---|
+| A hex SHA-256 | The body is hashed and compared. It has to be buffered for that, so it is capped at 32 MiB — larger uploads use one of the modes below, or multipart |
+| `UNSIGNED-PAYLOAD` (or absent) | Not at all, by the client's own choice. A declared `x-amz-checksum-*` is still verified |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]` | Chunk by chunk as it streams: each chunk carries an HMAC chained from the request signature, and the upload is committed only after the last one — and the trailer, when there is one — has verified |
+| `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | By the trailing checksum, when the client declares one in `x-amz-trailer` |
+
+The streaming modes need the request signature to seed the chain, so they are
+accepted only under the `Authorization` header: a bearer token or a presigned
+URL carrying `aws-chunked` framing answers `501`. So does SigV4a
+(`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`), which Jay does not implement. See
+[S3 compatibility](/jay/reference/s3-compatibility/#aws-chunked-streaming-uploads).
 
 The region is not server-side configuration. Jay reads it out of
 `X-Amz-Credential` and uses it only to derive the signing key, so any region

@@ -8,7 +8,7 @@ description: TLS, reverse proxies, disk, backups and what to expose.
 | Listener | Default | Expose to |
 |---|---|---|
 | S3 API | `:9000` | Whatever needs to store objects, including the public internet if that is your design |
-| Admin API | `:9001` | Nothing outside your network. It creates accounts and tokens |
+| Admin API | `:9001` | Nothing outside your network. It creates accounts and tokens. Your Prometheus scrapes `/metrics` here |
 | Native protocol | `:4444` | Nothing outside your network, unless you give it TLS — the handshake carries the token secret in the clear by default |
 
 If you do not use the native protocol, disable its listener entirely by setting
@@ -37,10 +37,6 @@ native transport and break clients already speaking to it in the clear. Setting
 one half of either pair without the other aborts startup rather than serving in
 the clear. Left unset, the native listener stays plaintext and belongs on an
 internal network — Jay says so in a startup warning.
-
-**Enable TLS if you use `mc` or `warp`.** minio-go signs plaintext uploads with
-SigV4's streaming mode, which Jay refuses; over TLS the same clients upload
-normally. See [S3 compatibility](/jay/reference/s3-compatibility/).
 
 ## Behind a reverse proxy
 
@@ -132,6 +128,26 @@ instance has a recovery path for:
 It never changes the status code. Object bytes having no backup is a property of
 Jay's design, not a fault of the instance; failing readiness over it would pull a
 healthy server out of the pool forever.
+
+## Monitoring
+
+Point Prometheus at `/metrics` on the admin port. Give it its own credential
+rather than the admin token:
+
+```bash
+JAY_METRICS_TOKEN=$(openssl rand -base64 32)
+```
+
+That token opens `/metrics` and is refused on every other admin route, so a
+leaked scraper config cannot mint tokens. On a network where nothing untrusted
+can reach the admin port, `JAY_METRICS_PUBLIC=true` drops authentication from
+`/metrics` instead — never both. The metric list, a `scrape_config` and alert
+rules for a degrading disk are in [Observability](/jay/reference/observability/#metrics).
+
+Every admin request also leaves an access line, and every change an `audit`
+line naming what was created, revoked or purged, from where, under the
+response's request ID. Ship the log somewhere that outlives the instance: it is
+the only record of when a token was issued.
 
 ## Upgrades
 

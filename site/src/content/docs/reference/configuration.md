@@ -23,6 +23,8 @@ both set the same key, **the environment wins** and the conflict is logged at
 | `JAY_TLS_KEY` | *(optional)* | Path to the matching private key |
 | `JAY_NATIVE_TLS_CERT` | *(optional)* | Path to a TLS certificate for the **native** listener. Set both or neither — one alone aborts startup |
 | `JAY_NATIVE_TLS_KEY` | *(optional)* | Path to the matching private key |
+| `JAY_NATIVE_MAX_CONNS` | `1000` | Connections the native listener holds at once, handshakes included. The next one is refused with the `ServerBusy` handshake status. Must be at least `1` |
+| `JAY_NATIVE_TOKEN_BYTES_PER_SEC` | `0` | Object bytes per second each token may move over the native protocol, uploads and downloads together (`0` = no cap). It slows transfers, never refuses them, and does not apply to the S3 API — see [Back pressure](/jay/reference/native-protocol/#back-pressure) before setting it below 1 MiB/s |
 | `JAY_RATE_LIMIT` | `100` | Requests/sec per token (`0` disables) |
 | `JAY_RATE_BURST` | `200` | Rate limit burst size; must be at least `1` — a burst of `0` rejects every request, so turn the limiter off with `JAY_RATE_LIMIT=0` instead |
 | `JAY_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` |
@@ -33,6 +35,8 @@ both set the same key, **the environment wins** and the conflict is logged at
 | `JAY_BACKUP_DIR` | — | Deprecated spelling of the above. Still honoured, warns at startup |
 | `JAY_MIN_FREE_BYTES` | `524288000` | Readiness fails below this free space (`0` disables) |
 | `JAY_MAX_OBJECT_SIZE` | `5368709120` | Largest accepted body and multipart part (`0` disables) |
+| `JAY_METRICS_TOKEN` | *(optional)* | Read-only bearer for `GET /metrics` on the admin port, and nothing else. At least 32 characters and different from `JAY_ADMIN_TOKEN` when set. See [Metrics](/jay/reference/observability/#metrics) |
+| `JAY_METRICS_PUBLIC` | `false` | Serve `GET /metrics` with no authentication at all. Warns at every startup; cannot be combined with `JAY_METRICS_TOKEN` |
 | `JAY_SEED_TOKEN_ACCOUNT` | *(optional)* | See [Seed token](/jay/reference/seed-token/) |
 | `JAY_SEED_TOKEN_ID` | *(optional)* | Seed token ID |
 | `JAY_SEED_TOKEN_SECRET` | *(optional)* | Seed token secret, bcrypt-hashed before storage |
@@ -48,6 +52,22 @@ opening the database and before binding a listener**.
 `JAY_SIGNING_SECRET` is the AES-GCM key that encrypts token secrets in bbolt.
 **Losing it makes every stored token unreadable.** To change it, use
 `jay-rekey`, which re-encrypts the stored secrets — do not just set a new value.
+
+## The optional metrics token
+
+Without further configuration, `GET /metrics` takes `JAY_ADMIN_TOKEN` — the
+credential that mints tokens — and handing that to a monitoring system is
+rarely what you want. `JAY_METRICS_TOKEN` is a second bearer that opens
+`/metrics` and is refused everywhere else on the admin port.
+
+It is a secret and follows the same rules: no default, and Jay refuses to start
+if it is set to fewer than 32 characters, or to the same value as
+`JAY_ADMIN_TOKEN` (which would make every scraper an administrator).
+
+`JAY_METRICS_PUBLIC=true` removes authentication from `/metrics` instead. It is
+an explicit opt-in for a private network, logged at `WARN` on every startup.
+Setting it **and** a metrics token says two opposite things about who may
+scrape, so Jay refuses to start rather than guess.
 
 ## YAML file
 
@@ -79,6 +99,10 @@ tls_key: ${JAY_TLS_KEY:-}
 native_tls_cert: ${JAY_NATIVE_TLS_CERT:-}
 native_tls_key: ${JAY_NATIVE_TLS_KEY:-}
 
+# Native protocol limits. The S3 API has neither.
+native_max_conns: 1000
+native_token_bytes_per_sec: 0
+
 scrub:
   interval_hours: 6
   bytes_per_sec: 52428800
@@ -90,6 +114,12 @@ metadata_backup:
   dir: ${JAY_METADATA_BACKUP_DIR:-}
 min_free_bytes: 524288000
 max_object_size: 5368709120
+
+# GET /metrics. Leave both unset to require admin_token; set the token for a
+# read-only scraper credential, or public: true for no auth — never both.
+metrics:
+  token: ${JAY_METRICS_TOKEN:-}
+  public: false
 
 seed_token:
   account: ${JAY_SEED_TOKEN_ACCOUNT:-}
@@ -121,7 +151,7 @@ switch for the native listener.
 
 When discarding an empty value actually overrides something, it is logged at
 `WARN`. When the key would have been empty anyway — `tls_cert`,
-`metadata_backup.dir`, `seed_token.*`, `client.*` above — it is not, because
+`metadata_backup.dir`, `metrics.token`, `seed_token.*`, `client.*` above — it is not, because
 seven lines of noise per startup is what teaches people to ignore the one that
 matters.
 
@@ -148,7 +178,7 @@ jay-config yaml-to-env --input config.yml --output .env
 # .env → YAML
 jay-config env-to-yaml --input .env --output config.yml
 
-# Check required secrets, seed-token atomicity and value ranges
+# Check required secrets, seed-token atomicity, the metrics token and value ranges
 jay-config validate --input config.yml
 ```
 

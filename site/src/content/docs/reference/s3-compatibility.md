@@ -18,13 +18,13 @@ surface. Everything else answers `501 Not Implemented` — never a misleading
 | GetBucketLocation | `GET /<bucket>?location` | Always the empty `<LocationConstraint/>` (us-east-1) |
 | ListObjectsV2 | `GET /<bucket>?list-type=2` | |
 | DeleteObjects | `POST /<bucket>?delete` | Batch delete, up to 1000 keys |
-| PutObject | `PUT /<bucket>/<key>` | Verifies `Content-MD5` and `x-amz-checksum-*` when sent |
+| PutObject | `PUT /<bucket>/<key>` | Verifies `Content-MD5` and `x-amz-checksum-*` when sent. Accepts SigV4 streaming (`aws-chunked`), [decoded and verified](#aws-chunked-streaming-uploads) |
 | GetObject | `GET /<bucket>/<key>` | Range: `bytes=0-499`, suffix, open-ended |
 | HeadObject | `HEAD /<bucket>/<key>` | |
 | DeleteObject | `DELETE /<bucket>/<key>` | |
 | CopyObject | `PUT /<bucket>/<key>` | With `x-amz-copy-source`. `x-amz-checksum-algorithm` returns that digest inside `<CopyObjectResult>` |
 | CreateMultipartUpload | `POST /<bucket>/<key>?uploads` | `x-amz-checksum-algorithm` is refused if Jay cannot compute it, rather than ignored |
-| UploadPart | `PUT /<bucket>/<key>?uploadId=X&partNumber=N` | Same digest verification as `PutObject` |
+| UploadPart | `PUT /<bucket>/<key>?uploadId=X&partNumber=N` | Same digest verification and streaming support as `PutObject` |
 | CompleteMultipartUpload | `POST /<bucket>/<key>?uploadId=X` | A whole-object `x-amz-checksum-*` answers `501`; the parts are what get verified |
 | AbortMultipartUpload | `DELETE /<bucket>/<key>?uploadId=X` | |
 | ListParts | `GET /<bucket>/<key>?uploadId=X` | |
@@ -55,43 +55,92 @@ That asymmetry is not theoretical: the earlier version dispatched by method, so
 `PUT /bucket/key?tagging` overwrote the object with the tagging XML and answered
 `200`.
 
-## aws-chunked streaming uploads are not supported
+## aws-chunked streaming uploads
 
-SigV4 has a streaming mode: the client declares
-`x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (or a
-`STREAMING-*-TRAILER` variant) and sends the body wrapped in `aws-chunked`
-framing — `<hex-size>;chunk-signature=<sig>\r\n<data>\r\n`, repeated until a
-zero-length chunk.
+SigV4 has a streaming mode: instead of hashing the whole payload before sending
+it, the client declares one of the `STREAMING-*` literals in
+`x-amz-content-sha256` and sends the body wrapped in `aws-chunked` framing —
+`<hex-size>;chunk-signature=<sig>\r\n<data>\r\n`, repeated until a zero-length
+chunk, optionally followed by a trailer that carries a checksum.
+`Content-Length` counts the framing; the payload's own size travels in
+`x-amz-decoded-content-length`.
 
-**Jay has no decoder for that framing, so it refuses the mode.** Any request
-carrying it answers `501` and writes nothing: no object, no metadata, no temp
-file. The refusal happens before authentication, so it costs the same on every
-entry point that takes a body and under every credential form. All three
-announcements are treated as framing, because a client may send any of them:
-`x-amz-content-sha256: STREAMING-*`, `x-amz-decoded-content-length`, and
-`Content-Encoding: aws-chunked`.
+Jay decodes it on `PutObject` and `UploadPart`, and verifies it before a single
+byte is committed:
 
-Refusing is not the ideal answer. It is the honest one. Jay used to *recognise*
-the mode — SigV4 skipped the payload check for `STREAMING-*` — and then store
-the body verbatim. A 15-byte file uploaded with `mc` became a 187-byte object
-whose content began `f;chunk-signature=…`, answered `200`, and carried an ETag
-and a SHA-256 computed over the corrupted bytes. Nothing could detect it
-afterwards: the scrubber verified the object against its own bad digest and
-reported it healthy forever.
+| `x-amz-content-sha256` | What Jay verifies | Who sends it |
+|---|---|---|
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | Every chunk signature, chained from the request signature, the final empty chunk included | minio-go (`mc`, `warp`) over plain HTTP |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` | The same, plus the trailer's own signature and the checksum it carries | `warp --checksum` over plain HTTP |
+| `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | The request signature, and the trailing checksum against the bytes | The AWS CLI and SDKs over HTTPS; `mc --checksum` |
+
+What holds in every mode:
+
+- **The body only ends once everything has verified.** Each chunk signature is
+  an HMAC over the previous one, so a chunk cannot be dropped, reordered or
+  appended without breaking the chain — and the final empty chunk is signed
+  too, so the stream cannot be cut short either. The data streams through as it
+  arrives (nothing is buffered beyond one chunk header line), but the object is
+  committed only after the end of the body, so a failure anywhere — first chunk,
+  last chunk, trailer — leaves **nothing written**: no object, no temp file, no
+  metadata, and an existing object under the same key untouched.
+- **`x-amz-decoded-content-length` is mandatory and binding.** A chunk larger
+  than what remains of it is refused before its data is read, and chunks that
+  do not add up to it are refused at the end.
+- **A trailing checksum is verified like a header one.** All five algorithms
+  are supported; the digest is compared against the bytes before the commit,
+  and the response echoes it. A trailer other than one checksum is refused
+  before the body is read — never accepted and ignored.
+- **The framing never reaches the object.** Size, ETag and SHA-256 are those of
+  the payload, and `aws-chunked` is removed from `Content-Encoding`.
+
+| What arrives | Answer |
+|---|---|
+| A chunk or trailer signature that does not verify | `403 SignatureDoesNotMatch`, nothing written |
+| Chunks that do not add up to `x-amz-decoded-content-length` | `400 IncompleteBody`, nothing written |
+| Malformed framing: a size that is not 1–16 hex digits, a missing CRLF, a header line over 128 bytes, an unknown chunk extension, a body that ends early | `400 InvalidRequest`, nothing written |
+| A trailing checksum that does not match the bytes | `400 BadDigest`, nothing written |
+| `x-amz-decoded-content-length` missing or not a number, or framing announced without a `STREAMING-*` literal | `400 InvalidRequest`, before a byte is read |
+
+### What still answers 501
+
+Refused before authentication and before a byte is read, like every other
+`501`:
+
+- **SigV4a streaming** (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` and its
+  `-TRAILER` form). Jay implements no SigV4a at all.
+- **Framing under a bearer token or a presigned URL**, either style. The chunk
+  chain is seeded by the request signature, and those credentials have none,
+  so the chunks could not be verified.
+- **Framing on any operation other than `PutObject` and `UploadPart`.** Those
+  two are the only ones that commit at the end of the body. A handler that acts
+  while it parses — `DeleteObjects` deleting the keys it reads — would act on
+  bytes whose chunk has not been verified yet. No client frames those bodies.
+
+### Why it is this strict
+
+The mode was once *recognised* and not decoded: SigV4 skipped the payload check
+for `STREAMING-*` and the body was stored verbatim. A 15-byte file uploaded
+with `mc` became a 187-byte object whose content began `f;chunk-signature=…`,
+answered `200`, and carried an ETag and a SHA-256 computed over the corrupted
+bytes — so the scrubber verified it against its own bad digest and reported it
+healthy forever. The fix that closed the data loss was to refuse the mode with
+`501`; the decoder replaced that refusal. A decoder that accepted the literal
+without verifying the chain would have been the same defect with extra steps,
+so the literal is accepted only where the body is actually decoded and
+verified.
 
 ### What it means per client
 
 | Client | Status |
 |---|---|
-| **AWS CLI**, AWS SDKs, boto3 | Fully working, up and down, single-part and multipart, with or without `--checksum-algorithm`. They send a real payload hash |
-| **minio-go over plain HTTP** — `mc`, `warp` | **Uploads fail** with `501`. Downloads, listings, `stat`, presigned URLs and deletes work normally |
-| **minio-go over HTTPS** — same clients | **Fully working**, uploads included. minio-go only reaches for the streaming signature when the connection is not secure |
-| **Presigned URLs**, both styles | Working. A presigned `PUT` that adds framing is refused like any other |
+| **AWS CLI**, AWS SDKs, boto3 over HTTP | Fully working. They send a real payload hash, no framing |
+| **AWS CLI** over HTTPS | Fully working. Uploads travel as `STREAMING-UNSIGNED-PAYLOAD-TRAILER` with a CRC64NVME trailer, which is decoded and verified. (Until the decoder existed, these uploads answered `501`.) |
+| **minio-go over plain HTTP** — `mc`, `warp` | Fully working, uploads included, single-part and multipart. Signed streaming, every chunk verified |
+| **minio-go over HTTPS** — same clients | Fully working. Unframed bodies; with `--checksum`, the unsigned-trailer framing |
+| **`mc cp --checksum` of a file above the part size** | Parts are accepted and verified, but `CompleteMultipartUpload` carries a whole-object checksum and answers `501` — see [Checksums](#checksums). `mc` aborts the upload and nothing is left |
+| **Presigned URLs**, both styles | Working. A presigned `PUT` that adds framing answers `501` |
 | **Jay's CLI and native protocol** | Unaffected. The native protocol has no SigV4 and no framing |
-
-The practical workaround, if you need `mc` for uploads, is to
-[put Jay behind TLS](/jay/guides/deployment/) rather than to wait for the
-decoder.
 
 ## Checksums
 
@@ -150,7 +199,9 @@ Two things Jay deliberately does not do:
 - **`CompleteMultipartUpload` refuses a whole-object checksum with `501`.** S3
   composes that value from the part digests; Jay does not implement the
   composition, and accepting the header would answer `200` to a verification
-  that never happened. Each part is verified instead.
+  that never happened. Each part is verified instead. The AWS CLI does not send
+  it; `mc cp --checksum` does, on every multipart upload, so that combination
+  fails — `mc` aborts the upload and no object is left.
 - **The extra digest is not persisted.** A `PutObject` declaring CRC32 gets its
   CRC32 back in that response, but only the SHA-256 is stored. The same holds
   for a copy: the response is computed live, and re-reading the object later
@@ -188,9 +239,10 @@ not write.
 | **aws-cli** (botocore) | `mb`/`rb --force`, `cp` up and down, `sync`, `rm --recursive`, `ListObjectsV2` with prefix and delimiter, multipart upload and ranged download of a 12 MiB object, `presign` including an expired URL, `GetBucketLocation`, `ListMultipartUploads`, `DeleteObjects` whole and partial, a `501` sub-resource, and that `--checksum-algorithm` answers with the algorithm it asked for — all five, on `put-object` and on `copy-object`, the copy compared against the digest the upload returned for the same bytes |
 | **curl** | That a deliberately wrong digest is refused and writes nothing. No correct client would ever send one, so it has to be forged by hand |
 | **aws-cli, second account** | That a token of account B can neither list, read, write, delete nor batch-delete inside a bucket of account A — each asserted against A's own view of the bucket, not against B's error message |
-| **mc** (minio-go) over HTTP | Listing, `stat`, `get`, bucket create/delete, `rm`, a presigned URL minted by minio-go, and that an upload is refused with `501` leaving nothing behind |
-| **mc** over HTTPS | That the same client uploads fine over TLS, small and 12 MiB, byte for byte |
-| **warp** (minio-go) | That `warp put` over HTTP is refused and writes nothing, and that `warp mixed` over TLS runs PUT/GET/DELETE/STAT with zero errors |
+| **mc** (minio-go) over HTTP | Listing, `stat`, `get`, bucket create/delete, `rm`, a presigned URL minted by minio-go, and `aws-chunked` uploads — small, 20 MiB multipart and with a CRC32C trailer — each read back and compared byte for byte |
+| **mc** over HTTPS | Unframed uploads, small and 12 MiB, byte for byte; an unsigned-trailer upload; and that a multipart upload with `--checksum` is refused at `CompleteMultipartUpload` leaving no object |
+| **aws-cli** over HTTPS | Small and 12 MiB multipart uploads in the unsigned-trailer framing, byte for byte |
+| **warp** (minio-go) | `warp put` and `warp get` over HTTP with zero errors (the second checks the size of every download), signed-trailer uploads with `--checksum`, and `warp mixed` over TLS with zero errors |
 
 Three things about how it reports:
 
@@ -201,7 +253,11 @@ Three things about how it reports:
   absent, a status code — never a confirmation message. `aws s3 cp --quiet`
   hides its own failure line, so the checks read the exit code and then ask the
   server what actually happened.
-- **The known limitations are asserted, not tolerated.** The `mc` and `warp`
-  upload refusals are checks that pass *because* the answer is `501` and nothing
-  was written. If the `aws-chunked` decoder ever lands, they go red on purpose,
-  so nobody can ship it without updating this page.
+- **Every `aws-chunked` check proves which framing it exercised.** The
+  client's own debug trace has to show the `STREAMING-*` literal it sent, or the
+  check fails: a round trip that never reached the decoder must not be counted
+  as one that did.
+- **The known limitations are asserted, not tolerated.** The `mc --checksum`
+  multipart refusal is a check that passes *because* the answer is `501` and no
+  object is left. The day whole-object checksums land, it goes red on purpose,
+  so nobody can ship that without updating this page.

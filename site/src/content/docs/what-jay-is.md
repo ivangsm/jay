@@ -58,10 +58,13 @@ half-working version of a big one.
 
 ## The one compatibility caveat to know upfront
 
-minio-go clients — `mc` and `warp` — **cannot upload over plain HTTP**. They
-sign non-TLS uploads with SigV4's streaming mode, which frames the body in
-`aws-chunked`, and Jay refuses that framing with `501` rather than storing it
-raw. Over HTTPS the same clients work completely, uploads included. The full
-explanation is in [S3 compatibility](/jay/reference/s3-compatibility/).
+**`mc cp --checksum` of a file large enough to go multipart fails.** The parts
+are accepted and verified, but `CompleteMultipartUpload` carries a whole-object
+checksum that Jay does not compose from the parts, and it answers `501` rather
+than accept a digest it never checked. mc aborts and no object is left behind.
+The full explanation is in [S3 compatibility](/jay/reference/s3-compatibility/).
 
-Everything else — aws-cli, the AWS SDKs, boto3 — works over both.
+Everything else — aws-cli, the AWS SDKs, boto3, `mc` and `warp` — works over
+plain HTTP and HTTPS, uploads included. SigV4's streaming mode (`aws-chunked`),
+which minio-go uses for every plaintext upload and aws-cli for every HTTPS one,
+is decoded and verified chunk by chunk before anything is committed.

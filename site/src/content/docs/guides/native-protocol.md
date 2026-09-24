@@ -172,7 +172,10 @@ with an empty `JAY_NATIVE_ADDR`.
 
 ## Limits and timeouts
 
-The server holds up to 1000 concurrent connections. Handshakes must complete
+The server holds up to 1000 concurrent connections by default
+(`JAY_NATIVE_MAX_CONNS`). The one past the cap is refused during the handshake, and `Dial` — or the operation that
+needed a new connection — returns `client.ErrServerBusy`: the server is up and
+full, so back off and retry rather than fail over. Handshakes must complete
 within 10 seconds and an idle connection is dropped after 60.
 
 Read and write deadlines are **scaled to the size of the transfer** rather than
@@ -182,3 +185,21 @@ transfer is not cut off halfway.
 
 Rate limiting on this transport is **per token, not per connection**. Opening
 more connections with the same token does not buy more budget.
+
+A rate-limited request comes back as a `*client.Error` with code
+`RateLimitExceeded`, which is the one retryable `BadRequest`. For an upload
+larger than 10 MiB the server answers without reading the body and closes the
+connection; the client still reports the code, not the broken pipe, and does
+not return that connection to the pool. The same holds for any refused upload
+with more than 10 MiB left unread. After a rate-limited upload larger than
+1 MiB the client also drops the connection, although today's server keeps it:
+the server's threshold is meant to come down to 1 MiB, and the client already
+plans for it at the price of one reconnect. The details are in
+[the reference](/jay/reference/native-protocol/#refusing-a-frame-without-reading-it).
+
+`JAY_NATIVE_TOKEN_BYTES_PER_SEC` caps the object bytes a token moves per
+second, uploads and downloads together; it is off by default. It never refuses
+anything — transfers just take longer — but the client's own deadlines assume
+1 MiB/s per transfer (`Timeouts.BytesPerSec`). With a cap below 1 MiB/s times
+the transfers a token runs at once, lower that option to match, or large
+transfers time out on the client side.

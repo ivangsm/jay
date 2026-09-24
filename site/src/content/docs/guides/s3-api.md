@@ -65,26 +65,29 @@ url = s3.generate_presigned_url(
 
 | Client | Status |
 |---|---|
-| AWS CLI (`aws s3`, `aws s3api`), AWS SDKs, boto3 | Fully working, up and down, single-part and multipart, with or without `--checksum-algorithm` |
-| minio-go over **HTTPS** — `mc`, `warp` | Fully working, uploads included |
-| minio-go over **plain HTTP** — `mc`, `warp` | **Uploads fail with `501`.** Downloads, listings, `stat`, presigned URLs and deletes work normally |
+| AWS CLI (`aws s3`, `aws s3api`), AWS SDKs, boto3 | Fully working over HTTP and HTTPS, up and down, single-part and multipart, with or without `--checksum-algorithm` |
+| minio-go — `mc`, `warp` — over HTTP or HTTPS | Fully working, uploads included |
 | Presigned URLs, both styles | Working |
 
-The minio-go limitation is not arbitrary. Over a non-TLS connection minio-go
-signs uploads with SigV4's *streaming* mode, which wraps the body in
-`aws-chunked` framing. Jay has no decoder for that framing, so it refuses the
-mode instead of storing the frames as if they were your file. Over TLS minio-go
-sends an unframed body and everything works.
+Several of these do not send the body as-is. minio-go signs every plain-HTTP
+upload with SigV4's *streaming* mode, which wraps the body in `aws-chunked`
+framing with a signature per chunk; the AWS CLI does the same over HTTPS, with
+unsigned chunks and a trailing CRC64NVME checksum. Jay decodes the framing and
+verifies every chunk signature and every trailing checksum before it commits
+the object, so a tampered or truncated upload is refused and writes nothing.
 
-**If you need `mc` for uploads, the fix is to put Jay behind TLS**, not to wait
-for a decoder. The full story, including what went wrong when Jay used to accept
-the mode, is in [S3 compatibility](/jay/reference/s3-compatibility/).
+One combination still fails: `mc cp --checksum` of a file large enough to go
+multipart. The parts are accepted, but `mc` then asks Jay to verify a
+whole-object checksum on `CompleteMultipartUpload`, which Jay does not
+implement, and the upload is aborted. The details, and what answers `501`, are
+in [S3 compatibility](/jay/reference/s3-compatibility/#aws-chunked-streaming-uploads).
 
 ## Checksums are verified, not decorated
 
-If you send `Content-MD5` or `x-amz-checksum-*` on an upload, Jay hashes the
-body as it writes and compares. A mismatch answers `400 BadDigest` and **writes
-nothing** — no object, no metadata, no leftover temp file.
+If you send `Content-MD5` or `x-amz-checksum-*` on an upload — as a header, or
+in the trailer of an `aws-chunked` body — Jay hashes the body as it writes and
+compares. A mismatch answers `400 BadDigest` and **writes nothing** — no object,
+no metadata, no leftover temp file.
 
 All five algorithms S3 defines for object payloads are implemented: CRC32,
 CRC32C, CRC64NVME, SHA1 and SHA256. That last one matters more than it looks —
