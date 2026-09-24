@@ -6,6 +6,9 @@
 // before authentication and by "<token_id>" after it; the proto server limits
 // by "<token_id>" alone (see proto/server.go), so a token's budget is shared
 // across all of its connections rather than granted per connection.
+//
+// Throughput (throughput.go) is the byte-denominated counterpart, and only the
+// native server uses it: Limiter refuses requests, Throughput delays bytes.
 package ratelimit
 
 import (
