@@ -190,8 +190,9 @@ func (a *Auth) AuthenticatePresignedSigV4(r *http.Request) (*meta.Token, error) 
 	//
 	// Called unconditionally, not behind `payloadHash != unsignedPayload`:
 	// verifyPayloadHash skips UNSIGNED-PAYLOAD on its own, and it is also
-	// where an aws-chunked body is refused — a presigned PUT can carry the
-	// framing just as a header-signed one can.
+	// where an aws-chunked body is refused. A presigned PUT can carry the
+	// framing just as a header-signed one can, but only the header form has a
+	// request signature to seed the chunk chain with, so only it is decoded.
 	if err := verifyPayloadHash(r, payloadHash); err != nil {
 		return nil, err
 	}

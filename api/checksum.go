@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/internal/objops"
 )
 
@@ -135,6 +136,26 @@ func parseChecksumRequest(r *http.Request) (objops.ChecksumRequest, error) {
 		req.Digest = value
 	}
 
+	// The digest can also come AFTER the body, in the trailer of an
+	// aws-chunked upload. It is the same promise through another door, so it
+	// obeys the same rule: one digest, and a second one anywhere is refused.
+	trailing, err := trailingChecksum(r)
+	if err != nil {
+		return objops.ChecksumRequest{}, err
+	}
+	if trailing != nil {
+		if seen != "" {
+			return objops.ChecksumRequest{}, &objops.ChecksumError{
+				Header: trailerDeclarationHeader,
+				Kind:   objops.ErrUnknownChecksumAlgorithm,
+				Detail: "expecting a single checksum, got " + seen + " as a header and " + trailing.header + " in the trailer",
+			}
+		}
+		seen = trailing.header
+		req.Algorithm = trailing.alg
+		req.Trailing = true
+	}
+
 	declared, _ := declaredChecksumAlgorithm(r)
 	if declared == "" {
 		return req, nil
@@ -161,10 +182,62 @@ func parseChecksumRequest(r *http.Request) (objops.ChecksumRequest, error) {
 	return req, nil
 }
 
+// trailerDeclarationHeader is where an aws-chunked upload names the headers it
+// will send after the body.
+const trailerDeclarationHeader = "x-amz-trailer"
+
+// checksumTrailer is a checksum declared in x-amz-trailer.
+type checksumTrailer struct {
+	header string
+	alg    objops.ChecksumAlgorithm
+}
+
+// trailingChecksum reads what x-amz-trailer announced for an aws-chunked body,
+// before a byte of it is read. nil means no trailer was declared.
+//
+// The only trailer S3 defines for an upload is its checksum, so that is the
+// only one accepted: exactly one, and one of the five digests jay computes. A
+// trailer jay could not verify is refused here, up front, rather than read and
+// ignored.
+func trailingChecksum(r *http.Request) (*checksumTrailer, error) {
+	cr, ok := auth.ChunkedBodyOf(r)
+	if !ok {
+		return nil, nil
+	}
+	names := cr.Trailers()
+	switch len(names) {
+	case 0:
+		return nil, nil
+	case 1:
+	default:
+		return nil, &objops.ChecksumError{
+			Header: trailerDeclarationHeader,
+			Kind:   objops.ErrUnknownChecksumAlgorithm,
+			Detail: "expecting a single trailing checksum, got " + strings.Join(names, ", "),
+		}
+	}
+	for _, candidate := range checksumValueHeaders {
+		if candidate.header == names[0] {
+			return &checksumTrailer{header: candidate.header, alg: candidate.alg}, nil
+		}
+	}
+	return nil, &objops.ChecksumError{
+		Header: trailerDeclarationHeader,
+		Kind:   objops.ErrUnknownChecksumAlgorithm,
+		Detail: "trailer " + names[0] + " is not a checksum jay can verify",
+	}
+}
+
 // checksumVerifierFor parses the request's checksum headers and builds the
 // verifier. On a bad declaration it writes the S3 error and returns false, and
 // the caller must return without reading the body: refusing here is what makes
 // a rejected upload leave nothing at all, not even a temp file.
+//
+// For a checksum that arrives in an aws-chunked trailer it also hands the
+// decoder the one function allowed to receive it: the verifier's. The decoder
+// calls it after the trailer signature verified and before it reports the end
+// of the body, so the store's pre-rename hook compares against it like against
+// any declared digest — and a trailer with nobody to receive it is refused.
 func (h *Handler) checksumVerifierFor(w http.ResponseWriter, r *http.Request, resource string) (*objops.ChecksumVerifier, bool) {
 	req, err := parseChecksumRequest(r)
 	if err != nil {
@@ -175,6 +248,22 @@ func (h *Handler) checksumVerifierFor(w http.ResponseWriter, r *http.Request, re
 	if err != nil {
 		h.writeChecksumError(w, r, err, resource)
 		return nil, false
+	}
+	if req.Trailing {
+		cr, _ := auth.ChunkedBodyOf(r)
+		want := req.Algorithm.Header()
+		cr.SetTrailerHandler(func(name, value string) error {
+			if name != want {
+				// Unreachable: the decoder admits only declared trailers and
+				// trailingChecksum admits only this one. Refused all the same.
+				return &objops.ChecksumError{
+					Header: name,
+					Kind:   objops.ErrUnknownChecksumAlgorithm,
+					Detail: "unexpected trailer " + name,
+				}
+			}
+			return v.SetTrailingDigest(value)
+		})
 	}
 	return v, true
 }

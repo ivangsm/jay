@@ -328,6 +328,12 @@ func (s *Service) PutObject(
 		case errors.Is(err, ErrBadDigest), errors.Is(err, ErrInvalidDigest):
 			s.log.Warn("objops: client checksum mismatch, nothing written",
 				"err", err, "bucket", bucketName, "key", key)
+		case isChunkedBodyRejection(err):
+			// The aws-chunked decoder refused the body: a chunk signature that
+			// does not verify, framing that does not parse, a length that does
+			// not add up. A client fault, and nothing was written.
+			s.log.Warn("objops: aws-chunked body rejected, nothing written",
+				"err", err, "bucket", bucketName, "key", key)
 		default:
 			s.log.Error("objops: write object", "err", err, "bucket", bucketName, "key", key)
 		}
@@ -482,6 +488,13 @@ func (s *Service) DeleteObject(
 		s.log.Warn("objops: gc deleted object", "err", err, "location", obj.LocationRef)
 	}
 	return nil
+}
+
+// isChunkedBodyRejection reports whether err is the aws-chunked decoder
+// refusing the body it was decoding (see auth.ChunkedReader).
+func isChunkedBodyRejection(err error) bool {
+	var cerr *auth.ChunkedBodyError
+	return errors.As(err, &cerr)
 }
 
 // emptyReader returns EOF on the first Read. Used when a PUT carries no body

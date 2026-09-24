@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1183,39 +1185,125 @@ func TestAuthenticateSigV4_UnsignedPayloadSkipsVerification(t *testing.T) {
 	}
 }
 
-// STREAMING-* means the body is aws-chunked, and jay has no decoder for that
-// framing. The signature itself still verifies here; what must fail is the
-// payload gate, so the framing is never stored as the object body.
-func TestAuthenticateSigV4_StreamingPayloadRejected(t *testing.T) {
+// signStreamingRequest signs r for a streaming upload and returns the chunk
+// chain seeded by the request signature, the way a client holds it after
+// signing the headers.
+func signStreamingRequest(r *http.Request, tokenID, secretKey, mode string, decoded int, now time.Time) *chunkSigner {
+	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
+	r.Header.Set("x-amz-decoded-content-length", strconv.Itoa(decoded))
+	r.Header.Set("Content-Encoding", "aws-chunked")
+	signRequestWithPayload(r, tokenID, secretKey, "us-east-1", dateStr, amzDate, mode)
+	_, seed, _ := strings.Cut(r.Header.Get("Authorization"), "Signature=")
+	return &chunkSigner{
+		key:     deriveSigningKey(secretKey, dateStr, "us-east-1", "s3"),
+		amzDate: amzDate,
+		scope:   dateStr + "/us-east-1/s3/aws4_request",
+		prev:    seed,
+	}
+}
+
+// A STREAMING-* request whose headers verify gets its body replaced by the
+// decoder: the handler reads the payload, never the framing, and the request
+// describes the payload (ContentLength, Content-Encoding) from then on.
+func TestAuthenticateSigV4_StreamingPayloadDecoded(t *testing.T) {
 	db := openTestDB(t)
 	_, _ = seedToken(t, db, "pay-stream", "sigv4-secret-key", []string{"*"})
 	a := New(db)
 
-	now := time.Now().UTC()
-	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
-
-	for _, declared := range []string{
-		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
-		"STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+	data := []byte("hola desde jay\n")
+	for _, tc := range []struct {
+		mode     string
+		trailers []string
+	}{
+		{StreamingSignedPayload, nil},
+		{StreamingSignedPayloadTrailer, []string{"x-amz-checksum-crc32:AAAAAA=="}},
+		{StreamingUnsignedPayloadTrailer, []string{"x-amz-checksum-crc32:AAAAAA=="}},
 	} {
-		t.Run(declared, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("chunk data"))
+		t.Run(tc.mode, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPut, "/bucket/key", nil)
 			r.Host = "s3.example.com"
-			signRequestWithPayload(r, "pay-stream", "sigv4-secret-key", "us-east-1", dateStr, amzDate, declared)
+			if tc.trailers != nil {
+				r.Header.Set("x-amz-trailer", "x-amz-checksum-crc32")
+			}
+			s := signStreamingRequest(r, "pay-stream", "sigv4-secret-key", tc.mode, len(data), time.Now().UTC())
+			if tc.mode == StreamingUnsignedPayloadTrailer {
+				s = nil
+			}
+			framed := frame(data, 64<<10, s, tc.trailers != nil, tc.trailers, awsStyle)
+			r.Body = io.NopCloser(bytes.NewReader(framed))
+			r.ContentLength = int64(len(framed))
 
-			_, err := a.AuthenticateSigV4(r)
-			if !errors.Is(err, ErrChunkedBodyUnsupported) {
-				t.Fatalf("want ErrChunkedBodyUnsupported for %s, got %v", declared, err)
+			if _, err := a.AuthenticateSigV4(r); err != nil {
+				t.Fatalf("AuthenticateSigV4: %v", err)
+			}
+			cr, ok := ChunkedBodyOf(r)
+			if !ok {
+				t.Fatal("the body was not replaced by the decoder")
+			}
+			cr.SetTrailerHandler(func(string, string) error { return nil })
+			got, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read decoded body: %v", err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatalf("handler would read %q, want %q", got, data)
+			}
+			if r.ContentLength != int64(len(data)) {
+				t.Errorf("ContentLength = %d, want the decoded %d", r.ContentLength, len(data))
+			}
+			if ce := r.Header.Values("Content-Encoding"); len(ce) != 0 {
+				t.Errorf("aws-chunked left in Content-Encoding: %q", ce)
 			}
 		})
 	}
 }
 
-// A framed body announced only by x-amz-decoded-content-length is refused too:
-// the declared hash is a perfectly ordinary UNSIGNED-PAYLOAD, so the payload
-// hash alone would have waved it through.
-func TestAuthenticateSigV4_DecodedContentLengthRejected(t *testing.T) {
+// The request signature verifies and the body carries a bad chunk: the
+// authentication succeeds (the headers are genuine) and the READ fails. What
+// the handler sees is an error, never a clean end of body.
+func TestAuthenticateSigV4_StreamingTamperedChunkFailsTheRead(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-tamper", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	data := bytes.Repeat([]byte("x"), 1000)
+	r := httptest.NewRequest(http.MethodPut, "/bucket/key", nil)
+	r.Host = "s3.example.com"
+	s := signStreamingRequest(r, "pay-tamper", "sigv4-secret-key", StreamingSignedPayload, len(data), time.Now().UTC())
+	framed := frame(data, 300, s, false, nil, awsStyle)
+	r.Body = io.NopCloser(bytes.NewReader(flipSignature(t, framed, 2)))
+
+	if _, err := a.AuthenticateSigV4(r); err != nil {
+		t.Fatalf("AuthenticateSigV4: %v", err)
+	}
+	if _, err := io.ReadAll(r.Body); !errors.Is(err, ErrChunkSignatureMismatch) {
+		t.Fatalf("want ErrChunkSignatureMismatch from the body, got %v", err)
+	}
+}
+
+// A streaming request whose own signature is wrong never gets a decoder: the
+// seed of the chain is exactly what failed.
+func TestAuthenticateSigV4_StreamingBadSeedRejected(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-seed", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("anything"))
+	r.Host = "s3.example.com"
+	_ = signStreamingRequest(r, "pay-seed", "wrong-secret", StreamingSignedPayload, 8, time.Now().UTC())
+
+	if _, err := a.AuthenticateSigV4(r); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("want ErrInvalidCredentials, got %v", err)
+	}
+	if _, ok := ChunkedBodyOf(r); ok {
+		t.Fatal("a decoder was installed for a request that failed authentication")
+	}
+}
+
+// Framing announced by a header other than the STREAMING-* literal, with a
+// payload hash that is an ordinary UNSIGNED-PAYLOAD: there is no mode to
+// decode with, and the body must not be read as is.
+func TestAuthenticateSigV4_FramingWithoutStreamingModeRejected(t *testing.T) {
 	db := openTestDB(t)
 	_, _ = seedToken(t, db, "pay-decoded", "sigv4-secret-key", []string{"*"})
 	a := New(db)
@@ -1228,7 +1316,38 @@ func TestAuthenticateSigV4_DecodedContentLengthRejected(t *testing.T) {
 	r.Header.Set("x-amz-decoded-content-length", "10")
 	signRequestWithPayload(r, "pay-decoded", "sigv4-secret-key", "us-east-1", dateStr, amzDate, "UNSIGNED-PAYLOAD")
 
+	if _, err := a.AuthenticateSigV4(r); !errors.Is(err, ErrChunkedBodyMalformed) {
+		t.Fatalf("want ErrChunkedBodyMalformed, got %v", err)
+	}
+}
+
+// The streaming modes jay does not implement are refused by name, whatever the
+// signature says.
+func TestAuthenticateSigV4_StreamingECDSARejected(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "pay-ecdsa", "sigv4-secret-key", []string{"*"})
+	a := New(db)
+
+	r := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("anything"))
+	r.Host = "s3.example.com"
+	_ = signStreamingRequest(r, "pay-ecdsa", "sigv4-secret-key", "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", 8, time.Now().UTC())
+
 	if _, err := a.AuthenticateSigV4(r); !errors.Is(err, ErrChunkedBodyUnsupported) {
+		t.Fatalf("want ErrChunkedBodyUnsupported, got %v", err)
+	}
+}
+
+// A bearer token has no signature to seed a chain with, so a framed body under
+// one is refused before bcrypt runs.
+func TestAuthenticate_BearerWithChunkedBodyRejected(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = seedToken(t, db, "bearer-stream", "bearer-secret", []string{"*"})
+	a := New(db)
+
+	r := newBearerRequest("bearer-stream", "bearer-secret")
+	r.Header.Set("x-amz-content-sha256", StreamingUnsignedPayloadTrailer)
+	r.Header.Set("x-amz-decoded-content-length", "5")
+	if _, err := a.Authenticate(r); !errors.Is(err, ErrChunkedBodyUnsupported) {
 		t.Fatalf("want ErrChunkedBodyUnsupported, got %v", err)
 	}
 }

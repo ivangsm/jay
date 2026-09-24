@@ -4,7 +4,9 @@
 // SigV4 verification recomputes the body hash rather than trusting the one the
 // client declared, so an altered body does not pass. That is why signed requests
 // carrying a payload hash are size-capped: the body has to be buffered to be
-// hashed.
+// hashed. The streaming modes (aws-chunked, see chunked.go) are the uncapped
+// alternative: each chunk is verified as it streams, and the body only ends
+// once the whole signature chain has.
 package auth
 
 import (
@@ -12,6 +14,7 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -143,6 +146,16 @@ func (a *Auth) Authenticate(r *http.Request) (*meta.Token, error) {
 
 	// Bearer <token_id>:<secret>
 	if after, ok := strings.CutPrefix(authHeader, "Bearer "); ok {
+		// A bearer token has no signature to seed a chunk chain with, so an
+		// aws-chunked body under one can be neither verified nor decoded. The
+		// HTTP layer refuses it before authentication (api.withChunkedBodyGate);
+		// this is the second gate, so that reordering the middleware can never
+		// make a bearer request store its framing as the object. Checked before
+		// bcrypt: there is nothing to authenticate a request for that cannot run.
+		if hdr := ChunkedBodyIndicator(r); hdr != "" {
+			return nil, fmt.Errorf("%w: announced by %s; only a SigV4 Authorization header can carry an aws-chunked body",
+				ErrChunkedBodyUnsupported, hdr)
+		}
 		parts := strings.SplitN(after, ":", 2)
 		if len(parts) != 2 {
 			return nil, ErrInvalidCredentials

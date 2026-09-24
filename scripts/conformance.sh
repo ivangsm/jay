@@ -286,13 +286,16 @@ info "building jay from $REPO_ROOT ..."
 (cd "$REPO_ROOT" && go build -o "$WORK/jay" ./cmd/jay) || die "go build failed"
 
 # ---------------------------------------------------------------------------
-# Boot: two instances, because minio-go behaves differently on each
+# Boot: two instances, because the clients put different bytes on each wire
 #
-# minio-go signs a plain-HTTP PutObject with the SigV4 *streaming* signature
-# (aws-chunked framing), which jay refuses with 501; over TLS it sends an
-# unframed body instead. One listener cannot be both, so the harness runs two:
-# the HTTP one carries the bulk of the suite, the TLS one proves the minio-go
-# upload path that HTTP cannot reach.
+# minio-go signs a plain-HTTP upload with the SigV4 *streaming* signature: the
+# body travels in aws-chunked framing, every chunk signed, and jay decodes and
+# verifies it (PND-0188). Over TLS the same client sends an unframed body — or,
+# when asked for a checksum, the UNSIGNED-PAYLOAD-TRAILER framing, which is what
+# aws-cli sends over TLS by default too. One listener cannot be both, so the
+# harness runs two and asserts, from each client's own debug output, which
+# framing actually went over the wire: a round trip that never exercised the
+# decoder must not be counted as one that did.
 # ---------------------------------------------------------------------------
 
 S3_PORT="$(pick_port)"
@@ -435,6 +438,10 @@ printf 'two\n' >"$FIX/syncdir/nested/b.txt"
 # header is verified on the way down.
 dd if=/dev/urandom of="$FIX/big.bin" bs=1048576 count=12 >/dev/null 2>&1 ||
 	die "could not create the 12 MiB fixture"
+# 20 MiB: above mc's 16 MiB default part size, so mc splits it into framed
+# UploadPart requests — minio-go frames parts exactly like whole objects.
+dd if=/dev/urandom of="$FIX/huge.bin" bs=1048576 count=20 >/dev/null 2>&1 ||
+	die "could not create the 20 MiB fixture"
 
 SMALL_B64="$(b64sha256 "$FIX/small.txt")"
 BIG_SHA="$(hexsha256 "$FIX/big.bin")"
@@ -967,6 +974,77 @@ export MC_CONFIG_DIR="$WORK/mc"
 mkdir -p "$MC_CONFIG_DIR"
 mc_() { "$MC_BIN" --no-color "$@"; }
 
+# mc_roundtrip_expect_refusal NAME FILE TARGET LOG MESSAGE [-- MC CP FLAGS...]
+#
+# For a known limitation: the upload must FAIL, mc must report MESSAGE (the
+# server's own words, so the check cannot pass on an unrelated failure), and
+# the target must not exist afterwards.
+mc_roundtrip_expect_refusal() {
+	local name="$1" file="$2" target="$3" log="$4" message="$5"
+	shift 5
+	[ $# -gt 0 ] && [ "$1" = "--" ] && shift
+	local runner="${MC_RT:-mc_}"
+
+	"$runner" --debug cp "$@" "$file" "$target" >"$LOGS/$log.log" 2>&1
+	local rc=$?
+	if [ "$rc" -eq 0 ]; then
+		fail "$name" "the upload succeeded; if the limitation was lifted, update this check and the README"
+		return
+	fi
+	if ! grep -qF "$message" "$LOGS/$log.log"; then
+		fail "$name" "mc failed for another reason: $(grep -iv '^mc: <debug>' "$LOGS/$log.log" | tail -2 | tr '\n' ' ' | cut -c1-200)"
+		return
+	fi
+	if "$runner" stat "$target" >/dev/null 2>&1; then
+		fail "$name" "the refused upload left an object behind"
+		return
+	fi
+	pass "$name"
+}
+
+# mc_roundtrip NAME FILE TARGET LOG WIRE [WIRE2] [-- MC CP FLAGS...]
+#
+# Uploads FILE to TARGET with `mc --debug cp`, reads it back with `mc cat`, and
+# passes only if (1) the debug trace shows the x-amz-content-sha256 literal
+# WIRE — and WIRE2, when given, e.g. partNumber= for multipart — so the check
+# cannot pass on a path that never framed the body; (2) the upload exited 0;
+# and (3) the bytes read back are identical to FILE. The mc binary and its
+# flags (--insecure for TLS) come from $MC_RT, defaulting to plain mc_.
+mc_roundtrip() {
+	local name="$1" file="$2" target="$3" log="$4" wire="$5"
+	shift 5
+	local wire2=""
+	if [ $# -gt 0 ] && [ "$1" != "--" ]; then
+		wire2="$1"
+		shift
+	fi
+	[ $# -gt 0 ] && [ "$1" = "--" ] && shift
+	local runner="${MC_RT:-mc_}"
+
+	"$runner" --debug cp "$@" "$file" "$target" >"$LOGS/$log.log" 2>&1
+	local rc=$?
+	if [ "$rc" -ne 0 ]; then
+		fail "$name" "mc cp exited $rc: $(grep -iv '^mc: <debug>' "$LOGS/$log.log" | tail -2 | tr '\n' ' ' | cut -c1-200)"
+		return
+	fi
+	# Anchored on what follows the literal, because the plain mode is a
+	# prefix of its -TRAILER sibling.
+	if ! grep -Eqi "X-Amz-Content-Sha256: ${wire}([^-a-z0-9]|\$)" "$LOGS/$log.log"; then
+		fail "$name" "mc did not send $wire, so the check proves nothing about it (see $log.log)"
+		return
+	fi
+	if [ -n "$wire2" ] && ! grep -q "$wire2" "$LOGS/$log.log"; then
+		fail "$name" "the trace has no $wire2 (see $log.log)"
+		return
+	fi
+	"$runner" cat "$target" >"$WORK/$log.dl" 2>>"$LOGS/$log.log"
+	if cmp -s "$file" "$WORK/$log.dl"; then
+		pass "$name"
+	else
+		fail "$name" "read back $(file_size "$WORK/$log.dl") bytes, uploaded $(file_size "$file"): the stored object is not the file"
+	fi
+}
+
 if [ -z "$MC_BIN" ]; then
 	skip "whole group" "mc is not installed"
 elif [ -z "$AWS_BIN" ]; then
@@ -1029,34 +1107,38 @@ else
 		fi
 	fi
 
-	# KNOWN LIMIT — asserted, not tolerated.
-	#
-	# Over plain HTTP minio-go signs every PutObject with the SigV4 *streaming*
-	# signature and frames the body as aws-chunked. jay has no decoder for that
-	# framing and refuses the request with 501 rather than storing the framing
-	# as the object.
-	#
-	# TODO(PND-0188): when the decoder lands this check goes red on purpose;
-	# update it and the README together.
-	mc_ cp "$FIX/small.txt" jayhttp/"$BUCKET_A"/via-mc.txt >"$LOGS/mc-cp.log" 2>&1
-	mc_rc=$?
-	if [ "$mc_rc" -ne 0 ] &&
-		grep -qi "not implemented" "$LOGS/mc-cp.log" &&
-		! object_exists "$BUCKET_A" via-mc.txt; then
-		pass "known limit: an mc upload is refused with 501 and writes nothing (PND-0186/PND-0188)"
-	else
-		fail "known limit: an mc upload is refused with 501 and writes nothing (PND-0186/PND-0188)" \
-			"rc=$mc_rc, object present=$(object_exists "$BUCKET_A" via-mc.txt && echo yes || echo no). If the aws-chunked decoder landed, update this check and the README."
-	fi
+	# Uploads over plain HTTP: every one of them travels as aws-chunked, which
+	# jay decodes and verifies chunk by chunk (PND-0188). Until then this was a
+	# 501, and before THAT the framing itself was stored as the object (a
+	# 15-byte file became 187 bytes). So each check asserts three things: that
+	# mc's own debug trace shows the streaming literal it sent — otherwise the
+	# decoder was not exercised at all — that the upload succeeded, and that
+	# the bytes read back are the bytes of the file, compared with cmp.
+	mc_roundtrip "PutObject over HTTP round-trips byte for byte (aws-chunked, PND-0188)" \
+		"$FIX/small.txt" "jayhttp/$BUCKET_A/via-mc.txt" mc-cp STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+
+	# 20 MiB is above mc's 16 MiB part size: two framed UploadPart requests
+	# and a CompleteMultipartUpload.
+	mc_roundtrip "multipart upload of 20 MiB over HTTP round-trips byte for byte (framed parts, PND-0188)" \
+		"$FIX/huge.bin" "jayhttp/$BUCKET_A/via-mc-huge.bin" mc-cp-huge STREAMING-AWS4-HMAC-SHA256-PAYLOAD partNumber=
+
+	# --checksum moves the digest into a trailer after the last chunk. mc then
+	# stops signing the chunks (it disables the payload SHA-256), so this is the
+	# UNSIGNED-PAYLOAD-TRAILER framing even over HTTP: jay verifies the CRC32C
+	# against the bytes before committing. The SIGNED trailer variant is what
+	# warp sends; see the warp group.
+	mc_roundtrip "PutObject with a CRC32C trailer round-trips (PND-0188)" \
+		"$FIX/small.txt" "jayhttp/$BUCKET_A/via-mc-crc.txt" mc-cp-crc STREAMING-UNSIGNED-PAYLOAD-TRAILER \
+		-- --checksum CRC32C
 fi
 
 # ---------------------------------------------------------------------------
 # GROUP: mc over TLS (minio-go)
 #
-# Same client, same version, opposite outcome: minio-go only reaches for the
-# streaming signature when the connection is NOT secure, so over HTTPS it sends
-# an unframed body and jay stores it. This is why the README cannot say
-# "minio-go uploads fail" without saying over what.
+# Same client, different wire: minio-go only reaches for the SIGNED streaming
+# mode when the connection is not secure, so over HTTPS it sends an unframed
+# body — and, when asked for a checksum, the STREAMING-UNSIGNED-PAYLOAD-TRAILER
+# framing, whose trailer jay verifies before committing.
 # ---------------------------------------------------------------------------
 
 say ""
@@ -1089,6 +1171,81 @@ else
 	else
 		fail "12 MiB upload over HTTPS round-trips byte for byte" "$(tail -3 "$LOGS/mctls-big.log")"
 	fi
+
+	# The unsigned-trailer framing: unsigned chunks, a CRC32C trailer. Before
+	# PND-0188 this was a 501 even over TLS.
+	MC_RT=mc_tls mc_roundtrip "PutObject with an unsigned CRC32C trailer over HTTPS round-trips (PND-0188)" \
+		"$FIX/small.txt" "jaytls/conformance-tls/via-mc-crc.txt" mctls-cp-crc STREAMING-UNSIGNED-PAYLOAD-TRAILER \
+		-- --checksum CRC32C
+
+	# KNOWN LIMIT — asserted, not tolerated. With --checksum, mc sends every
+	# part with a trailing CRC32C (decoded and verified, the parts answer 200)
+	# and then a whole-object x-amz-checksum-crc32c on
+	# CompleteMultipartUpload. jay does not compose part checksums into a
+	# whole-object one, so that last step answers 501 and mc aborts the
+	# upload. What must hold: mc fails, says why, and no object is left.
+	MC_RT=mc_tls mc_roundtrip_expect_refusal \
+		"known limit: mc multipart with --checksum is refused at CompleteMultipartUpload and leaves no object" \
+		"$FIX/huge.bin" "jaytls/conformance-tls/via-mc-crc-huge.bin" mctls-cp-crc-huge \
+		"Whole-object checksum verification on CompleteMultipartUpload is not implemented" \
+		-- --checksum CRC32C
+fi
+
+# ---------------------------------------------------------------------------
+# GROUP: aws-cli over TLS (botocore)
+#
+# Over HTTPS botocore stops hashing the payload up front and sends every
+# upload as STREAMING-UNSIGNED-PAYLOAD-TRAILER with a CRC64NVME trailer — the
+# AWS SDK layout of the framing, where mc uses minio-go's. Before PND-0188
+# this was a 501: aws-cli could upload to jay only over plain HTTP.
+# ---------------------------------------------------------------------------
+
+say ""
+say "${C_BOLD}aws-cli over TLS${C_RESET}"
+GROUP="aws-cli-tls"
+
+if [ -z "$AWS_BIN" ]; then
+	skip "whole group" "aws-cli is not installed"
+else
+	aws_tls() {
+		AWS_ACCESS_KEY_ID="$TLS_ID" AWS_SECRET_ACCESS_KEY="$TLS_SECRET" \
+			AWS_ENDPOINT_URL="$TLS_S3" "$AWS_BIN" --no-verify-ssl "$@"
+	}
+
+	# aws_tls_roundtrip NAME FILE KEY LOG [WIRE2] — upload with --debug, assert
+	# the trace shows the unsigned-trailer framing (and WIRE2, when given),
+	# download, compare bytes.
+	aws_tls_roundtrip() {
+		local name="$1" file="$2" key="$3" log="$4" wire2="${5:-}"
+		if ! aws_tls --debug s3 cp "$file" "s3://conformance-aws-tls/$key" >"$LOGS/$log.log" 2>&1; then
+			fail "$name" "aws s3 cp failed: $(grep -v ' - DEBUG - ' "$LOGS/$log.log" | tail -2 | tr '\n' ' ' | cut -c1-200)"
+			return
+		fi
+		if ! grep -Eqi "'x-amz-content-sha256': b'STREAMING-UNSIGNED-PAYLOAD-TRAILER'" "$LOGS/$log.log"; then
+			fail "$name" "aws-cli did not send STREAMING-UNSIGNED-PAYLOAD-TRAILER, so the check proves nothing about it (see $log.log)"
+			return
+		fi
+		if [ -n "$wire2" ] && ! grep -q "$wire2" "$LOGS/$log.log"; then
+			fail "$name" "the trace has no $wire2 (see $log.log)"
+			return
+		fi
+		aws_tls s3 cp "s3://conformance-aws-tls/$key" "$WORK/$log.dl" --quiet >>"$LOGS/$log.log" 2>&1
+		if cmp -s "$file" "$WORK/$log.dl"; then
+			pass "$name"
+		else
+			fail "$name" "read back $(file_size "$WORK/$log.dl" 2>/dev/null || echo 0) bytes, uploaded $(file_size "$file")"
+		fi
+	}
+
+	if aws_tls s3 mb s3://conformance-aws-tls >"$LOGS/awstls-mb.log" 2>&1; then
+		pass "CreateBucket over HTTPS"
+	else
+		fail "CreateBucket over HTTPS" "$(tail -2 "$LOGS/awstls-mb.log")"
+	fi
+	aws_tls_roundtrip "PutObject with a CRC64NVME trailer round-trips byte for byte (PND-0188)" \
+		"$FIX/small.txt" small.txt awstls-cp
+	aws_tls_roundtrip "multipart 12 MiB with CRC64NVME trailers round-trips byte for byte (PND-0188)" \
+		"$FIX/big.bin" big.bin awstls-cp-big partNumber=
 fi
 
 # ---------------------------------------------------------------------------
@@ -1103,37 +1260,89 @@ say ""
 say "${C_BOLD}warp${C_RESET}"
 GROUP="warp"
 
+# warp_check NAME LOG [BUCKET] — passes only if the report exists, mentions no
+# error, and (when BUCKET is given) the bucket really holds objects: a
+# benchmark whose every PUT failed still prints a report.
+warp_check() {
+	local name="$1" log="$2" bucket="${3:-}"
+	local total state
+	total="$(sed -n 's/^ \* Average: \(.*\)$/\1/p' "$log" | tail -1)"
+	if grep -qi "error" "$log"; then
+		fail "$name" "$(grep -i error "$log" | head -2 | tr '\n' ' ' | cut -c1-220)"
+		return
+	fi
+	if [ -z "$total" ]; then
+		fail "$name" "warp printed no report: $(tail -3 "$log" | tr '\n' ' ')"
+		return
+	fi
+	if [ -n "$bucket" ]; then
+		state="$(bucket_state "$bucket")"
+		if [ "$state" != "populated" ]; then
+			fail "$name" "bucket $bucket is [$state] after the run"
+			return
+		fi
+	fi
+	pass "$name — $total"
+}
+
 if [ -z "$WARP_BIN" ]; then
 	skip "whole group" "warp is not installed (go install github.com/minio/warp@latest)"
 else
-	# KNOWN LIMIT, same framing as mc: over plain HTTP every PUT is refused.
+	# Over plain HTTP every warp PUT is aws-chunked. Before PND-0188 it was a
+	# 501, and before PND-0186 it stored the framing: `warp get` then failed
+	# every download with "unexpected download size. want:65536, got:65712".
+	# So both halves run: put fills a bucket, get uploads its own objects and
+	# checks the size of every download. The assertion is zero errors in the
+	# report and a bucket that really holds objects afterwards.
 	run_limited 120 "$WARP_BIN" put --host="127.0.0.1:$S3_PORT" \
 		--access-key="$A_ID" --secret-key="$A_SECRET" --bucket=warp-http \
-		--duration=3s --obj.size=1KiB --concurrent=2 --noclear --no-color \
-		--benchdata="$WORK/warp-http" >"$LOGS/warp-http.log" 2>&1
-	warp_http_state="$(bucket_state warp-http)"
-	if grep -qi "not implemented" "$LOGS/warp-http.log" && [ "$warp_http_state" = "empty" ]; then
-		pass "known limit: warp cannot upload over HTTP and leaves the bucket empty (PND-0186/PND-0188)"
+		--duration=5s --obj.size=256KiB --concurrent=4 --noclear --no-color \
+		--benchdata="$WORK/warp-http-put" >"$LOGS/warp-http-put.log" 2>&1
+	warp_check "warp put over HTTP runs clean and stores objects (aws-chunked, PND-0188)" \
+		"$LOGS/warp-http-put.log" warp-http
+
+	run_limited 180 "$WARP_BIN" get --host="127.0.0.1:$S3_PORT" \
+		--access-key="$A_ID" --secret-key="$A_SECRET" --bucket=warp-http-get \
+		--duration=5s --obj.size=64KiB --objects=50 --concurrent=4 --noclear --no-color \
+		--benchdata="$WORK/warp-http-get" >"$LOGS/warp-http-get.log" 2>&1
+	warp_check "warp get over HTTP downloads exactly what it uploaded (PND-0186/PND-0188)" \
+		"$LOGS/warp-http-get.log" warp-http-get
+
+	# --checksum over plain HTTP is the one client path that sends the SIGNED
+	# trailer variant: signed chunks, then a CRC32C trailer with its own
+	# signature. A 200 here means jay verified the chain, the trailer signature
+	# and the CRC32C of the bytes it was about to commit. The --debug trace is
+	# what proves the variant; warp's report cannot be read from it (the trace
+	# echoes the server's expected probe errors), so every traced PUT in that
+	# variant must have been answered 200.
+	run_limited 120 "$WARP_BIN" put --debug --host="127.0.0.1:$S3_PORT" \
+		--access-key="$A_ID" --secret-key="$A_SECRET" --bucket=warp-http-crc \
+		--duration=3s --obj.size=100KiB --concurrent=2 --noclear --no-color --checksum CRC32C \
+		--benchdata="$WORK/warp-http-crc" >"$LOGS/warp-http-crc.log" 2>&1
+	crc_counts="$(tr -d '\r' <"$LOGS/warp-http-crc.log" | awk '
+		/---------START-HTTP---------/ { hit = 0; status = ""; next }
+		/^X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER$/ { hit = 1 }
+		/^HTTP\/1\.1 / { status = $2 }
+		/---------END-HTTP---------/ { if (hit) { n++; if (status != "200") bad++ } }
+		END { printf "%d %d", n, bad }')"
+	crc_sent="${crc_counts% *}"
+	crc_bad="${crc_counts#* }"
+	crc_state="$(bucket_state warp-http-crc)"
+	if [ "$crc_sent" -gt 0 ] && [ "$crc_bad" -eq 0 ] && [ "$crc_state" = "populated" ]; then
+		pass "warp put --checksum over HTTP: $crc_sent signed-trailer uploads, all verified and stored (PND-0188)"
 	else
-		fail "known limit: warp cannot upload over HTTP and leaves the bucket empty (PND-0186/PND-0188)" \
-			"bucket warp-http is [$warp_http_state], refusal in the log=$(grep -qi 'not implemented' "$LOGS/warp-http.log" && echo yes || echo no). If the aws-chunked decoder landed, update this check and the README."
+		fail "warp put --checksum over HTTP: signed-trailer uploads verified and stored (PND-0188)" \
+			"signed-trailer PUTs traced=$crc_sent, not 200=$crc_bad, bucket=[$crc_state]"
 	fi
 
-	# And the real smoke test: the same tool, over TLS, doing PUT/GET/DELETE/STAT
-	# concurrently for ten seconds. The number it prints is informational; the
-	# assertion is that it ran with zero errors.
+	# And the mixed smoke test over TLS: PUT/GET/DELETE/STAT concurrently for
+	# ten seconds. The number it prints is informational; the assertion is that
+	# it ran with zero errors.
 	run_limited 180 "$WARP_BIN" mixed --host="127.0.0.1:$TLS_S3_PORT" --tls --insecure \
 		--access-key="$TLS_ID" --secret-key="$TLS_SECRET" --bucket=warp-tls \
 		--duration=10s --obj.size=256KiB --concurrent=4 --no-color \
 		--benchdata="$WORK/warp-tls" >"$LOGS/warp-tls.log" 2>&1
-	warp_total="$(sed -n 's/^ \* Average: \(.*\)$/\1/p' "$LOGS/warp-tls.log" | tail -1)"
-	if grep -qi "error" "$LOGS/warp-tls.log"; then
-		fail "warp mixed over TLS runs clean" "$(grep -i error "$LOGS/warp-tls.log" | head -2)"
-	elif [ -z "$warp_total" ]; then
-		fail "warp mixed over TLS runs clean" "warp printed no report: $(tail -3 "$LOGS/warp-tls.log")"
-	else
-		pass "warp mixed over TLS runs clean — $warp_total"
-	fi
+	warp_check "warp mixed over TLS runs clean" "$LOGS/warp-tls.log"
 fi
 
 # ---------------------------------------------------------------------------

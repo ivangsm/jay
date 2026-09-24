@@ -191,8 +191,8 @@ func (h *Handler) SetMaxObjectSize(n int64) {
 //   - withRequestID mints the ID before anything can answer, so the header the
 //     client gets, the access log line and the <RequestId> of any error
 //     document are the same string on EVERY path — including the ones that
-//     never reach the credential middleware (429, aws-chunked 501, presigned
-//     rejection).
+//     never reach the credential middleware (429, a refused aws-chunked body,
+//     presigned rejection).
 //   - withIPRateLimit runs BEFORE any authentication so that bcrypt/SigV4
 //     verification is never reached by a source already over its budget.
 //     withRateLimit then applies the per-token quota once the caller is known.
@@ -200,9 +200,12 @@ func (h *Handler) SetMaxObjectSize(n int64) {
 //     and the statusWriter the logger installed (so a recovered panic still
 //     produces an access line, with status 500), and it wraps everything
 //     below — a panic in the rate limiter or in authentication counts too.
-//   - withUnframedBody sits between the two rate limiters and withPresigned: an
-//     aws-chunked body is refused before a signature is verified and before a
-//     byte is read, but still inside the IP limiter.
+//   - withChunkedBodyGate sits between the two rate limiters and withPresigned:
+//     an aws-chunked body that jay will not decode (wrong credential form,
+//     wrong operation, a variant it does not implement) is refused before a
+//     signature is verified and before a byte is read, but still inside the IP
+//     limiter. The ones it lets through are decoded by withAuth, in
+//     auth.AuthenticateSigV4.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.chain(h.dispatch)(w, r)
 }
@@ -218,7 +221,7 @@ func (h *Handler) chain(final http.HandlerFunc) http.HandlerFunc {
 		h.withLogging(
 			h.withRecover(
 				h.withIPRateLimit(
-					h.withUnframedBody(
+					h.withChunkedBodyGate(
 						h.withPresigned(
 							h.withAuth(
 								h.withRateLimit(final))))))))
@@ -236,9 +239,15 @@ func (h *Handler) chain(final http.HandlerFunc) http.HandlerFunc {
 //   - jay's own X-Jay-* form, HMAC'd with the server signing secret. falco and
 //     `jay-admin presign` emit it, so it stays.
 //
-// The SigV4 branch is tried first and IsPresignedSigV4 already refuses a
-// request that also carries an Authorization header, so there is no way to
-// attach two credentials and have jay shop for the one that verifies.
+// A request that carries an Authorization header is not a presign in either
+// form: the header wins and the request goes to the normal auth middleware.
+// IsPresignedSigV4 already enforces that for the SigV4 branch, and the X-Jay
+// branch checks it here. Without the check, a valid X-Jay URL plus any header
+// that merely looked like SigV4 slipped an aws-chunked body past
+// withChunkedBodyGate (which admits framing for SigV4 headers, to be decoded
+// by AuthenticateSigV4) and into this branch, which never decodes it — so the
+// framing was stored as the object. It also means there is no way to attach
+// two credentials and have jay shop for the one that verifies.
 func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if auth.IsPresignedSigV4(r) {
@@ -250,7 +259,7 @@ func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 			h.servePresigned(w, r, token)
 			return
 		}
-		if h.signingSecret != "" && r.URL.Query().Get("X-Jay-Token") != "" {
+		if h.signingSecret != "" && r.URL.Query().Get("X-Jay-Token") != "" && r.Header.Get("Authorization") == "" {
 			token, err := validatePresignedRequest(r, h.signingSecret, h.db)
 			if err != nil {
 				h.rejectPresigned(w, r)
@@ -272,7 +281,19 @@ func (h *Handler) withPresigned(next http.HandlerFunc) http.HandlerFunc {
 // It does NOT mint a request ID: withRequestID owns the single generator and
 // this path inherits its value like every other, so a request cannot log one
 // ID and answer with another.
+//
+// A presigned request never carries an aws-chunked body: neither form has a
+// request signature to seed the chunk chain, so nothing on this path could
+// verify the chunks, and reading the body as is would store the framing as the
+// object. withChunkedBodyGate refuses it first; this is the second lock, for
+// the X-Jay form, which unlike the SigV4 one never reaches verifyPayloadHash.
 func (h *Handler) servePresigned(w http.ResponseWriter, r *http.Request, token *meta.Token) {
+	if hdr := auth.ChunkedBodyIndicator(r); hdr != "" {
+		h.refuseChunkedBody(w, r, hdr, http.StatusNotImplemented, S3ErrNotImplemented,
+			"a presigned URL has no request signature to verify aws-chunked framing against. "+
+				"Re-send the request with an unframed body.")
+		return
+	}
 	ctx := context.WithValue(r.Context(), ctxKeyToken, token)
 	h.withRateLimit(h.dispatch)(w, r.WithContext(ctx))
 }

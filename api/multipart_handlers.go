@@ -231,16 +231,26 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 
 	checksum, size, locationRef, err := h.store.WritePartVerified(uploadID, partNumber, body, verify)
 	if err != nil {
+		var chunkedErr *auth.ChunkedBodyError
 		switch {
 		case errors.Is(err, objops.ErrObjectTooLarge):
 			h.log.Warn("upload part exceeds max size",
 				"upload", uploadID, "part", partNumber, "size", seenSize, "max", maxSize)
 			writeS3Error(w, r, http.StatusBadRequest, s3ErrEntityTooLarge,
 				"Your proposed upload exceeds the maximum allowed object size", resource)
-		case errors.Is(err, objops.ErrBadDigest):
+		case errors.Is(err, objops.ErrBadDigest), errors.Is(err, objops.ErrInvalidDigest):
+			// ErrInvalidDigest can only surface here from a trailing checksum,
+			// which is shape-checked when it arrives after the data.
 			h.log.Warn("upload part checksum mismatch, nothing written",
 				"err", err, "upload", uploadID, "part", partNumber)
 			h.writeChecksumError(w, r, err, resource)
+		case errors.As(err, &chunkedErr):
+			// The aws-chunked decoder refused the part — a chunk signature that
+			// does not verify, or framing that does not parse — before the
+			// store renamed it, so the part it retries is untouched.
+			h.log.Warn("upload part aws-chunked body rejected, nothing written",
+				"err", err, "upload", uploadID, "part", partNumber)
+			h.writeChunkedBodyError(w, r, err, resource)
 		default:
 			h.log.Error("write part", "err", err, "upload", uploadID, "part", partNumber)
 			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to write part", resource)

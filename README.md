@@ -121,15 +121,20 @@ Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
 | [Architecture](https://ivangsm.github.io/jay/internals/architecture/) | The write path, recovery, scrubbing, GC, snapshots |
 | [Limits](https://ivangsm.github.io/jay/internals/limits/) | No versioning, no object-byte backup, no replication, no events |
 
-## One compatibility caveat
+## Client compatibility
 
-minio-go clients (`mc`, `warp`) **cannot upload over plain HTTP**. They sign
-non-TLS uploads with SigV4's streaming mode, which frames the body in
-`aws-chunked`, and Jay refuses that framing with `501` rather than storing the
-frames as if they were your file. Over HTTPS the same clients work completely.
+aws-cli, the AWS SDKs, boto3 and minio-go clients (`mc`, `warp`) upload and
+download over both plain HTTP and HTTPS.
 
-aws-cli, the AWS SDKs and boto3 work over both.
-[The full explanation](https://ivangsm.github.io/jay/reference/s3-compatibility/).
+Some of them never send the body as-is: minio-go signs every plain-HTTP upload
+with SigV4's streaming mode, and aws-cli frames its HTTPS uploads with a
+trailing checksum — both in `aws-chunked` framing. Jay decodes it and verifies
+every chunk signature and every trailing checksum **before** it commits the
+object, so a tampered or truncated upload writes nothing. What still answers
+`501`: SigV4a streaming, framing under a bearer token or a presigned URL, and
+`mc cp --checksum` of a file big enough to go multipart (Jay does not verify
+whole-object checksums on `CompleteMultipartUpload`).
+[The full explanation](https://ivangsm.github.io/jay/reference/s3-compatibility/#aws-chunked-streaming-uploads).
 
 ## Development
 

@@ -94,7 +94,24 @@ func (a *Auth) AuthenticateSigV4(r *http.Request) (*meta.Token, error) {
 	// (or a MITM) could swap the body and keep the signature valid. Done after
 	// the signature check so an unauthenticated caller can never make us buffer
 	// a body.
-	if err := verifyPayloadHash(r, r.Header.Get("x-amz-content-sha256")); err != nil {
+	//
+	// A STREAMING-* literal is the one declared hash that is not checked here,
+	// and it is not skipped either: the body is replaced by a decoder that
+	// verifies every chunk against a chain seeded by THIS signature, and that
+	// never reports the end of the body before the whole chain has verified.
+	// The literal is accepted exactly when that decoder is installed — there is
+	// no path where it passes and the body is read as is.
+	if ChunkedBodyIndicator(r) != "" {
+		signer := &chunkSigner{
+			key:     signingKey,
+			amzDate: amzDate,
+			scope:   dateStr + "/" + region + "/" + sigV4Service + "/" + sigV4Terminator,
+			prev:    expectedSig,
+		}
+		if err := decodeStreamingBody(r, signer); err != nil {
+			return nil, err
+		}
+	} else if err := verifyPayloadHash(r, r.Header.Get("x-amz-content-sha256")); err != nil {
 		return nil, err
 	}
 
@@ -113,18 +130,44 @@ func (a *Auth) AuthenticateSigV4(r *http.Request) (*meta.Token, error) {
 // rejected rather than buffered.
 const maxSignedPayloadSize = 32 << 20 // 32 MiB
 
+// decodeStreamingBody accepts an aws-chunked request signed with a SigV4
+// Authorization header and installs the decoder that verifies it.
+//
+// The streaming modes put the ISO 8601 X-Amz-Date in every chunk's string to
+// sign, so a request dated only by an HTTP Date header cannot seed the chain.
+// For the unsigned mode the signer is dropped: the chunks carry no signatures,
+// and the request signature has already been verified above.
+func decodeStreamingBody(r *http.Request, signer *chunkSigner) error {
+	p, err := ParseStreamingPayload(r)
+	if err != nil {
+		return err
+	}
+	if _, err := time.Parse(amzDateFormat, signer.amzDate); err != nil {
+		return chunkedErr(ErrChunkedBodyMalformed,
+			"a streaming signature needs X-Amz-Date in ISO 8601 basic format, got %q", truncate(signer.amzDate))
+	}
+	if !p.Signed {
+		signer = nil
+	}
+	installChunkedReader(r, p, signer)
+	return nil
+}
+
 // verifyPayloadHash checks that the request body actually hashes to the value
 // declared in x-amz-content-sha256, and leaves the body readable by handlers.
 //
-// An aws-chunked body is refused outright, whatever the declared hash says:
-// jay cannot decode the framing, so nothing here could verify it, and skipping
-// the check would store the framing as the object body.
+// An aws-chunked body is refused outright, whatever the declared hash says.
+// Only AuthenticateSigV4 decodes the framing — it has the request signature
+// that seeds the chunk chain — and it does so before ever calling this. Every
+// other caller (the presigned form) reaching here with framing would otherwise
+// store the framing as the object body.
 //
 // Verification is skipped for UNSIGNED-PAYLOAD and for an absent header, which
 // the canonical request already treats as UNSIGNED-PAYLOAD.
 func verifyPayloadHash(r *http.Request, declared string) error {
 	if hdr := ChunkedBodyIndicator(r); hdr != "" {
-		return fmt.Errorf("%w: announced by %s", ErrChunkedBodyUnsupported, hdr)
+		return fmt.Errorf("%w: announced by %s; only a SigV4 Authorization header can carry an aws-chunked body",
+			ErrChunkedBodyUnsupported, hdr)
 	}
 
 	if declared == "" || declared == unsignedPayload {

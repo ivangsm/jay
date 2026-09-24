@@ -68,6 +68,12 @@ func (h *Handler) mapObjopsErr(w http.ResponseWriter, r *http.Request, err error
 // bytes that arrive, and a mismatch answers 400 with nothing written — see
 // objops.PutObject. The declaration is parsed before the body is read so a
 // malformed one never opens a temp file.
+//
+// An aws-chunked body arrives here already wrapped by auth's decoder, so what
+// reaches the store is the payload. A chunk that fails to verify surfaces as a
+// read error before the store renames anything, and is answered by
+// writeChunkedBodyError; a checksum carried in its trailer is verified like a
+// header one (see checksumVerifierFor).
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	token, ok := h.requireAuth(r, w, meta.ActionObjectPut, bucketName, objectKey)
 	if !ok {
@@ -102,6 +108,9 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	)
 	if err != nil {
 		if h.writeChecksumError(w, r, err, resource) {
+			return
+		}
+		if h.writeChunkedBodyError(w, r, err, resource) {
 			return
 		}
 		if h.mapObjopsErr(w, r, err, bucketName, objectKey) {
