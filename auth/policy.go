@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"slices"
 	"strings"
 
 	"github.com/ivangsm/jay/meta"
@@ -57,7 +56,7 @@ func validateStatement(i int, stmt PolicyStatement) error {
 			"can never match", ErrInvalidPolicy, i)
 	}
 	for _, action := range stmt.Actions {
-		if action == "*" || slices.Contains(meta.AllActions, action) {
+		if meta.ValidAction(action) {
 			continue
 		}
 		return fmt.Errorf("%w: statement %d: %q is not one of %v (or \"*\")",

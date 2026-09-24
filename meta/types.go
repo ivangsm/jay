@@ -2,6 +2,7 @@ package meta
 
 import (
 	"encoding/json/jsontext"
+	"slices"
 	"time"
 )
 
@@ -109,4 +110,11 @@ var AllActions = []string{
 	ActionBucketList, ActionBucketReadMeta, ActionBucketWriteMeta,
 	ActionObjectGet, ActionObjectPut, ActionObjectDelete, ActionObjectList,
 	ActionMultipartCreate, ActionMultipartUpload, ActionMultipartComplete, ActionMultipartAbort,
+}
+
+// ValidAction reports whether action is one a token or a policy can name: one
+// of AllActions, or the wildcard "*". Anything else matches nothing when it is
+// evaluated, so it has to be refused where it enters.
+func ValidAction(action string) bool {
+	return action == "*" || slices.Contains(AllActions, action)
 }

@@ -15,6 +15,7 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -28,21 +29,6 @@ import (
 // written by hand and read by a human; anything past this is not one, and the
 // body is buffered to be parsed.
 const maxBucketPolicyBytes = 64 << 10
-
-// bucketRoute splits "/buckets/<name>[/<sub>]" out of an admin path. ok is
-// false for anything else. Bucket names cannot contain a slash
-// (meta.ValidBucketName), so the split is unambiguous.
-func bucketRoute(path string) (name, sub string, ok bool) {
-	rest, found := strings.CutPrefix(path, "/buckets/")
-	if !found || rest == "" {
-		return "", "", false
-	}
-	name, sub, _ = strings.Cut(rest, "/")
-	if name == "" || strings.Contains(sub, "/") {
-		return "", "", false
-	}
-	return name, sub, true
-}
 
 // bucketResponse is what GET /_jay/buckets/{name} answers. Policy and
 // visibility come together because they are the two halves of one question:
@@ -129,7 +115,9 @@ func (h *Handler) handlePutBucketPolicy(w http.ResponseWriter, r *http.Request, 
 		h.writeBucketUpdateError(w, "update bucket policy", name, err)
 		return
 	}
-	h.log.Info("bucket policy installed", "bucket", name, "statements", len(policy.Statements))
+	h.audit(r, "bucket.policy.put",
+		slog.String("bucket", name),
+		slog.Int("statements", len(policy.Statements)))
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := jsonv2.MarshalWrite(w, putPolicyResponse{
@@ -146,7 +134,7 @@ func (h *Handler) handlePutBucketPolicy(w http.ResponseWriter, r *http.Request, 
 // AuthorizeBucketAccess has nothing to grant on and the default is deny. That
 // is why it is a plain delete and not a quarantine — nothing is lost that was
 // protecting anything.
-func (h *Handler) handleDeleteBucketPolicy(w http.ResponseWriter, _ *http.Request, name string) {
+func (h *Handler) handleDeleteBucketPolicy(w http.ResponseWriter, r *http.Request, name string) {
 	if _, ok := h.loadBucket(w, name); !ok {
 		return
 	}
@@ -154,7 +142,7 @@ func (h *Handler) handleDeleteBucketPolicy(w http.ResponseWriter, _ *http.Reques
 		h.writeBucketUpdateError(w, "delete bucket policy", name, err)
 		return
 	}
-	h.log.Info("bucket policy removed", "bucket", name)
+	h.audit(r, "bucket.policy.delete", slog.String("bucket", name))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -181,7 +169,9 @@ func (h *Handler) handlePutBucketVisibility(w http.ResponseWriter, r *http.Reque
 		h.writeBucketUpdateError(w, "update bucket visibility", name, err)
 		return
 	}
-	h.log.Info("bucket visibility changed", "bucket", name, "visibility", req.Visibility)
+	h.audit(r, "bucket.visibility.put",
+		slog.String("bucket", name),
+		slog.String("visibility", req.Visibility))
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := jsonv2.MarshalWrite(w, map[string]string{
