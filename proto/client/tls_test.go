@@ -75,8 +75,10 @@ type tlsEnv struct {
 }
 
 // startNativeServer boots a native protocol server, with TLS when serverTLS is
-// non-nil, and returns everything needed to connect to it.
-func startNativeServer(t *testing.T, serverTLS *tls.Config) *tlsEnv {
+// non-nil, and returns everything needed to connect to it. configure runs
+// before the listener opens, which is the only time the server's setters may
+// be called.
+func startNativeServer(t *testing.T, serverTLS *tls.Config, configure ...func(*proto.Server)) *tlsEnv {
 	t.Helper()
 	dir := t.TempDir()
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -118,6 +120,9 @@ func startNativeServer(t *testing.T, serverTLS *tls.Config) *tlsEnv {
 	srv := proto.NewServer(db, st, auth.New(db), log, metrics, 0, 0)
 	if serverTLS != nil {
 		srv.SetTLSConfig(serverTLS)
+	}
+	for _, fn := range configure {
+		fn(srv)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

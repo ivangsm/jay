@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ivangsm/jay/proto"
@@ -511,12 +512,10 @@ func (c *Client) doRequestWithData(ctx context.Context, op byte, meta []byte, da
 	defer stop()
 
 	if err := proto.WriteFrame(cn.bw, op, 0, meta, data, dataLen); err != nil {
-		c.dropConn(cn)
-		return 0, nil, wrapCtx(ctx, fmt.Errorf("write request: %w", err))
+		return c.answerBeforeBody(ctx, cn, fmt.Errorf("write request: %w", err))
 	}
 	if err := cn.bw.Flush(); err != nil {
-		c.dropConn(cn)
-		return 0, nil, wrapCtx(ctx, fmt.Errorf("flush request: %w", err))
+		return c.answerBeforeBody(ctx, cn, fmt.Errorf("flush request: %w", err))
 	}
 
 	status, _, metaLen, respDataLen, err := proto.ReadHeader(cn.br)
@@ -544,9 +543,93 @@ func (c *Client) doRequestWithData(ctx context.Context, op byte, meta []byte, da
 		}
 	}
 
+	if status != proto.StatusOK && serverMayHaveClosed(respMeta, dataLen) {
+		c.dropConn(cn)
+		return status, respMeta, nil
+	}
+
 	c.putConn(cn)
 	return status, respMeta, nil
 }
+
+// earlyAnswerTimeout bounds the read for an answer after a body write failed.
+// A server that refused the frame has already answered and closed, so the
+// answer is in the receive buffer or nowhere; the bound only matters when the
+// write failed for another reason and nothing is coming.
+const earlyAnswerTimeout = time.Second
+
+// answerBeforeBody handles a request body that could not be written. The
+// server refuses some frames without reading their body — rate limited with a
+// body larger than proto.RateLimitDrainSize, or rejected with more than
+// proto.MaxDrainSize left unread — by answering and closing the connection,
+// and that close is usually what failed the write. The answer came first and
+// is sitting in the receive buffer: it is the true error ("rate limit
+// exceeded", "access denied") where the socket only knows "broken pipe".
+//
+// Only a peer that closed or reset the connection can have answered first, so
+// only EPIPE and ECONNRESET are worth looking behind. A deadline or a
+// cancellation is the client's own doing, and an error from the caller's
+// reader means the server never refused anything. The data reader is not
+// wrapped to tell the two sides apart: that would hide an *os.File from
+// (*net.TCPConn).ReadFrom and cost uploads their sendfile(2). An OK status is
+// never taken from here: a body that was not written whole was not stored,
+// whatever a confused peer says.
+//
+// The connection is dropped in every case: the frame did not go out whole.
+func (c *Client) answerBeforeBody(ctx context.Context, cn *conn, writeErr error) (status byte, respMeta []byte, err error) {
+	defer c.dropConn(cn)
+	if ctx.Err() != nil {
+		return 0, nil, ctxError(ctx)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) && !errors.Is(writeErr, syscall.ECONNRESET) {
+		return 0, nil, writeErr
+	}
+	if err := cn.nc.SetReadDeadline(deadline(ctx, earlyAnswerTimeout)); err != nil {
+		return 0, nil, writeErr
+	}
+	st, _, metaLen, _, err := proto.ReadHeader(cn.br)
+	if err != nil || st == proto.StatusOK || metaLen > proto.MaxMetaSize {
+		return 0, nil, writeErr
+	}
+	m := make([]byte, metaLen)
+	if _, err := io.ReadFull(cn.br, m); err != nil {
+		return 0, nil, writeErr
+	}
+	return st, m, nil
+}
+
+// serverMayHaveClosed reports whether the server was entitled to close the
+// connection after this error answer to a request that carried a body. It
+// does that when it refuses a frame without reading all of it — the
+// protocol reference, "Refusing a frame without reading it" — and if the body
+// was small enough to fit in the socket buffers, our write finished before
+// the close arrived and nothing told us. Pooling that connection would fail
+// the next request on it.
+//
+// The test is on sizes the reference fixes, and errs toward dropping: a
+// connection the server kept costs one reconnect, a dead one in the pool
+// costs a failed request.
+func serverMayHaveClosed(respMeta []byte, reqDataLen int64) bool {
+	if reqDataLen > proto.MaxDrainSize {
+		return true
+	}
+	if reqDataLen <= rateLimitKeptBody {
+		return false
+	}
+	_, code, err := proto.DecodeError(respMeta)
+	return err == nil && code == "RateLimitExceeded"
+}
+
+// rateLimitKeptBody is the largest rate-limited body after which any server
+// keeps the connection. It is the floor the reference gives
+// proto.RateLimitDrainSize, not its current value: the server drains more
+// today only for the clients that predate this rule, and is meant to come
+// down to the floor once they are gone. Deciding by the current value would
+// build that value into this client, and lowering it on the server would then
+// make this client pool connections the server closed — the defect the rule
+// exists to prevent. Against today's server, the price is one reconnect after
+// a rate-limited upload between the two.
+const rateLimitKeptBody = proto.MaxMetaSize
 
 // doRequestWithDataResponse sends a request and returns a response with streaming data.
 // The caller must call result.Close() when done reading.
