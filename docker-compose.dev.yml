@@ -21,6 +21,11 @@ services:
       # JAY_TLS_KEY: /data/certs/server.key
       # JAY_RATE_LIMIT: "100"
       # JAY_RATE_BURST: "200"
+      # JAY_NATIVE_MAX_CONNS: "1000"
+      # JAY_NATIVE_TOKEN_BYTES_PER_SEC: "0"
+      # GET /metrics takes the admin token unless one of these is set (never both):
+      # JAY_METRICS_TOKEN: "${JAY_METRICS_TOKEN}"   # read-only scraper bearer, >= 32 chars
+      # JAY_METRICS_PUBLIC: "true"                  # no auth on /metrics at all
     restart: unless-stopped
     stop_grace_period: 30s
     healthcheck:

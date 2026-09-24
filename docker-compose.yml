@@ -25,6 +25,9 @@ services:
       # with `openssl rand -base64 32`; jay refuses to start without them.
       JAY_ADMIN_TOKEN: ${JAY_ADMIN_TOKEN:?JAY_ADMIN_TOKEN required}
       JAY_SIGNING_SECRET: ${JAY_SIGNING_SECRET:?JAY_SIGNING_SECRET required}
+      # Optional: a read-only bearer for Prometheus on GET /metrics, so the
+      # scraper never holds the admin token. At least 32 characters.
+      # JAY_METRICS_TOKEN: ${JAY_METRICS_TOKEN}
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9001/health/ready"]
       interval: 10s
