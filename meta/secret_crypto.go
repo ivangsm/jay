@@ -110,11 +110,33 @@ func (db *DB) decryptSecret(stored string) (string, error) {
 	return aesGCMDecrypt(db.kek, stored)
 }
 
+// minSigningSecretLen is the server's floor for JAY_SIGNING_SECRET
+// (minSecretLen in cmd/jay/main.go, which refuses to start below it).
+// cmd/jay-rekey's tests read the server's constant and check this refusal
+// against it, so the two cannot drift apart silently.
+const minSigningSecretLen = 32
+
 // RekeyTokens decrypts every token secret with oldSecret and re-encrypts it
 // with newSecret. Jay must be stopped before calling this — bbolt enforces an
 // exclusive file lock that will block if another process has the DB open.
-// Returns the number of tokens rekeyed. Idempotent if run again with same args.
+// Returns the number of tokens rekeyed.
+//
+// A token that already decrypts under newSecret is left as it is. That is what
+// makes a second run with the same arguments a no-op rather than a decrypt
+// error, and — more to the point — what makes a database holding tokens under
+// BOTH secrets recoverable: the state a server leaves when it is restarted
+// with the new secret before the rekey runs and mints a token in between.
+// Refusing that database left the operator with no way back, since no endpoint
+// deletes a token record.
+//
+// A token that decrypts under neither secret aborts the run before anything is
+// written. So does a newSecret shorter than the server accepts: rekeying to it
+// would report success and leave a database jay refuses to start against.
 func (db *DB) RekeyTokens(oldSecret, newSecret string) (int, error) {
+	if len(newSecret) < minSigningSecretLen {
+		return 0, fmt.Errorf("rekey: the new signing secret is %d bytes and jay refuses to start "+
+			"with fewer than %d; nothing was rekeyed", len(newSecret), minSigningSecretLen)
+	}
 	oldKEK := DeriveKEK(oldSecret)
 	newKEK := DeriveKEK(newSecret)
 
@@ -124,7 +146,11 @@ func (db *DB) RekeyTokens(oldSecret, newSecret string) (int, error) {
 		}
 		plain, err := aesGCMDecrypt(oldKEK, t.SecretKey)
 		if err != nil {
-			return false, fmt.Errorf("rekey: decrypt token %s: %w", t.TokenID, err)
+			if _, errNew := aesGCMDecrypt(newKEK, t.SecretKey); errNew == nil {
+				return false, nil // already under the new secret
+			}
+			return false, fmt.Errorf("rekey: token %s decrypts under neither the old nor the new "+
+				"secret; nothing was rekeyed: %w", t.TokenID, err)
 		}
 		enc, err := aesGCMEncrypt(newKEK, plain)
 		if err != nil {
