@@ -28,8 +28,36 @@ const (
 	// MaxMetaSize limits metadata payload to 1MB (prevents memory exhaustion).
 	MaxMetaSize = 1 << 20
 
-	// MaxDrainSize is how much data we'll drain on auth failure before closing.
-	MaxDrainSize = 10 << 20 // 10MB
+	// MaxDrainSize is the most of a refused request body the server reads
+	// out to keep the connection. When a handler refuses a frame (access
+	// denied, no such bucket, too large…) with more than this left unread, it
+	// answers and then closes, because the stream behind the answer is no
+	// longer aligned on a frame. Contract: a client uses it to tell whether a
+	// connection survived an error answer. See the protocol reference,
+	// "Refusing a frame without reading it".
+	MaxDrainSize = 10 << 20 // 10 MiB
+
+	// RateLimitDrainSize is the same limit for a frame the rate limiter
+	// refused, held against data_len alone, as MaxDrainSize is; the metadata,
+	// already bounded by MaxMetaSize, is read on top of it. At or under it
+	// the frame is read, thrown away and answered, and the connection carries
+	// on; over it the answer goes out without any of the frame being read,
+	// and the connection closes.
+	//
+	// It is MaxDrainSize today for the clients that predate this constant
+	// (jay v0.16.0 and earlier, falco among them). They pool the connection
+	// after any error answer, and they were built against a server that
+	// drained every rate-limited body up to 10 MiB: close on one of them
+	// after a smaller refusal and it reports "broken pipe" instead of
+	// RateLimitExceeded, then fails its next request on the dead connection.
+	//
+	// It is meant to come down to MaxMetaSize: a limiter refuses under load,
+	// over and over, and draining 10 MiB per refused upload costs the server
+	// the full body every time. That may happen only once no native client
+	// older than this release is left (PND-0260). Clients from this release
+	// on already assume MaxMetaSize and no more, so they are right about
+	// either value — which is also why this must never go below MaxMetaSize.
+	RateLimitDrainSize = MaxDrainSize
 )
 
 // Op codes for request frames.

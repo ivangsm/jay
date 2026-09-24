@@ -689,4 +689,30 @@ func TestGolden_ProtocolConstants(t *testing.T) {
 	if MaxMetaSize != 1<<20 {
 		t.Errorf("MaxMetaSize = %d, want %d", MaxMetaSize, 1<<20)
 	}
+
+	// The two drain limits are contract, not tuning (reference: "Refusing a
+	// frame without reading it"). A client decides from MaxDrainSize whether
+	// the server closed the connection after an error answer, so lowering it
+	// makes a client of the old value pool connections the server closed.
+	if MaxDrainSize != 10<<20 {
+		t.Errorf("MaxDrainSize = %d, want %d", MaxDrainSize, 10<<20)
+	}
+	// RateLimitDrainSize is 10 MiB for the native clients that predate it
+	// (jay v0.16.0 and earlier): they pool the connection after any error
+	// answer and were built against a server that drained every rate-limited
+	// body up to 10 MiB. It was 1 MiB for a while before any release shipped
+	// it, and that turned their refused 1–10 MiB uploads into "broken pipe"
+	// plus a failed next request.
+	if RateLimitDrainSize != 10<<20 {
+		t.Errorf("RateLimitDrainSize = %d, want %d — lowering it is only safe once every "+
+			"native client talking to this server is from this release or later, which "+
+			"assume MaxMetaSize; an older one reports a refused upload as a broken pipe "+
+			"and fails its next request on the connection the server closed", RateLimitDrainSize, 10<<20)
+	}
+	// Clients from this release on assume no more than MaxMetaSize; below
+	// that, they too would pool connections the server closed.
+	if RateLimitDrainSize < MaxMetaSize {
+		t.Errorf("RateLimitDrainSize = %d is below MaxMetaSize (%d), the floor every "+
+			"current client relies on", RateLimitDrainSize, MaxMetaSize)
+	}
 }

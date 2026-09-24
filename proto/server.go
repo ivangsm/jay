@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -40,9 +41,23 @@ const (
 	// finish on their own before force-closing the remaining connections.
 	shutdownGrace = 5 * time.Second
 
-	// busyRejectTimeout bounds the 8-byte "server busy" handshake reply that
-	// the accept loop writes before dropping an over-limit connection.
+	// busyRejectTimeout bounds the whole refusal of an over-limit connection:
+	// the TLS handshake when there is one, the 8-byte "server busy" reply, and
+	// the wait for the client to close first. It is a read AND write deadline:
+	// a TLS handshake reads the ClientHello before it can write anything.
 	busyRejectTimeout = 2 * time.Second
+
+	// maxBusyRejections bounds how many over-limit connections may be in the
+	// middle of being refused at once. Each holds an fd and a goroutine for up
+	// to busyRejectTimeout; without a bound, a flood past the connection cap
+	// would cost exactly the resources the cap exists to protect. Past it,
+	// the connection is closed without a status — see rejectBusy.
+	maxBusyRejections = 64
+
+	// maxHandshakeBytes is the largest handshake a client can send: the fixed
+	// part plus a uint16-sized credential. rejectBusy reads at most this much
+	// while it waits for the refused client to hang up.
+	maxHandshakeBytes = HandshakeSize + 1<<16 - 1
 )
 
 // Server is the native TCP protocol server.
@@ -76,28 +91,48 @@ type Server struct {
 	shutdownOnce sync.Once
 
 	limiter *ratelimit.Limiter
+
+	// throughput caps body bytes per second per token; nil means no cap. See
+	// SetTokenBytesPerSec.
+	throughput *ratelimit.Throughput
+
+	// waitCtx is what a throttled body waits under. It is cancelled when
+	// Shutdown gives up on in-flight requests, so a connection force-closed
+	// mid-upload does not leave its goroutine parked in the limiter.
+	waitCtx    context.Context
+	cancelWait context.CancelFunc
+
+	// busySlots bounds the refusals in flight; see maxBusyRejections.
+	busySlots chan struct{}
 }
 
 // NewServer creates a new native protocol server.
 //
-// rateLimit is requests per second per connection key; rateBurst is the
-// token-bucket capacity. rateLimit <= 0 disables the limiter entirely, and
-// rateBurst <= 0 takes internal/ratelimit.New's default.
-func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, rateLimit, rateBurst int) *Server {
+// rateLimit is requests per second per token; rateBurst is the token-bucket
+// capacity. rateLimit <= 0 disables the limiter entirely, and rateBurst <= 0
+// takes internal/ratelimit.New's default. rateLimit is a float for the same
+// reason JAY_RATE_LIMIT is: a rate below one request per second is a rate, and
+// truncating 0.5 to an int turned it into "no limit" on this transport while
+// the S3 API applied it.
+func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, metrics *maintenance.Metrics, rateLimit float64, rateBurst int) *Server {
+	waitCtx, cancelWait := context.WithCancel(context.Background())
 	return &Server{
-		db:       db,
-		store:    st,
-		auth:     au,
-		objops:   objops.New(db, st, log),
-		log:      log,
-		metrics:  metrics,
-		quit:     make(chan struct{}),
-		maxConns: defaultMaxConns,
-		conns:    make(map[net.Conn]struct{}),
+		db:        db,
+		store:     st,
+		auth:      au,
+		objops:    objops.New(db, st, log),
+		log:       log,
+		metrics:   metrics,
+		quit:      make(chan struct{}),
+		maxConns:  defaultMaxConns,
+		conns:     make(map[net.Conn]struct{}),
+		busySlots: make(chan struct{}, maxBusyRejections),
 		limiter: ratelimit.New(ratelimit.Config{
-			Rate:  float64(rateLimit),
+			Rate:  rateLimit,
 			Burst: rateBurst,
 		}),
+		waitCtx:    waitCtx,
+		cancelWait: cancelWait,
 	}
 }
 
@@ -106,6 +141,39 @@ func NewServer(db *meta.DB, st *store.Store, au *auth.Auth, log *slog.Logger, me
 // owns a separate objops.Service and is configured through its own setter.
 func (s *Server) SetMaxObjectSize(n int64) {
 	s.objops.SetMaxObjectSize(n)
+}
+
+// SetMaxConns caps how many connections the server holds at once, counting
+// those still in their handshake. The connection past the cap is answered
+// with HandshakeServerBusy and closed. Must be called before ListenAndServe.
+//
+// n must be positive: a cap of zero would refuse every client while the
+// listener looks healthy, so a non-positive n is a programming error and
+// panics, like time.NewTicker. The config layer rejects it before it gets here.
+func (s *Server) SetMaxConns(n int) {
+	if n <= 0 {
+		panic(fmt.Sprintf("proto: SetMaxConns(%d): the connection cap must be positive", n))
+	}
+	s.maxConns = n
+}
+
+// SetTokenBytesPerSec caps the object bytes each token may move per second
+// over this transport: request bodies read (PutObject, UploadPart) and
+// response bodies written (GetObject, GetObjectRange), one budget for both
+// directions, shared by all of the token's connections. 0 or less means no
+// cap, which is the default. Must be called before ListenAndServe.
+//
+// It delays, it never refuses: an admitted request whose bytes are over
+// budget is slowed, and TCP's flow control carries the slowdown back to the
+// peer. The time spent waiting is added to the transfer's deadline, so the
+// cap cannot make the server time out its own client. A client that sizes its
+// own deadlines by an expected throughput (the Go client assumes 1 MiB/s) can
+// still time out when the cap, split across its concurrent transfers, falls
+// below that — see the protocol reference.
+//
+// The S3 API is not affected.
+func (s *Server) SetTokenBytesPerSec(n int64) {
+	s.throughput = ratelimit.NewThroughput(n)
 }
 
 // SetTLSConfig wraps the native listener in TLS. Must be called before
@@ -133,7 +201,11 @@ func (s *Server) ListenAndServe(addr string) (func() error, error) {
 		ln = tls.NewListener(ln, s.tlsConfig)
 	}
 	s.listener = ln
-	s.log.Info("native server listening", "addr", addr, "tls", s.tlsConfig != nil)
+	// "bound" is the address actually listening, which differs from addr
+	// whenever addr leaves the host or the port to the kernel (":4444", ":0").
+	s.log.Info("native server listening", "addr", addr, "bound", ln.Addr().String(),
+		"tls", s.tlsConfig != nil,
+		"max_conns", s.maxConns, "token_bytes_per_sec", s.throughput.BytesPerSec())
 
 	go s.acceptLoop()
 
@@ -162,6 +234,7 @@ func (s *Server) Shutdown() error {
 		select {
 		case <-done:
 		case <-time.After(shutdownGrace):
+			s.cancelWait()
 			s.connMu.Lock()
 			s.closing = true
 			for c := range s.conns {
@@ -171,6 +244,7 @@ func (s *Server) Shutdown() error {
 			<-done
 		}
 
+		s.cancelWait()
 		s.limiter.Stop()
 	})
 	return nil
@@ -228,23 +302,56 @@ func (s *Server) acceptLoop() {
 }
 
 // rejectBusy tells a client that the server is at its connection limit and
-// closes. It runs inline on the accept loop on purpose: the response is the
-// 8 fixed bytes of a handshake reply on a freshly accepted socket, which fit
-// in the kernel send buffer without blocking. The short deadline is the belt
-// that makes "without blocking" a guarantee rather than an expectation, so a
-// pathological peer cannot stall accepts.
+// closes. The status is written before the client's handshake is read, which
+// is fine: the reply is self-describing and the client is waiting on exactly
+// these bytes after its own write.
 //
-// The client never sent its handshake at this point — we answer before
-// reading — which is fine: the reply is self-describing and the client is
-// waiting on exactly these bytes after its own write.
+// It does not run on the accept loop. Over TLS the reply needs a TLS handshake,
+// and a TLS handshake reads the ClientHello first — a peer that connects and
+// says nothing would otherwise stall every accept behind it. The refusal runs
+// on its own goroutine, bounded twice: by busyRejectTimeout per connection and
+// by maxBusyRejections in total. A connection that finds every slot taken is
+// closed without a status; that degrades a flood to the bare EOF a client saw
+// before HandshakeServerBusy existed, instead of letting the flood spend the
+// fds the connection cap protects.
 func (s *Server) rejectBusy(conn net.Conn) {
+	select {
+	case s.busySlots <- struct{}{}:
+	default:
+		s.log.Debug("busy refusals saturated, closing without a status", "remote", conn.RemoteAddr())
+		_ = conn.Close()
+		return
+	}
+	s.wg.Go(func() {
+		defer func() { <-s.busySlots }()
+		s.answerBusy(conn)
+	})
+}
+
+// answerBusy writes HandshakeServerBusy and closes gracefully.
+//
+// "Gracefully" is the point of the second half. The client's handshake is
+// usually already in our receive buffer, and closing a socket with unread data
+// makes the kernel answer with a reset instead of a FIN. Linux and macOS still
+// hand the client the status that arrived before the reset (measured), but not
+// every TCP stack keeps data it received once a reset follows, and a client
+// that reads the reset loses the only thing we came here to say. So: write the
+// status, half-close, and read out whatever the client sent until it hangs up,
+// which it does as soon as it has read the status. The final close then finds
+// nothing unread and sends a plain FIN.
+func (s *Server) answerBusy(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
-	if err := conn.SetWriteDeadline(time.Now().Add(busyRejectTimeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(busyRejectTimeout)); err != nil {
 		return
 	}
 	if err := WriteHandshakeResponse(conn, HandshakeServerBusy); err != nil {
 		s.log.Debug("write busy handshake response", "err", err, "remote", conn.RemoteAddr())
+		return
 	}
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(conn, maxHandshakeBytes))
 }
 
 // handshakeRejection maps a ReadHandshake failure onto the status byte the
@@ -367,6 +474,9 @@ func (s *Server) handleConn(nc net.Conn) {
 		sourceIP: sourceIP,
 		limiter:  s.limiter,
 		limitKey: limitKey,
+
+		throughput: s.throughput,
+		waitCtx:    s.waitCtx,
 	}
 
 	for {
@@ -409,6 +519,9 @@ type connHandler struct {
 
 	limiter  *ratelimit.Limiter
 	limitKey string
+
+	throughput *ratelimit.Throughput
+	waitCtx    context.Context
 }
 
 // authorizeBucketAccess is the cross-account gate of the native protocol: the
@@ -458,32 +571,11 @@ func (h *connHandler) handleOneRequest() (err error) {
 		}
 	}()
 
-	// Shared token-bucket rate limit. If the limiter rejects, we must still
-	// drain this frame's meta + data so the connection remains usable for
-	// subsequent requests (up to MaxDrainSize — beyond that the caller is
-	// either abusive or the stream is desynced; either way drop the conn).
+	// Shared token-bucket rate limit, decided on the header alone: nothing of
+	// the frame's payload has been read yet, so a refusal can choose how much
+	// of it to pay for. See rejectRateLimited.
 	if !h.limiter.Allow(h.limitKey) {
-		if metaLen > 0 {
-			if _, err := io.CopyN(io.Discard, h.br, int64(metaLen)); err != nil {
-				return err
-			}
-		}
-		if dataLen > 0 {
-			if dataLen > MaxDrainSize {
-				return fmt.Errorf("rate limit + oversized frame: %d > %d", dataLen, MaxDrainSize)
-			}
-			if _, err := io.CopyN(io.Discard, h.br, dataLen); err != nil {
-				return err
-			}
-		}
-		errMeta := EncodeError("rate limit exceeded", "RateLimitExceeded")
-		if wErr := h.writeResponseCombined(StatusBadRequest, streamID, errMeta); wErr != nil {
-			return wErr
-		}
-		if err := h.bw.Flush(); err != nil {
-			return err
-		}
-		return h.conn.SetWriteDeadline(time.Time{})
+		return h.rejectRateLimited(streamID, metaLen, dataLen)
 	}
 
 	// Clear the idle deadline now that we have a request header.
@@ -504,13 +596,19 @@ func (h *connHandler) handleOneRequest() (err error) {
 	}
 
 	// Data reader (for PutObject / UploadPart).
+	var body *io.LimitedReader
 	var dataReader io.Reader
 	if dataLen > 0 {
 		timeout := max(time.Duration(dataLen/dataReadBytesPerSec+1)*time.Second, minDataReadTimeout)
-		if err := h.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		readDeadline := time.Now().Add(timeout)
+		if err := h.conn.SetReadDeadline(readDeadline); err != nil {
 			return fmt.Errorf("set data read deadline: %w", err)
 		}
-		dataReader = io.LimitReader(h.br, dataLen)
+		body = &io.LimitedReader{R: h.br, N: dataLen}
+		dataReader = body
+		if h.throughput.Enabled() {
+			dataReader = &throttledReader{r: body, h: h, deadline: readDeadline}
+		}
 	}
 
 	req := &request{
@@ -518,10 +616,19 @@ func (h *connHandler) handleOneRequest() (err error) {
 		streamID: streamID,
 		meta:     metaPayload,
 		data:     dataReader,
+		body:     body,
 		dataLen:  dataLen,
 	}
 
 	if err := h.dispatch(req); err != nil {
+		return err
+	}
+	// Whatever the handler left of the body goes the way drainData says, so
+	// the next header is read from a frame boundary. The handlers that
+	// refuse a body drain it themselves; this also covers a body sent with
+	// an operation that takes none, which would otherwise be parsed as the
+	// next frame's header.
+	if err := drainData(req); err != nil {
 		return err
 	}
 
@@ -531,6 +638,12 @@ func (h *connHandler) handleOneRequest() (err error) {
 
 	if err := h.bw.Flush(); err != nil {
 		return err
+	}
+	// The handler answered without consuming the frame, and what was left of
+	// the body was more than it is worth draining: the answer is on the wire,
+	// and the stream behind it is not aligned on a frame any more.
+	if req.closeAfter {
+		return errClosedAfterAnswer
 	}
 	// Clear the write deadline armed by the response writers so it cannot
 	// leak into the next request's response.
@@ -544,8 +657,100 @@ type request struct {
 	op       byte
 	streamID uint32
 	meta     []byte
-	data     io.Reader
-	dataLen  int64
+	// data is what a handler reads the body from: body itself, or body behind
+	// the per-token throughput cap.
+	data io.Reader
+	// body is the frame body, bounded to dataLen. body.N is how much of it is
+	// still unread, which is what drainData has to account for — not dataLen,
+	// since a handler may have consumed part of it before failing.
+	body    *io.LimitedReader
+	dataLen int64
+	// closeAfter is set by drainData when the unread rest of the body is more
+	// than MaxDrainSize: the handler still writes its answer, and the
+	// connection is closed after it instead of being drained.
+	closeAfter bool
+}
+
+// errClosedAfterAnswer ends a connection whose current frame was answered
+// without being read to the end. It is a deliberate close, not a failure: the
+// peer has its answer, and the bytes it is still sending belong to a frame
+// nobody will read.
+var errClosedAfterAnswer = errors.New("proto: frame answered without being consumed, closing the connection")
+
+// rejectRateLimited answers a frame the limiter refused. The header is all
+// that has been read.
+func (h *connHandler) rejectRateLimited(streamID uint32, metaLen uint32, dataLen int64) error {
+	if metaLen > MaxMetaSize {
+		// Not a frame the server would read if it were admitted either.
+		return fmt.Errorf("metadata too large: %d", metaLen)
+	}
+	// The body alone is held against the bound, and the metadata is read on
+	// top of it: the rule every client older than RateLimitDrainSize was
+	// built against, so every frame the servers they knew drained is still
+	// drained. Holding meta_len + data_len against it instead would close on
+	// a MaxDrainSize upload that brings any metadata at all.
+	//
+	// Nothing is added to dataLen before the comparison: it comes off the
+	// wire and can be anything up to MaxInt64, and a sum could wrap
+	// negative, pass as a small frame, drain nothing and keep a connection
+	// whose frame is still unread. Once kept, the sum is at most
+	// MaxMetaSize + RateLimitDrainSize.
+	keep := dataLen <= RateLimitDrainSize
+	if keep {
+		if _, err := io.CopyN(io.Discard, h.br, int64(metaLen)+dataLen); err != nil {
+			return err
+		}
+	}
+	errMeta := EncodeError("rate limit exceeded", "RateLimitExceeded")
+	if err := h.writeResponseCombined(StatusBadRequest, streamID, errMeta); err != nil {
+		return err
+	}
+	if err := h.bw.Flush(); err != nil {
+		return err
+	}
+	if !keep {
+		return errClosedAfterAnswer
+	}
+	return h.conn.SetWriteDeadline(time.Time{})
+}
+
+// throttledReader is a request body behind the per-token throughput cap. It
+// reads first and pays after, like the scrubber: the bytes wait in our buffer
+// while the budget refills, and the peer is held back by TCP's flow control.
+//
+// deadline is the body's read deadline. Every wait pushes it back by as long
+// as the wait took, so the deadline keeps measuring the peer's throughput —
+// what it exists for — and not the time the server chose to spend waiting.
+type throttledReader struct {
+	r        io.Reader
+	h        *connHandler
+	deadline time.Time
+}
+
+func (t *throttledReader) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if n > 0 {
+		if werr := t.h.waitBytes(n, &t.deadline, t.h.conn.SetReadDeadline); werr != nil {
+			return n, werr
+		}
+	}
+	return n, err
+}
+
+// waitBytes charges n body bytes to the token's throughput budget and, when
+// that took time, moves *deadline back by the same amount through set.
+func (h *connHandler) waitBytes(n int, deadline *time.Time, set func(time.Time) error) error {
+	start := time.Now()
+	if err := h.throughput.WaitN(h.waitCtx, h.limitKey, n); err != nil {
+		return fmt.Errorf("throughput wait: %w", err)
+	}
+	if waited := time.Since(start); waited > 0 {
+		*deadline = deadline.Add(waited)
+		if err := set(*deadline); err != nil {
+			return fmt.Errorf("extend deadline: %w", err)
+		}
+	}
+	return nil
 }
 
 // armWriteDeadline sets a write deadline scaled by the response payload size:
@@ -553,8 +758,16 @@ type request struct {
 // response writer must call it before touching the connection; the deadline
 // is cleared after the final flush in handleOneRequest.
 func (h *connHandler) armWriteDeadline(payloadLen int64) error {
+	_, err := h.armWriteDeadlineAt(payloadLen)
+	return err
+}
+
+// armWriteDeadlineAt is armWriteDeadline for a writer that needs the deadline
+// back, to push it later (see waitBytes).
+func (h *connHandler) armWriteDeadlineAt(payloadLen int64) (time.Time, error) {
 	timeout := max(time.Duration(payloadLen/dataWriteBytesPerSec+1)*time.Second, minDataWriteTimeout)
-	return h.conn.SetWriteDeadline(time.Now().Add(timeout))
+	deadline := time.Now().Add(timeout)
+	return deadline, h.conn.SetWriteDeadline(deadline)
 }
 
 func (h *connHandler) writeResponse(status byte, streamID uint32, meta []byte, data io.Reader, dataLen int64) error {
