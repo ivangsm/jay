@@ -11,6 +11,24 @@ change bumps the minor version and is called out as such below.
 
 ## [Unreleased]
 
+### Removed
+
+- MinIO's clients (`mc`, `warp`, minio-go) are no longer supported. The S3
+  conformance suite no longer installs or drives them, and the docs no longer
+  describe them as working over HTTPS. Supported S3 clients are aws-cli, the
+  AWS SDKs and boto3.
+
+### Changed
+
+- The conformance suite boots a single plain-HTTP instance instead of two, and
+  asserts the `aws-chunked` refusal (`501`, nothing written) with a hand-built
+  request instead of an `mc` upload.
+
+### Upgrade notes
+
+- No server, library or protocol change. Requests in SigV4's streaming mode
+  were already answered `501` and still are.
+
 ## [0.17.1] - 2026-09-21
 
 ### Fixed

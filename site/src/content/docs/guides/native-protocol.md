@@ -106,7 +106,7 @@ url, err := c.PresignURL("GET", "photos", "2026/cat.jpg", 15*time.Minute)
 ```
 
 The signature is SigV4 in its query-string form, the one `aws s3 presign`,
-boto3 and minio-go produce and consume — and it is an HMAC over the token
+boto3 and the AWS SDKs produce and consume — and it is an HMAC over the token
 secret the client already holds. That is why there is no opcode for it: the
 client computes it locally, exactly as the AWS SDKs do, and never asks the
 server anything.

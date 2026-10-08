@@ -3,8 +3,8 @@
 # conformance.sh — exercise jay's S3 surface with S3 clients jay did not write.
 #
 # The Go tests prove only that jay agrees with itself. This script boots a
-# throwaway jay and drives it with real clients: aws-cli (botocore), mc and
-# warp (both minio-go).
+# throwaway jay and drives it with a real client: aws-cli (botocore). MinIO's
+# clients (mc, warp, minio-go) are not supported and not exercised here.
 #
 # What it does NOT do: fix anything, or paper over a failure. Every check either
 # asserts an effect (bytes on the wire, an object present or absent, a status
@@ -21,14 +21,9 @@
 #   2  nothing ran, or every check was skipped — a green run that proved nothing
 #   3  --require-all was given and a client was missing
 #
-# Requirements: go, curl, openssl. The S3 clients are optional unless
+# Requirements: go, curl, openssl. The S3 client is optional unless
 # --require-all is given:
 #   aws  — https://docs.aws.amazon.com/cli/  (botocore; the reference client)
-#   mc   — https://min.io/docs/minio/linux/reference/minio-mc.html (minio-go)
-#   warp — https://github.com/minio/warp     (minio-go, benchmark harness)
-#
-# mc and warp are looked up on PATH and in $(go env GOPATH)/bin, because
-# `go install` puts them in the latter and CI runners rarely have that on PATH.
 
 set -uo pipefail
 # Deliberately NOT `set -e`: half of the checks below run a command that is
@@ -143,8 +138,8 @@ assert_eq() {
 # ---------------------------------------------------------------------------
 # Work dir and cleanup
 #
-# Everything the run creates lives under one temp dir: the built binary, both
-# data dirs, the TLS material, every client's config and every captured log.
+# Everything the run creates lives under one temp dir: the built binary, the
+# data dir, the client's config and every captured log.
 # The trap fires on success, on failure and on Ctrl-C, so a jay never outlives
 # the script.
 # ---------------------------------------------------------------------------
@@ -219,20 +214,6 @@ pick_port() {
 	die "no free TCP port found in 20000-40000"
 }
 
-TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
-# run_limited SECONDS CMD... — a hung client must not hang the whole run. When
-# neither timeout nor gtimeout exists (stock macOS), the command runs unbounded
-# rather than not running at all.
-run_limited() {
-	local secs="$1"
-	shift
-	if [ -n "$TIMEOUT_BIN" ]; then
-		"$TIMEOUT_BIN" "$secs" "$@"
-	else
-		"$@"
-	fi
-}
-
 # ---------------------------------------------------------------------------
 # Preflight: the tools this script cannot run without
 # ---------------------------------------------------------------------------
@@ -246,31 +227,12 @@ for tool in go curl openssl; do
 done
 
 AWS_BIN="$(command -v aws || true)"
-MC_BIN="$(command -v mc || true)"
-WARP_BIN="$(command -v warp || true)"
-
-# go_installed_bin echoes the path of a tool `go install` left in GOPATH/bin,
-# or nothing.
-go_installed_bin() {
-	for candidate in "$(go env GOPATH 2>/dev/null)/bin/$1" "$HOME/go/bin/$1"; do
-		if [ -x "$candidate" ]; then
-			echo "$candidate"
-			return
-		fi
-	done
-}
-[ -n "$MC_BIN" ] || MC_BIN="$(go_installed_bin mc)"
-[ -n "$WARP_BIN" ] || WARP_BIN="$(go_installed_bin warp)"
 
 info "aws:  ${AWS_BIN:-(not found)}"
-info "mc:   ${MC_BIN:-(not found)}"
-info "warp: ${WARP_BIN:-(not found)}"
 
 if [ "$REQUIRE_ALL" -eq 1 ]; then
 	missing=""
 	[ -z "$AWS_BIN" ] && missing="$missing aws"
-	[ -z "$MC_BIN" ] && missing="$missing mc"
-	[ -z "$WARP_BIN" ] && missing="$missing warp"
 	if [ -n "$missing" ]; then
 		printf '%sfatal:%s --require-all given but these clients are missing:%s\n' \
 			"$C_FAIL" "$C_RESET" "$missing" >&2
@@ -286,39 +248,28 @@ info "building jay from $REPO_ROOT ..."
 (cd "$REPO_ROOT" && go build -o "$WORK/jay" ./cmd/jay) || die "go build failed"
 
 # ---------------------------------------------------------------------------
-# Boot: two instances, because minio-go behaves differently on each
-#
-# minio-go signs a plain-HTTP PutObject with the SigV4 *streaming* signature
-# (aws-chunked framing), which jay refuses with 501; over TLS it sends an
-# unframed body instead. One listener cannot be both, so the harness runs two:
-# the HTTP one carries the bulk of the suite, the TLS one proves the minio-go
-# upload path that HTTP cannot reach.
+# Boot
 # ---------------------------------------------------------------------------
 
 S3_PORT="$(pick_port)"
 ADMIN_PORT="$(pick_port)"
 NATIVE_PORT="$(pick_port)"
-TLS_S3_PORT="$(pick_port)"
-TLS_ADMIN_PORT="$(pick_port)"
-TLS_NATIVE_PORT="$(pick_port)"
 
 ADMIN_TOKEN="$(openssl rand -base64 32)"
 SIGNING_SECRET="$(openssl rand -base64 32)"
 
 A_ID="conformance-a"
 A_SECRET="$(openssl rand -hex 24)"
-TLS_ID="conformance-tls"
-TLS_SECRET="$(openssl rand -hex 24)"
 
-# start_jay NAME DATADIR S3PORT ADMINPORT NATIVEPORT SEEDID SEEDSECRET [TLS]
+# start_jay NAME DATADIR S3PORT ADMINPORT NATIVEPORT SEEDID SEEDSECRET
 start_jay() {
 	local name="$1" datadir="$2" s3p="$3" adminp="$4" nativep="$5"
-	local seed_id="$6" seed_secret="$7" tls="${8:-}"
+	local seed_id="$6" seed_secret="$7"
 	mkdir -p "$datadir"
 
 	# The rate limiter defaults to 100 rps per token. aws-cli fires 10 parallel
-	# part uploads and warp runs hundreds of ops a second, so the default would
-	# make the run measure the limiter instead of the S3 surface.
+	# part uploads, so the default would make the run measure the limiter
+	# instead of the S3 surface.
 	(
 		export JAY_DATA_DIR="$datadir"
 		export JAY_LISTEN_ADDR="127.0.0.1:$s3p"
@@ -332,10 +283,6 @@ start_jay() {
 		export JAY_RATE_LIMIT=100000
 		export JAY_RATE_BURST=200000
 		export JAY_LOG_LEVEL=info
-		if [ -n "$tls" ]; then
-			export JAY_TLS_CERT="$WORK/tls.crt"
-			export JAY_TLS_KEY="$WORK/tls.key"
-		fi
 		exec "$WORK/jay" >"$LOGS/jay-$name.log" 2>&1
 	) &
 	JAY_PIDS+=("$!")
@@ -354,29 +301,16 @@ wait_ready() {
 	return 1
 }
 
-# The TLS instance needs a certificate before it can start. One RSA key, valid
-# for a day, for 127.0.0.1 — the clients are told to skip verification.
-openssl req -x509 -newkey rsa:2048 -keyout "$WORK/tls.key" -out "$WORK/tls.crt" \
-	-days 1 -nodes -subj "/CN=127.0.0.1" \
-	-addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >"$LOGS/openssl.log" 2>&1 ||
-	die "could not generate the self-signed certificate (see $LOGS/openssl.log)"
-
 start_jay "http" "$WORK/data-http" "$S3_PORT" "$ADMIN_PORT" "$NATIVE_PORT" "$A_ID" "$A_SECRET"
-start_jay "tls" "$WORK/data-tls" "$TLS_S3_PORT" "$TLS_ADMIN_PORT" "$TLS_NATIVE_PORT" "$TLS_ID" "$TLS_SECRET" tls
 
 S3="http://127.0.0.1:$S3_PORT"
 ADMIN="http://127.0.0.1:$ADMIN_PORT"
-TLS_S3="https://127.0.0.1:$TLS_S3_PORT"
 
 wait_ready "$ADMIN/health/ready" || {
 	cat "$LOGS/jay-http.log" >&2
-	die "the plain-HTTP jay never became ready"
+	die "jay never became ready"
 }
-wait_ready "https://127.0.0.1:$TLS_ADMIN_PORT/health/ready" -k || {
-	cat "$LOGS/jay-tls.log" >&2
-	die "the TLS jay never became ready"
-}
-info "jay is up on $S3 (admin $ADMIN) and $TLS_S3"
+info "jay is up on $S3 (admin $ADMIN)"
 
 # ---------------------------------------------------------------------------
 # Accounts and tokens
@@ -475,31 +409,6 @@ aws_scoped() { aws_as "$SCOPED_ID" "$SCOPED_SECRET" "$@"; }
 # with an empty listing or a swallowed error message.
 object_exists() {
 	aws_a s3api head-object --bucket "$1" --key "$2" >/dev/null 2>&1
-}
-
-# bucket_state BUCKET — prints "empty", "populated" or "unreadable(<code>)",
-# asking jay over plain HTTP with the bearer form.
-#
-# Deliberately not built on aws-cli: the warp group has to run when aws-cli is
-# absent, and a listing command that fails to launch also produces no output.
-# "the bucket is empty" and "I could not look" have to be different answers, or
-# the check passes without having checked — which is the whole point of this
-# script.
-bucket_state() {
-	local body code
-	body="$(curl -sS -H "Authorization: Bearer $A_ID:$A_SECRET" \
-		-w '\n%{http_code}' "$S3/$1?list-type=2" 2>/dev/null)"
-	code="${body##*$'\n'}"
-	if [ "$code" != "200" ]; then
-		# Never "empty": a 403, a 404 or a dead connection all mean the state
-		# is unknown, and unknown must not read as "nothing was written".
-		printf 'unreadable(%s)' "$code"
-		return
-	fi
-	case "$body" in
-	*"<Contents>"*) printf 'populated' ;;
-	*) printf 'empty' ;;
-	esac
 }
 
 # ---------------------------------------------------------------------------
@@ -843,6 +752,24 @@ else
 	refused_and_absent "a malformed Content-MD5 is refused" bad-md5.txt InvalidDigest \
 		-H "Content-MD5: not-base64"
 
+	# SigV4's streaming mode frames the body as aws-chunked. jay has no decoder
+	# for it, so the request is answered 501 before a byte is read — never a 200
+	# that stores the chunk headers as part of the object.
+	files_before="$(data_files)"
+	chunked_http="$(curl_a PUT "/$BUCKET_INT/chunked.txt" --data-binary "conformance payload" \
+		-H "Content-Encoding: aws-chunked" -H "x-amz-decoded-content-length: 19")"
+	chunked_body="$(tr -d '\n' <"$WORK/int.body" 2>/dev/null)"
+	chunked_get="$(curl -sS -o /dev/null -w '%{http_code}' \
+		-H "Authorization: Bearer $A_ID:$A_SECRET" "$S3/$BUCKET_INT/chunked.txt" 2>/dev/null)"
+	if [ "$chunked_http" = "501" ] && [ "$chunked_get" = "404" ] &&
+		[ "$(data_files)" = "$files_before" ] &&
+		case "$chunked_body" in *"<Code>NotImplemented</Code>"*) true ;; *) false ;; esac; then
+		pass "an aws-chunked body is refused with 501 and writes nothing"
+	else
+		fail "an aws-chunked body is refused with 501 and writes nothing" \
+			"put=$chunked_http get=$chunked_get body=$(printf '%s' "$chunked_body" | cut -c1-160)"
+	fi
+
 	# The control. Without it a jay that refused every upload would pass every
 	# check above, and the group would prove the opposite of what it claims.
 	good_sum="$(printf 'conformance payload' | openssl dgst -sha256 -binary | openssl base64 -A)"
@@ -952,187 +879,6 @@ else
 		pass "control: B works normally in its own bucket"
 	else
 		fail "control: B works normally in its own bucket" "$(tail -3 "$LOGS/xacct-own.log")"
-	fi
-fi
-
-# ---------------------------------------------------------------------------
-# GROUP: mc over plain HTTP (minio-go)
-# ---------------------------------------------------------------------------
-
-say ""
-say "${C_BOLD}mc / minio-go over HTTP${C_RESET}"
-GROUP="mc-http"
-
-export MC_CONFIG_DIR="$WORK/mc"
-mkdir -p "$MC_CONFIG_DIR"
-mc_() { "$MC_BIN" --no-color "$@"; }
-
-if [ -z "$MC_BIN" ]; then
-	skip "whole group" "mc is not installed"
-elif [ -z "$AWS_BIN" ]; then
-	skip "whole group" "the fixtures this group reads are uploaded by the aws-cli group"
-else
-	if mc_ alias set jayhttp "$S3" "$A_ID" "$A_SECRET" --api S3v4 >"$LOGS/mc-alias.log" 2>&1; then
-		pass "mc alias set"
-	else
-		fail "mc alias set" "$(tail -2 "$LOGS/mc-alias.log")"
-	fi
-
-	buckets="$(mc_ ls jayhttp 2>"$LOGS/mc-lsb.log" | awk '{print $NF}' | tr -d '/' | sort | tr '\n' ' ')"
-	case "$buckets" in
-	*"$BUCKET_A"*) pass "ListBuckets" ;;
-	*) fail "ListBuckets" "got [$buckets]" ;;
-	esac
-
-	keys="$(mc_ ls jayhttp/"$BUCKET_A" 2>"$LOGS/mc-ls.log" | awk '{print $NF}' | sort | tr '\n' ' ')"
-	case "$keys" in
-	*small.txt*) pass "ListObjects" ;;
-	*) fail "ListObjects" "got [$keys]" ;;
-	esac
-
-	mc_ stat jayhttp/"$BUCKET_A"/small.txt >"$LOGS/mc-stat.log" 2>&1
-	mc_sum="$(sed -n 's/^Checksum *: *SHA256://p' "$LOGS/mc-stat.log" | tr -d ' ')"
-	assert_eq "stat reports the SHA-256 checksum minio-go can parse" "$SMALL_B64" "$mc_sum"
-
-	if mc_ get jayhttp/"$BUCKET_A"/small.txt "$WORK/mc.dl" >"$LOGS/mc-get.log" 2>&1 &&
-		cmp -s "$FIX/small.txt" "$WORK/mc.dl"; then
-		pass "GetObject round-trips"
-	else
-		fail "GetObject round-trips" "$(tail -2 "$LOGS/mc-get.log")"
-	fi
-
-	if mc_ mb jayhttp/conformance-mc >"$LOGS/mc-mb.log" 2>&1 &&
-		mc_ rb --force jayhttp/conformance-mc >>"$LOGS/mc-mb.log" 2>&1; then
-		pass "CreateBucket and DeleteBucket"
-	else
-		fail "CreateBucket and DeleteBucket" "$(tail -2 "$LOGS/mc-mb.log")"
-	fi
-
-	if mc_ rm jayhttp/"$BUCKET_A"/denied/b.txt >"$LOGS/mc-rm.log" 2>&1 &&
-		! object_exists "$BUCKET_A" denied/b.txt; then
-		pass "DeleteObject"
-	else
-		fail "DeleteObject" "$(tail -2 "$LOGS/mc-rm.log")"
-	fi
-
-	# minio-go mints a SigV4 query-string URL of its own — a second, independent
-	# implementation of the presigned form.
-	share="$(mc_ share download --expire 5m jayhttp/"$BUCKET_A"/small.txt 2>"$LOGS/mc-share.log" | sed -n 's/^Share: //p')"
-	if [ -z "$share" ]; then
-		fail "SigV4 presigned GET minted by minio-go (PND-0161)" "$(tail -2 "$LOGS/mc-share.log")"
-	else
-		scode="$(curl -sS -o "$WORK/mc-presign.dl" -w '%{http_code}' "$share" 2>/dev/null)"
-		if [ "$scode" = "200" ] && cmp -s "$FIX/small.txt" "$WORK/mc-presign.dl"; then
-			pass "SigV4 presigned GET minted by minio-go (PND-0161)"
-		else
-			fail "SigV4 presigned GET minted by minio-go (PND-0161)" "http=$scode"
-		fi
-	fi
-
-	# KNOWN LIMIT — asserted, not tolerated.
-	#
-	# Over plain HTTP minio-go signs every PutObject with the SigV4 *streaming*
-	# signature and frames the body as aws-chunked. jay has no decoder for that
-	# framing and refuses the request with 501 rather than storing the framing
-	# as the object.
-	#
-	# TODO(PND-0188): when the decoder lands this check goes red on purpose;
-	# update it and the README together.
-	mc_ cp "$FIX/small.txt" jayhttp/"$BUCKET_A"/via-mc.txt >"$LOGS/mc-cp.log" 2>&1
-	mc_rc=$?
-	if [ "$mc_rc" -ne 0 ] &&
-		grep -qi "not implemented" "$LOGS/mc-cp.log" &&
-		! object_exists "$BUCKET_A" via-mc.txt; then
-		pass "known limit: an mc upload is refused with 501 and writes nothing (PND-0186/PND-0188)"
-	else
-		fail "known limit: an mc upload is refused with 501 and writes nothing (PND-0186/PND-0188)" \
-			"rc=$mc_rc, object present=$(object_exists "$BUCKET_A" via-mc.txt && echo yes || echo no). If the aws-chunked decoder landed, update this check and the README."
-	fi
-fi
-
-# ---------------------------------------------------------------------------
-# GROUP: mc over TLS (minio-go)
-#
-# Same client, same version, opposite outcome: minio-go only reaches for the
-# streaming signature when the connection is NOT secure, so over HTTPS it sends
-# an unframed body and jay stores it. This is why the README cannot say
-# "minio-go uploads fail" without saying over what.
-# ---------------------------------------------------------------------------
-
-say ""
-say "${C_BOLD}mc / minio-go over TLS${C_RESET}"
-GROUP="mc-tls"
-
-if [ -z "$MC_BIN" ]; then
-	skip "whole group" "mc is not installed"
-else
-	mc_tls() { "$MC_BIN" --no-color --insecure "$@"; }
-
-	if mc_tls alias set jaytls "$TLS_S3" "$TLS_ID" "$TLS_SECRET" --api S3v4 >"$LOGS/mctls-alias.log" 2>&1 &&
-		mc_tls mb jaytls/conformance-tls >"$LOGS/mctls-mb.log" 2>&1; then
-		pass "alias and CreateBucket over HTTPS"
-	else
-		fail "alias and CreateBucket over HTTPS" "$(tail -2 "$LOGS/mctls-mb.log")"
-	fi
-
-	if mc_tls cp "$FIX/small.txt" jaytls/conformance-tls/small.txt >"$LOGS/mctls-cp.log" 2>&1 &&
-		mc_tls get jaytls/conformance-tls/small.txt "$WORK/mctls.dl" >>"$LOGS/mctls-cp.log" 2>&1 &&
-		cmp -s "$FIX/small.txt" "$WORK/mctls.dl"; then
-		pass "PutObject over HTTPS round-trips (minio-go sends no aws-chunked framing here)"
-	else
-		fail "PutObject over HTTPS round-trips" "$(tail -3 "$LOGS/mctls-cp.log")"
-	fi
-
-	if mc_tls cp "$FIX/big.bin" jaytls/conformance-tls/big.bin >"$LOGS/mctls-big.log" 2>&1 &&
-		mc_tls get jaytls/conformance-tls/big.bin "$WORK/mctls-big.dl" >>"$LOGS/mctls-big.log" 2>&1; then
-		assert_eq "12 MiB upload over HTTPS round-trips byte for byte" "$BIG_SHA" "$(hexsha256 "$WORK/mctls-big.dl")"
-	else
-		fail "12 MiB upload over HTTPS round-trips byte for byte" "$(tail -3 "$LOGS/mctls-big.log")"
-	fi
-fi
-
-# ---------------------------------------------------------------------------
-# GROUP: warp (minio-go under load)
-#
-# warp exits 0 even when every single operation failed — its exit code reports
-# "the benchmark ran", not "the benchmark worked". So both checks below read the
-# report and the bucket, never the exit status.
-# ---------------------------------------------------------------------------
-
-say ""
-say "${C_BOLD}warp${C_RESET}"
-GROUP="warp"
-
-if [ -z "$WARP_BIN" ]; then
-	skip "whole group" "warp is not installed (go install github.com/minio/warp@latest)"
-else
-	# KNOWN LIMIT, same framing as mc: over plain HTTP every PUT is refused.
-	run_limited 120 "$WARP_BIN" put --host="127.0.0.1:$S3_PORT" \
-		--access-key="$A_ID" --secret-key="$A_SECRET" --bucket=warp-http \
-		--duration=3s --obj.size=1KiB --concurrent=2 --noclear --no-color \
-		--benchdata="$WORK/warp-http" >"$LOGS/warp-http.log" 2>&1
-	warp_http_state="$(bucket_state warp-http)"
-	if grep -qi "not implemented" "$LOGS/warp-http.log" && [ "$warp_http_state" = "empty" ]; then
-		pass "known limit: warp cannot upload over HTTP and leaves the bucket empty (PND-0186/PND-0188)"
-	else
-		fail "known limit: warp cannot upload over HTTP and leaves the bucket empty (PND-0186/PND-0188)" \
-			"bucket warp-http is [$warp_http_state], refusal in the log=$(grep -qi 'not implemented' "$LOGS/warp-http.log" && echo yes || echo no). If the aws-chunked decoder landed, update this check and the README."
-	fi
-
-	# And the real smoke test: the same tool, over TLS, doing PUT/GET/DELETE/STAT
-	# concurrently for ten seconds. The number it prints is informational; the
-	# assertion is that it ran with zero errors.
-	run_limited 180 "$WARP_BIN" mixed --host="127.0.0.1:$TLS_S3_PORT" --tls --insecure \
-		--access-key="$TLS_ID" --secret-key="$TLS_SECRET" --bucket=warp-tls \
-		--duration=10s --obj.size=256KiB --concurrent=4 --no-color \
-		--benchdata="$WORK/warp-tls" >"$LOGS/warp-tls.log" 2>&1
-	warp_total="$(sed -n 's/^ \* Average: \(.*\)$/\1/p' "$LOGS/warp-tls.log" | tail -1)"
-	if grep -qi "error" "$LOGS/warp-tls.log"; then
-		fail "warp mixed over TLS runs clean" "$(grep -i error "$LOGS/warp-tls.log" | head -2)"
-	elif [ -z "$warp_total" ]; then
-		fail "warp mixed over TLS runs clean" "warp printed no report: $(tail -3 "$LOGS/warp-tls.log")"
-	else
-		pass "warp mixed over TLS runs clean — $warp_total"
 	fi
 fi
 

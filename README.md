@@ -121,21 +121,22 @@ Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
 | [Architecture](https://ivangsm.github.io/jay/internals/architecture/) | The write path, recovery, scrubbing, GC, snapshots |
 | [Limits](https://ivangsm.github.io/jay/internals/limits/) | No versioning, no object-byte backup, no replication, no events |
 
-## One compatibility caveat
+## Supported clients
 
-minio-go clients (`mc`, `warp`) **cannot upload over plain HTTP**. They sign
-non-TLS uploads with SigV4's streaming mode, which frames the body in
-`aws-chunked`, and Jay refuses that framing with `501` rather than storing the
-frames as if they were your file. Over HTTPS the same clients work completely.
+aws-cli, the AWS SDKs and boto3 — over plain HTTP and over HTTPS. Jay's own Go
+client and library use the native protocol.
 
-aws-cli, the AWS SDKs and boto3 work over both.
+**MinIO's clients (`mc`, `warp`, minio-go) are not supported.** Jay does not
+test against them, and a request that uses SigV4's streaming mode — which
+minio-go sends for every upload over plain HTTP — is refused with `501` rather
+than stored with its `aws-chunked` framing as if it were your file.
 [The full explanation](https://ivangsm.github.io/jay/reference/s3-compatibility/).
 
 ## Development
 
 ```bash
 make check        # fmt + vet + lint + test + build — the commit gate
-make conformance  # S3 conformance against real aws-cli, mc and warp
+make conformance  # S3 conformance against the real aws-cli
 ```
 
 `make check` proves Jay agrees with itself. `make conformance` proves it agrees

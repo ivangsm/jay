@@ -38,10 +38,6 @@ one half of either pair without the other aborts startup rather than serving in
 the clear. Left unset, the native listener stays plaintext and belongs on an
 internal network — Jay says so in a startup warning.
 
-**Enable TLS if you use `mc` or `warp`.** minio-go signs plaintext uploads with
-SigV4's streaming mode, which Jay refuses; over TLS the same clients upload
-normally. See [S3 compatibility](/jay/reference/s3-compatibility/).
-
 ## Behind a reverse proxy
 
 Jay does not trust forwarding headers by default, because a client that can
