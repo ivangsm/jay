@@ -115,6 +115,7 @@ type requestCase struct {
 	stdin    string
 	method   string
 	path     string
+	rawQuery string         // expected query string; empty when none
 	jsonBody map[string]any // decoded body; nil when no JSON body is expected
 	rawBody  string         // exact bytes, for the policy document
 }
@@ -157,6 +158,14 @@ func requestCases(t *testing.T) []requestCase {
 			method: http.MethodDelete, path: "/_jay/quarantine", jsonBody: map[string]any{"mode": "all"}},
 		{name: "quarantine-purge one object", args: []string{"quarantine-purge", "-bucket-id", "bid", "-key", "k"},
 			method: http.MethodDelete, path: "/_jay/quarantine", jsonBody: map[string]any{"bucket_id": "bid", "key": "k"}},
+		{name: "list-accounts", args: []string{"list-accounts"}, method: http.MethodGet, path: "/_jay/accounts"},
+		{name: "list-buckets", args: []string{"list-buckets"}, method: http.MethodGet, path: "/_jay/buckets"},
+		{name: "list-buckets of an owner", args: []string{"list-buckets", "-owner", "acc-1"},
+			method: http.MethodGet, path: "/_jay/buckets", rawQuery: "owner_account_id=acc-1"},
+		{name: "create-bucket", args: []string{"create-bucket", "-name", "photos", "-owner", "acc-1"},
+			method: http.MethodPost, path: "/_jay/buckets", jsonBody: map[string]any{"name": "photos", "owner_account_id": "acc-1"}},
+		{name: "delete-bucket", args: []string{"delete-bucket", "-name", "photos"},
+			method: http.MethodDelete, path: "/_jay/buckets/photos"},
 		{name: "get-bucket", args: []string{"get-bucket", "-bucket", "photos"}, method: http.MethodGet, path: "/_jay/buckets/photos"},
 		{name: "set-bucket-policy from a file", args: []string{"set-bucket-policy", "-bucket", "photos", "-file", policyFile},
 			method: http.MethodPut, path: "/_jay/buckets/photos/policy", rawBody: policyDocument},
@@ -183,7 +192,7 @@ func TestRun_EachCommandSendsTheRequestItDocuments(t *testing.T) {
 				t.Fatalf("%d requests reached the server, want 1", len(reqs))
 			}
 			got := reqs[0]
-			if got.method != c.method || got.path != c.path || got.rawQuery != "" {
+			if got.method != c.method || got.path != c.path || got.rawQuery != c.rawQuery {
 				t.Fatalf("request = %s %s?%s, want %s %s", got.method, got.path, got.rawQuery, c.method, c.path)
 			}
 			if got.authorization != "Bearer "+cliToken {
@@ -375,6 +384,9 @@ func TestRun_RefusesBeforeSendingAnything(t *testing.T) {
 		{name: "presign with negative -expires", args: against(fake.url, "presign", "-bucket", "b", "-token-id", "t", "-expires", "-5"), wantErr: "-expires must be a positive number"},
 		{name: "quarantine-revalidate without -key", args: against(fake.url, "quarantine-revalidate", "-bucket-id", "b"), wantErr: "usage: quarantine-revalidate"},
 		{name: "quarantine-revalidate without -bucket-id", args: against(fake.url, "quarantine-revalidate", "-key", "k"), wantErr: "usage: quarantine-revalidate"},
+		{name: "create-bucket without -owner", args: against(fake.url, "create-bucket", "-name", "photos"), wantErr: "usage: create-bucket"},
+		{name: "create-bucket without -name", args: against(fake.url, "create-bucket", "-owner", "a"), wantErr: "usage: create-bucket"},
+		{name: "delete-bucket without -name", args: against(fake.url, "delete-bucket"), wantErr: "usage: delete-bucket"},
 		{name: "get-bucket without -bucket", args: against(fake.url, "get-bucket"), wantErr: "usage: get-bucket"},
 		{name: "set-bucket-policy without -file", args: against(fake.url, "set-bucket-policy", "-bucket", "b"), wantErr: "usage: set-bucket-policy"},
 		{name: "set-bucket-policy with an empty file", args: against(fake.url, "set-bucket-policy", "-bucket", "b", "-file", emptyPolicy), wantErr: "the policy document is empty"},
@@ -840,5 +852,81 @@ func TestContract_BucketPolicyAndVisibility(t *testing.T) {
 	}
 	if stored, err := r.db.GetBucket(name); err != nil || len(stored.PolicyJSON) != 0 {
 		t.Fatalf("a refused policy was stored: %q, %v", stored.PolicyJSON, err)
+	}
+}
+
+func TestContract_ListAccountsAndBuckets(t *testing.T) {
+	r := newRealAdmin(t)
+
+	code, stdout, stderr := runCLI(t, nil, "", against(r.url, "list-accounts")...)
+	if code != 0 || !strings.Contains(stdout, r.accountID) {
+		t.Fatalf("list-accounts: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "list-buckets")...)
+	if code != 0 || !strings.Contains(stdout, r.bucket.Name) {
+		t.Fatalf("list-buckets: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	// Filtering by an owner with no buckets must not return the contract bucket.
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "list-buckets", "-owner", "nobody")...)
+	if code != 0 || strings.Contains(stdout, r.bucket.Name) {
+		t.Fatalf("list-buckets -owner nobody: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "list-buckets", "-owner", r.accountID)...)
+	if code != 0 || !strings.Contains(stdout, r.bucket.Name) {
+		t.Fatalf("list-buckets -owner: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+}
+
+func TestContract_CreateAndDeleteBucket(t *testing.T) {
+	r := newRealAdmin(t)
+
+	code, stdout, stderr := runCLI(t, nil, "", against(r.url, "create-bucket", "-name", "fresh-bucket", "-owner", r.accountID)...)
+	if code != 0 {
+		t.Fatalf("create-bucket: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	stored, err := r.db.GetBucket("fresh-bucket")
+	if err != nil || stored.OwnerAccountID != r.accountID {
+		t.Fatalf("the bucket is not in meta under its owner: %+v, %v", stored, err)
+	}
+
+	// Duplicate: 409, passthrough of the server's message.
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "create-bucket", "-name", "fresh-bucket", "-owner", r.accountID)...)
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "409") || !strings.Contains(stderr, "bucket already exists") {
+		t.Fatalf("duplicate create: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	// Invalid name and unknown owner: 400, and nothing is created.
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "create-bucket", "-name", "A", "-owner", r.accountID)...)
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "400") || !strings.Contains(stderr, "bucket name is invalid") {
+		t.Fatalf("invalid name: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "create-bucket", "-name", "orphan-bucket", "-owner", "no-such-account")...)
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "account not found") {
+		t.Fatalf("unknown owner: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if _, err := r.db.GetBucket("orphan-bucket"); !errors.Is(err, meta.ErrBucketNotFound) {
+		t.Fatalf("a refused create left a bucket behind: %v", err)
+	}
+
+	// The seeded bucket holds a (quarantined) object: 409, and it stays.
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "delete-bucket", "-name", r.bucket.Name)...)
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "409") || !strings.Contains(stderr, "not empty") {
+		t.Fatalf("delete non-empty: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if _, err := r.db.GetBucket(r.bucket.Name); err != nil {
+		t.Fatalf("the non-empty bucket was deleted: %v", err)
+	}
+
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "delete-bucket", "-name", "fresh-bucket")...)
+	if code != 0 || !strings.Contains(stdout, "deleted") {
+		t.Fatalf("delete-bucket: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if _, err := r.db.GetBucket("fresh-bucket"); !errors.Is(err, meta.ErrBucketNotFound) {
+		t.Fatalf("the bucket survived delete-bucket: %v", err)
+	}
+
+	code, stdout, stderr = runCLI(t, nil, "", against(r.url, "delete-bucket", "-name", "fresh-bucket")...)
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "404") || !strings.Contains(stderr, "bucket not found") {
+		t.Fatalf("delete missing: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
 }

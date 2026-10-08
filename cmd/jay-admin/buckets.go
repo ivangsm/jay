@@ -1,6 +1,7 @@
 package main
 
-// Bucket policy and visibility subcommands, over the /_jay/buckets endpoints.
+// Bucket subcommands (list, create, delete, policy, visibility), over the
+// /_jay/buckets endpoints.
 
 import (
 	"bytes"
@@ -8,8 +9,63 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 )
+
+func (c *client) listBuckets(args []string) error {
+	endpoint := c.addr + "/_jay/buckets"
+	if owner := parseFlag(args, "-owner"); owner != "" {
+		endpoint += "?owner_account_id=" + url.QueryEscape(owner)
+	}
+	data, status, err := doRequest(http.MethodGet, endpoint, c.token, nil)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("server error (%d): %s", status, data)
+	}
+	prettyJSON(c.stdout, data)
+	return nil
+}
+
+func (c *client) createBucket(args []string) error {
+	name := parseFlag(args, "-name")
+	owner := parseFlag(args, "-owner")
+	if name == "" || owner == "" {
+		return errors.New("usage: create-bucket -name <name> -owner <account-id>")
+	}
+
+	body := map[string]string{"name": name, "owner_account_id": owner}
+	data, status, err := doRequest(http.MethodPost, c.addr+"/_jay/buckets", c.token, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("server error (%d): %s", status, data)
+	}
+	prettyJSON(c.stdout, data)
+	return nil
+}
+
+// deleteBucket removes an empty bucket. The success line is printed only after
+// the server answered 2xx: a non-empty bucket is a 409 that says so.
+func (c *client) deleteBucket(args []string) error {
+	name := parseFlag(args, "-name")
+	if name == "" {
+		return errors.New("usage: delete-bucket -name <name>")
+	}
+
+	data, status, err := doRequest(http.MethodDelete, c.addr+"/_jay/buckets/"+url.PathEscape(name), c.token, nil)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("server error (%d): %s", status, data)
+	}
+	_, _ = fmt.Fprintf(c.stdout, "Bucket %s deleted.\n", name)
+	return nil
+}
 
 func (c *client) getBucket(args []string) error {
 	bucket := parseFlag(args, "-bucket")

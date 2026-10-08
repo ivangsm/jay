@@ -94,6 +94,14 @@ done:
 		err = c.quarantineRevalidate(cmdArgs)
 	case "quarantine-purge":
 		err = c.quarantinePurge(cmdArgs)
+	case "list-accounts":
+		err = c.listAccounts()
+	case "list-buckets":
+		err = c.listBuckets(cmdArgs)
+	case "create-bucket":
+		err = c.createBucket(cmdArgs)
+	case "delete-bucket":
+		err = c.deleteBucket(cmdArgs)
 	case "get-bucket":
 		err = c.getBucket(cmdArgs)
 	case "set-bucket-policy":
@@ -126,6 +134,7 @@ Global flags:
 
 Commands:
   create-account  -name <name>                         Create a new account
+  list-accounts                                         List all accounts
   create-token    -account <id> -actions <a,b,...>      Create a new token
                   [-name <name>] [-bucket-scope b1,b2]
                   [-prefix-scope p1,p2]
@@ -149,6 +158,9 @@ Commands:
   quarantine-revalidate -bucket-id <id> -key <key>      Revalidate object
   quarantine-purge [-bucket-id <id> -key <key>]         Purge one quarantined object,
                                                         or all of them
+  list-buckets    [-owner <account-id>]                 List buckets, optionally of one account
+  create-bucket   -name <name> -owner <account-id>      Create a bucket owned by an account
+  delete-bucket   -name <name>                          Delete an empty bucket
   get-bucket      -bucket <name>                        Show visibility and policy
   set-bucket-policy -bucket <name> -file <path|->       Install a bucket policy
                   reads the policy document from a file,
