@@ -100,10 +100,19 @@ valid for the other. [The guide](https://ivangsm.github.io/jay/guides/embedded/)
 | Port | Purpose | Exposure |
 |---|---|---|
 | `:9000` | S3-compatible API | The only one meant for untrusted networks |
-| `:9001` | Admin API and health probes | Internal — it creates accounts and tokens |
+| `:9001` | Admin API, health probes and, when enabled, the web console | Internal — it creates accounts and tokens |
 | `:4444` | Native binary protocol | Internal by default — the token secret travels in the clear unless `JAY_NATIVE_TLS_CERT`/`_KEY` are set |
 
 Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
+
+## Web console
+
+Jay ships a small browser UI for the admin port: accounts, tokens, buckets and
+policies, quarantine, and an object browser. It is **off by default**; turn it
+on with `JAY_CONSOLE_ENABLED=true` (`console.enabled` in YAML) and open
+`http://localhost:9001/console/`. You sign in with `JAY_ADMIN_TOKEN`, and
+objects are browsed as one of your tokens. Keep the admin port off untrusted
+networks. [The guide](https://ivangsm.github.io/jay/guides/console/).
 
 ## Documentation
 

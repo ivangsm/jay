@@ -37,6 +37,7 @@ both set the same key, **the environment wins** and the conflict is logged at
 | `JAY_MAX_OBJECT_SIZE` | `5368709120` | Largest accepted body and multipart part (`0` disables) |
 | `JAY_METRICS_TOKEN` | *(optional)* | Read-only bearer for `GET /metrics` on the admin port, and nothing else. At least 32 characters and different from `JAY_ADMIN_TOKEN` when set. See [Metrics](/jay/reference/observability/#metrics) |
 | `JAY_METRICS_PUBLIC` | `false` | Serve `GET /metrics` with no authentication at all. Warns at every startup; cannot be combined with `JAY_METRICS_TOKEN` |
+| `JAY_CONSOLE_ENABLED` | `false` | Serve the [web console](/jay/guides/console/) under `/console/` on the admin port. Off by default; while off, `/console/` answers `404` and says how to turn it on. It adds no secret: you sign in with `JAY_ADMIN_TOKEN` |
 | `JAY_SEED_TOKEN_ACCOUNT` | *(optional)* | See [Seed token](/jay/reference/seed-token/) |
 | `JAY_SEED_TOKEN_ID` | *(optional)* | Seed token ID |
 | `JAY_SEED_TOKEN_SECRET` | *(optional)* | Seed token secret, bcrypt-hashed before storage |
@@ -120,6 +121,10 @@ max_object_size: 5368709120
 metrics:
   token: ${JAY_METRICS_TOKEN:-}
   public: false
+
+# The web console on the admin port, under /console/. Off unless true.
+console:
+  enabled: false
 
 seed_token:
   account: ${JAY_SEED_TOKEN_ACCOUNT:-}

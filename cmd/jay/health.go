@@ -74,6 +74,13 @@ func (hc *HealthChecker) SetReady(v bool) {
 	hc.ready.Store(v)
 }
 
+// IsReady reports whether startup recovery has finished and the listeners are
+// bound. It is the bare flag, not the full readiness probe: the web console
+// uses it to refuse object operations while recovery runs.
+func (hc *HealthChecker) IsReady() bool {
+	return hc.ready.Load()
+}
+
 // LivenessHandler always returns 200 — the process is alive.
 func (hc *HealthChecker) LivenessHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")

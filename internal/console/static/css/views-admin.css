@@ -1,0 +1,22 @@
+/* Styles owned by the accounts, tokens and quarantine views. The shell and
+   the shared components live in console.css. */
+
+.id-cell { display: inline-flex; align-items: center; gap: var(--s1); white-space: nowrap; }
+.chip-row { display: inline-flex; flex-wrap: wrap; gap: var(--s1); }
+.scope-cell { display: block; font-size: var(--text-sm); overflow-wrap: anywhere; }
+.row-actions { display: inline-flex; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
+
+.filter-bar { display: flex; flex-wrap: wrap; gap: var(--s4); margin-bottom: var(--s4); }
+.filter { display: flex; align-items: center; gap: var(--s2); }
+.filter label { color: var(--text-muted); font-size: var(--text-sm); }
+
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); margin: var(--s5) 0 var(--s3); }
+.section-head h2 { font-size: var(--text-lg); font-weight: 600; }
+
+.form-stack { display: flex; flex-direction: column; gap: var(--s4); }
+.check-list { display: flex; flex-direction: column; gap: var(--s2); max-height: 180px; overflow-y: auto; padding: var(--s2); border: 1px solid var(--line); border-radius: var(--radius); }
+.check-list .is-mono { font-family: var(--font-mono); font-size: var(--text-sm); }
+.prefix-list { display: flex; flex-direction: column; gap: var(--s2); margin-bottom: var(--s2); }
+
+.secret-body { display: flex; flex-direction: column; gap: var(--s4); }
+.secret-value { font-family: var(--font-mono); font-size: var(--text-sm); overflow-wrap: anywhere; user-select: all; }

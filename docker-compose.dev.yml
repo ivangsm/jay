@@ -5,7 +5,7 @@ services:
     build: .
     ports:
       - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9001:9001"
       - "4444:4444"
     volumes:
       - jay-data:/data
@@ -17,6 +17,8 @@ services:
       JAY_ADMIN_TOKEN: "${JAY_ADMIN_TOKEN}"
       JAY_SIGNING_SECRET: "${JAY_SIGNING_SECRET}"
       JAY_LOG_LEVEL: info
+      # The web console at http://localhost:9001/console/ (development only).
+      JAY_CONSOLE_ENABLED: "true"
       # JAY_TLS_CERT: /data/certs/server.crt
       # JAY_TLS_KEY: /data/certs/server.key
       # JAY_RATE_LIMIT: "100"

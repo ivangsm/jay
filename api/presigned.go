@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -61,6 +62,58 @@ func canonicalQuery(q url.Values) string {
 		}
 	}
 	return strings.Join(parts, "&")
+}
+
+// PresignRequest authorizes r as tokenID for ttl using jay's own presigned
+// form (X-Jay-Token, X-Jay-Expires, X-Jay-Signature), HMAC'd with
+// signingSecret over r.Method, r.URL.Path and the canonical query — exactly
+// what validatePresignedRequest checks. It rewrites r.URL.RawQuery.
+//
+// It refuses (error, r untouched) an empty secret or tokenID, a ttl <= 0 or
+// over auth.MaxPresignExpiry, an r that carries an Authorization header, and
+// an r whose query already has any X-Jay-* or X-Amz-* parameter.
+//
+// The refusals are deliberate: withPresigned ignores the X-Jay form when an
+// Authorization header is present, and an X-Amz-* parameter would make the
+// request a SigV4 presign instead, so a URL minted over either would never
+// verify as the caller meant — or would let two credentials ride one request.
+func PresignRequest(r *http.Request, signingSecret, tokenID string, ttl time.Duration) error {
+	if r == nil || r.URL == nil {
+		return errors.New("presign: nil request")
+	}
+	if signingSecret == "" {
+		return errors.New("presign: empty signing secret")
+	}
+	if tokenID == "" {
+		return errors.New("presign: empty token id")
+	}
+	if ttl <= 0 {
+		return errors.New("presign: ttl must be positive")
+	}
+	if ttl > auth.MaxPresignExpiry {
+		return errors.New("presign: ttl exceeds maximum of 7 days")
+	}
+	if r.Header.Get("Authorization") != "" {
+		return errors.New("presign: request already carries an Authorization header")
+	}
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return errors.New("presign: malformed query string")
+	}
+	for k := range q {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "x-jay-") || strings.HasPrefix(lk, "x-amz-") {
+			return errors.New("presign: query already carries credential parameter " + k)
+		}
+	}
+
+	expires := strconv.FormatInt(time.Now().Add(ttl).Unix(), 10)
+	sig := computeSignature(signingSecret, tokenID, r.Method, r.URL.Path, canonicalQuery(q), expires)
+	q.Set("X-Jay-Token", tokenID)
+	q.Set("X-Jay-Expires", expires)
+	q.Set("X-Jay-Signature", sig)
+	r.URL.RawQuery = q.Encode()
+	return nil
 }
 
 func validatePresignedRequest(r *http.Request, signingSecret string, db *meta.DB) (*meta.Token, error) {

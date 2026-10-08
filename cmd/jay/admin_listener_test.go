@@ -67,7 +67,13 @@ func newAdminListener(t *testing.T, level slog.Level, edit func(*Config)) *admin
 	if edit != nil {
 		edit(&cfg)
 	}
-	handler, adminHandler := buildAdminMux(cfg, db, st, auth.New(db), maintenance.NewMetrics(), hc, log)
+	au := auth.New(db)
+	metrics := maintenance.NewMetrics()
+	handler, adminHandler, err := buildAdminMux(cfg, db, st, au, metrics, hc, log,
+		newS3Handler(cfg, db, st, au, log, metrics))
+	if err != nil {
+		t.Fatalf("build admin mux: %v", err)
+	}
 	t.Cleanup(func() { _ = adminHandler.Close() })
 	return &adminListener{handler: handler, log: buf, hc: hc, db: db}
 }

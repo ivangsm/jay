@@ -913,3 +913,54 @@ func TestLoadConfigFromSources_NonPositiveRateBurstEnvKeepsDefault(t *testing.T)
 		t.Errorf("expected an invalid-value error in the log, got: %s", buf.String())
 	}
 }
+
+// The console is off unless asked for: unset, empty, YAML and env all land on
+// the same field, and an empty value is "not configured", never "true".
+func TestLoadConfigFromSources_ConsoleEnabled(t *testing.T) {
+	t.Run("absent is false", func(t *testing.T) {
+		clearJAYEnv(t)
+		cfg, err := LoadConfigFromSources("", quietLogger())
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.ConsoleEnabled {
+			t.Error("ConsoleEnabled is true with nothing configured")
+		}
+	})
+	t.Run("empty env is false", func(t *testing.T) {
+		clearJAYEnv(t)
+		t.Setenv("JAY_CONSOLE_ENABLED", "")
+		cfg, err := LoadConfigFromSources("", quietLogger())
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.ConsoleEnabled {
+			t.Error("an empty JAY_CONSOLE_ENABLED enabled the console")
+		}
+	})
+	t.Run("env true", func(t *testing.T) {
+		clearJAYEnv(t)
+		t.Setenv("JAY_CONSOLE_ENABLED", "true")
+		cfg, err := LoadConfigFromSources("", quietLogger())
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if !cfg.ConsoleEnabled {
+			t.Error("JAY_CONSOLE_ENABLED=true did not enable the console")
+		}
+	})
+	t.Run("yaml true", func(t *testing.T) {
+		clearJAYEnv(t)
+		path := filepath.Join(t.TempDir(), "jay.yaml")
+		if err := os.WriteFile(path, []byte("console:\n  enabled: true\n"), 0o600); err != nil {
+			t.Fatalf("write yaml: %v", err)
+		}
+		cfg, err := LoadConfigFromSources(path, quietLogger())
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if !cfg.ConsoleEnabled {
+			t.Error("console.enabled: true in YAML did not enable the console")
+		}
+	})
+}

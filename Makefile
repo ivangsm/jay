@@ -4,7 +4,7 @@
 # (.golangci.yml) es lo que impide que la legibilidad se vuelva a degradar:
 # sin él, la deuda se acumula sin que nada avise.
 
-.PHONY: check fmt vet lint test build conformance
+.PHONY: check fmt vet lint test build conformance console-smoke
 
 check: fmt vet lint test build ## Todo lo que tiene que pasar antes de un commit
 	@echo "ok: check completo"
@@ -30,3 +30,10 @@ build: ## Compila todo
 # prueba que coincide con clientes que no escribió.
 conformance: ## Suite de conformidad S3 contra aws-cli, mc y warp
 	./scripts/conformance.sh
+
+# Fuera de `check` a propósito, como `conformance`: arranca dos jay reales
+# (consola apagada y encendida) y los maneja con curl. Cada paso afirma el
+# efecto por otro camino (cliente nativo, admin API con bearer), no el código
+# HTTP de la consola.
+console-smoke: ## Smoke end-to-end de la consola web contra un jay real
+	./scripts/console-smoke.sh

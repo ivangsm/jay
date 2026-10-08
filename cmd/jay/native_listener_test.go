@@ -77,8 +77,10 @@ func startDataListenersForTest(t *testing.T, cfg Config) (func() error, *syncBuf
 	// fails to bind; there is no admin listener here, so it is a no-op.
 	noAdmin := func(context.Context) error { return nil }
 
+	au := auth.New(db)
+	metrics := maintenance.NewMetrics()
 	shutdownS3, shutdownNative := startDataListeners(
-		cfg, db, st, auth.New(db), log, maintenance.NewMetrics(), noAdmin,
+		cfg, db, st, au, newS3Handler(cfg, db, st, au, log, metrics), log, metrics, noAdmin,
 	)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -51,6 +51,9 @@ var fieldSpecs = []fieldSpec{
 	{yamlKey: "metrics.token", yamlPath: []string{"metrics", "token"}, envKey: "JAY_METRICS_TOKEN", kind: typeString},
 	{yamlKey: "metrics.public", yamlPath: []string{"metrics", "public"}, envKey: "JAY_METRICS_PUBLIC", kind: typeBool},
 
+	// The web console under /console/ on the admin listener; off by default.
+	{yamlKey: "console.enabled", yamlPath: []string{"console", "enabled"}, envKey: "JAY_CONSOLE_ENABLED", kind: typeBool},
+
 	{yamlKey: "seed_token.account", yamlPath: []string{"seed_token", "account"}, envKey: "JAY_SEED_TOKEN_ACCOUNT", kind: typeString},
 	{yamlKey: "seed_token.id", yamlPath: []string{"seed_token", "id"}, envKey: "JAY_SEED_TOKEN_ID", kind: typeString},
 	{yamlKey: "seed_token.secret", yamlPath: []string{"seed_token", "secret"}, envKey: "JAY_SEED_TOKEN_SECRET", kind: typeString},

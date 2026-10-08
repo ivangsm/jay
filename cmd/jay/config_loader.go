@@ -186,6 +186,10 @@ func bindings() []yamlKeyBinding {
 		bindString("metrics.token", "JAY_METRICS_TOKEN", func(c *Config) *string { return &c.MetricsToken }),
 		bindBool("metrics.public", "JAY_METRICS_PUBLIC", func(c *Config) *bool { return &c.MetricsPublic }),
 
+		// The web console. No default but off: nothing new is exposed unless
+		// the operator asks.
+		bindBool("console.enabled", "JAY_CONSOLE_ENABLED", func(c *Config) *bool { return &c.ConsoleEnabled }),
+
 		bindString("seed_token.account", "JAY_SEED_TOKEN_ACCOUNT", func(c *Config) *string { return &c.SeedTokenAccount }),
 		bindString("seed_token.id", "JAY_SEED_TOKEN_ID", func(c *Config) *string { return &c.SeedTokenID }),
 		bindString("seed_token.secret", "JAY_SEED_TOKEN_SECRET", func(c *Config) *string { return &c.SeedTokenSecret }),

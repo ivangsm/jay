@@ -46,6 +46,12 @@ type Config struct {
 	MetricsPublic bool   // JAY_METRICS_PUBLIC / metrics.public — serve /metrics with no auth at all; explicit opt-in, excludes MetricsToken
 	MaxObjectSize int64  // JAY_MAX_OBJECT_SIZE / max_object_size — largest accepted object body (and multipart part), in bytes; 0 disables the limit
 
+	// ConsoleEnabled serves the web console under /console/ on the admin
+	// listener. Off by default: an unset or empty value is false, and /console/**
+	// answers 404 saying how to turn it on. It adds no secret; it signs in with
+	// JAY_ADMIN_TOKEN.
+	ConsoleEnabled bool // JAY_CONSOLE_ENABLED / console.enabled
+
 	// Client credentials for the `jay` subcommands (ls, cp, rm, sync). The
 	// server itself never reads them; they live here so they go through
 	// bindings() like every other setting and stay visible to jay-config.
