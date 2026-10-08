@@ -1,6 +1,6 @@
 ---
 title: Admin API
-description: Endpoints for accounts, tokens, metrics, presigned URLs and quarantine, and the trail they leave.
+description: Endpoints for accounts, buckets, tokens, metrics, presigned URLs and quarantine, and the trail they leave.
 ---
 
 The admin API lives on the admin port (`:9001` by default) under the `/_jay`
@@ -12,7 +12,7 @@ Authorization: Bearer <JAY_ADMIN_TOKEN>
 
 **This port should never face an untrusted network.** It mints credentials.
 
-The same port also serves the health probes, pprof, and `GET /metrics` — the
+The same port also serves the optional [web console](/jay/guides/console/), the health probes, pprof, and `GET /metrics` — the
 Prometheus endpoint, which can be given its own read-only token so a monitoring
 system never holds this one. See [Observability](/jay/reference/observability/#metrics).
 
@@ -21,6 +21,7 @@ system never holds this one. See [Observability](/jay/reference/observability/#m
 | Endpoint | Method | Description |
 |---|---|---|
 | `/_jay/accounts` | POST | Create an account |
+| `/_jay/accounts` | GET | List accounts |
 | `/_jay/tokens` | POST | Create a token |
 | `/_jay/tokens` | GET | List tokens |
 | `/_jay/tokens/{id}` | DELETE | Revoke a token |
@@ -29,6 +30,9 @@ system never holds this one. See [Observability](/jay/reference/observability/#m
 | `/_jay/quarantine` | GET | List quarantined objects |
 | `/_jay/quarantine/revalidate` | POST | Revalidate a quarantined object |
 | `/_jay/quarantine` | DELETE | Purge one quarantined object, or all of them |
+| `/_jay/buckets` | GET | List buckets, with object counts and sizes |
+| `/_jay/buckets` | POST | Create a bucket for an account |
+| `/_jay/buckets/{name}` | DELETE | Delete an empty bucket |
 | `/_jay/buckets/{name}` | GET | Visibility and policy of one bucket |
 | `/_jay/buckets/{name}/policy` | PUT | Install or replace the bucket policy |
 | `/_jay/buckets/{name}/policy` | DELETE | Remove the bucket policy |
@@ -51,7 +55,7 @@ Every error is a JSON document with `Content-Type: application/json`:
 | `401` | No admin token, or the wrong one — the metrics token included, which opens `/metrics` and nothing under `/_jay`. After five failures from one address, that address is refused — the right token included — for 15 minutes, on `/_jay`, pprof and `/metrics` alike |
 | `404` | No endpoint at that path, or the thing it names does not exist: bucket, token, quarantined object |
 | `405` | The path exists, but not with that method. The `Allow` header lists the methods it takes |
-| `409` | A quarantine operation named an object that is not in quarantine |
+| `409` | A quarantine operation named an object that is not in quarantine; a bucket that already exists, or that would take its account past 1000 buckets; deleting a bucket that still holds objects |
 | `413` | A bucket policy larger than 64 KiB |
 | `500` | Jay failed: a database read, a file that could not be removed, a purge of the whole quarantine that left objects behind. The message says what |
 | `503` | Metrics are not wired into this instance |
@@ -67,7 +71,7 @@ with that ID. The ID is minted by Jay; one sent by the client is ignored.
 Every endpoint that changes something also writes an `audit` line with the same
 ID, once the change has committed: `account.create`, `token.create`,
 `token.revoke`, `presign.issue`, `quarantine.revalidate`, `quarantine.purge`,
-`quarantine.purge_all`, `bucket.policy.put`, `bucket.policy.delete` and
+`quarantine.purge_all`, `bucket.create`, `bucket.delete`, `bucket.policy.put`, `bucket.policy.delete` and
 `bucket.visibility.put`. It records the IDs involved — a new token's id,
 account, actions, scopes and expiry; a presigned URL's token, method, bucket,
 key and expiry — and **never** a token secret, a presigned URL or a signature.
@@ -104,6 +108,31 @@ dead on arrival.
 revoked — and `404` for an id that names no token. Revocation takes effect
 immediately, including for connections already authenticated: it is re-checked
 on every cached auth hit.
+
+## Accounts and buckets
+
+`GET /_jay/accounts` lists every account, oldest first, as an array of
+`{account_id, name, created_at, status}` (`[]` when there are none).
+
+`GET /_jay/buckets` lists buckets by name. Each row is `{id, name,
+owner_account_id, created_at, visibility, status, has_policy, object_count,
+total_size_bytes}`: the counters are included and the policy document is not
+(only whether there is one). `?owner_account_id=` narrows it to one account. If
+any bucket's counters cannot be read the whole call is a `500`; a row with
+invented zeros would say an unreadable bucket is empty.
+
+`POST /_jay/buckets` takes `name` and `owner_account_id`, both required, and
+answers `201` with the same document as `GET /_jay/buckets/{name}`. It is the
+way to create a bucket for an account whose token you do not hold. Errors:
+`400` for an invalid name (3 to 63 characters; lowercase letters, digits, `.`
+and `-`; no `..` or `--`; not an IP address) or an unknown account, `409` if the
+name is taken or the account is at its bucket limit.
+
+`DELETE /_jay/buckets/{name}` answers `204`. Only an **empty** bucket goes —
+objects in quarantine count — and there is deliberately no recursive delete:
+removing data stays a decision made object by object. `404` if the bucket does
+not exist, `409` if it is not empty. S3's `CreateBucket` and `DeleteBucket` take
+the same code path, so the rules are the same on both ports.
 
 ## Bucket policy and visibility
 
@@ -167,6 +196,7 @@ the same endpoints.
 export JAY_ADMIN_TOKEN=my-secret-admin-token
 
 jay-admin create-account -name myapp
+jay-admin list-accounts
 jay-admin create-token -account ACCOUNT_ID -name deploy \
   -actions bucket:write-meta,object:put,object:get,object:list
 jay-admin create-token -account ACCOUNT_ID -name reader -actions object:get \
@@ -182,6 +212,9 @@ jay-admin quarantine-revalidate -bucket-id BUCKET_ID -key file.txt
 jay-admin quarantine-purge -bucket-id BUCKET_ID -key file.txt
 jay-admin quarantine-purge
 
+jay-admin list-buckets -owner ACCOUNT_ID
+jay-admin create-bucket -name mybucket -owner ACCOUNT_ID
+jay-admin delete-bucket -name mybucket
 jay-admin get-bucket -bucket mybucket
 jay-admin set-bucket-policy -bucket mybucket -file policy.json
 jay-admin delete-bucket-policy -bucket mybucket
