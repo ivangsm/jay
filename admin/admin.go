@@ -26,6 +26,7 @@ import (
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/internal/accesslog"
 	"github.com/ivangsm/jay/internal/jsonx"
+	"github.com/ivangsm/jay/internal/objops"
 	"github.com/ivangsm/jay/maintenance"
 	"github.com/ivangsm/jay/meta"
 	"github.com/ivangsm/jay/store"
@@ -42,6 +43,7 @@ type authFailure struct {
 type Handler struct {
 	db            *meta.DB
 	store         *store.Store
+	objops        *objops.Service
 	auth          *auth.Auth
 	adminToken    string
 	metricsToken  string
@@ -108,6 +110,7 @@ func NewHandler(cfg AdminConfig) *Handler {
 	h := &Handler{
 		db:            cfg.DB,
 		store:         cfg.Store,
+		objops:        objops.New(cfg.DB, cfg.Store, cfg.Log),
 		auth:          cfg.Auth,
 		adminToken:    cfg.AdminToken,
 		metricsToken:  cfg.MetricsToken,
@@ -251,6 +254,7 @@ type route struct {
 // without the test that checks it requires the admin token knowing about it.
 var routes = []route{
 	{http.MethodPost, "/accounts", noParam((*Handler).handleCreateAccount)},
+	{http.MethodGet, "/accounts", noParam((*Handler).handleListAccounts)},
 	{http.MethodPost, "/tokens", noParam((*Handler).handleCreateToken)},
 	{http.MethodGet, "/tokens", noParam((*Handler).handleListTokens)},
 	{http.MethodDelete, "/tokens/{id...}", (*Handler).handleRevokeToken},
@@ -263,6 +267,9 @@ var routes = []route{
 	// things that decide who can reach a bucket. See admin/buckets.go for why
 	// they live here rather than on the S3 port. Bucket names cannot contain a
 	// slash (meta.ValidBucketName), so {name} is one segment.
+	{http.MethodGet, "/buckets", noParam((*Handler).handleListBuckets)},
+	{http.MethodPost, "/buckets", noParam((*Handler).handleCreateBucket)},
+	{http.MethodDelete, "/buckets/{name}", (*Handler).handleDeleteBucket},
 	{http.MethodGet, "/buckets/{name}", (*Handler).handleGetBucket},
 	{http.MethodPut, "/buckets/{name}/policy", (*Handler).handlePutBucketPolicy},
 	{http.MethodDelete, "/buckets/{name}/policy", (*Handler).handleDeleteBucketPolicy},
@@ -383,22 +390,31 @@ func (h *Handler) credentialOf(header string) credential {
 // valid scrape between every few guesses at the admin token and never be
 // locked out.
 func (h *Handler) authorize(r *http.Request, need scope) bool {
+	ok, _ := h.authorizeHeader(r, r.Header.Get("Authorization"), need)
+	return ok
+}
+
+// authorizeHeader is authorize for an Authorization header value that did not
+// necessarily arrive in r's headers. lockedOut reports that the refusal was the
+// address's backoff rather than the credential, which the web console's login
+// needs in order to answer 429 instead of 401.
+func (h *Handler) authorizeHeader(r *http.Request, header string, need scope) (ok, lockedOut bool) {
 	ip := accesslog.PeerIP(r)
 	requestID := accesslog.RequestID(r.Context())
 
 	if failures, locked := h.lockedOut(ip); locked {
 		h.log.Warn("admin auth rate limited", "ip", ip, "failures", failures, "request_id", requestID)
 		h.metrics.RecordAdminAuthFailure()
-		return false
+		return false, true
 	}
 
 	var reason string
-	switch cred := h.credentialOf(r.Header.Get("Authorization")); {
+	switch cred := h.credentialOf(header); {
 	case cred == credentialAdmin:
 		h.forgetAuthFailures(ip)
-		return true
+		return true, false
 	case cred == credentialMetrics && need == scopeMetrics:
-		return true
+		return true, false
 	case cred == credentialMetrics:
 		// A valid credential in the wrong place. It is refused like a wrong
 		// one — the metrics token must not be an admin credential in
@@ -412,7 +428,35 @@ func (h *Handler) authorize(r *http.Request, need scope) bool {
 	h.log.Warn("admin auth failure", "ip", ip, "reason", reason, "request_id", requestID)
 	h.recordAuthFailure(ip, time.Now())
 	h.metrics.RecordAdminAuthFailure()
-	return false
+	return false, false
+}
+
+// CredentialResult is the outcome of AuthenticateAdminToken.
+type CredentialResult int
+
+const (
+	// CredentialAccepted is the admin token. It clears the address's failures.
+	CredentialAccepted CredentialResult = iota
+	// CredentialRejected is a wrong token, the metrics token included. It is counted.
+	CredentialRejected
+	// CredentialLockedOut means the address used up its failures inside the window.
+	CredentialLockedOut
+)
+
+// AuthenticateAdminToken checks candidate as if it had arrived as
+// "Authorization: Bearer <candidate>" on r: same constant-time comparison,
+// same per-address backoff, same log line and failure metric. The web
+// console's login goes through here so it is not a second door with its own
+// counter.
+func (h *Handler) AuthenticateAdminToken(r *http.Request, candidate string) CredentialResult {
+	ok, locked := h.authorizeHeader(r, "Bearer "+candidate, scopeAdmin)
+	switch {
+	case ok:
+		return CredentialAccepted
+	case locked:
+		return CredentialLockedOut
+	}
+	return CredentialRejected
 }
 
 // lockedOut reports whether ip has used up its failures inside the window,

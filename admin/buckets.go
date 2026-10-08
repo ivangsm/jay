@@ -17,11 +17,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/internal/jsonx"
+	"github.com/ivangsm/jay/internal/objops"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -34,6 +37,7 @@ const maxBucketPolicyBytes = 64 << 10
 // visibility come together because they are the two halves of one question:
 // who can reach this bucket.
 type bucketResponse struct {
+	ID             string         `json:"id"`
 	Name           string         `json:"name"`
 	OwnerAccountID string         `json:"owner_account_id"`
 	CreatedAt      time.Time      `json:"created_at"`
@@ -63,16 +67,164 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, _ *http.Request, name s
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := jsonv2.MarshalWrite(w, bucketResponse{
-		Name:           bucket.Name,
-		OwnerAccountID: bucket.OwnerAccountID,
-		CreatedAt:      bucket.CreatedAt,
-		Visibility:     bucket.Visibility,
-		Status:         bucket.Status,
-		Policy:         bucket.PolicyJSON,
-	}); err != nil {
+	if err := jsonv2.MarshalWrite(w, newBucketResponse(bucket)); err != nil {
 		h.log.Error("encode get-bucket response", "err", err)
 	}
+}
+
+func newBucketResponse(b *meta.Bucket) bucketResponse {
+	return bucketResponse{
+		ID:             b.ID,
+		Name:           b.Name,
+		OwnerAccountID: b.OwnerAccountID,
+		CreatedAt:      b.CreatedAt,
+		Visibility:     b.Visibility,
+		Status:         b.Status,
+		Policy:         b.PolicyJSON,
+	}
+}
+
+// bucketSummary is one row of GET /_jay/buckets. Unlike bucketResponse it
+// carries the object counters and only whether a policy exists: a listing of
+// every bucket should not ship every policy document.
+type bucketSummary struct {
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	OwnerAccountID string    `json:"owner_account_id"`
+	CreatedAt      time.Time `json:"created_at"`
+	Visibility     string    `json:"visibility"`
+	Status         string    `json:"status"`
+	HasPolicy      bool      `json:"has_policy"`
+	ObjectCount    int64     `json:"object_count"`
+	TotalSizeBytes int64     `json:"total_size_bytes"`
+}
+
+// handleListBuckets answers GET /_jay/buckets[?owner_account_id=].
+//
+// Any failure reading a bucket's counters fails the whole listing: a row with
+// invented zeros would tell an operator an unreadable bucket is empty.
+func (h *Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
+	buckets, err := h.db.ListBuckets(r.URL.Query().Get("owner_account_id"))
+	if err != nil {
+		h.log.Error("list buckets", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	slices.SortFunc(buckets, func(a, b meta.Bucket) int { return strings.Compare(a.Name, b.Name) })
+
+	out := make([]bucketSummary, 0, len(buckets))
+	for i := range buckets {
+		b := &buckets[i]
+		count, size, err := h.db.BucketStats(b.ID)
+		if err != nil {
+			h.log.Error("bucket stats", "err", err, "bucket", b.Name, "bucket_id", b.ID)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		out = append(out, bucketSummary{
+			ID:             b.ID,
+			Name:           b.Name,
+			OwnerAccountID: b.OwnerAccountID,
+			CreatedAt:      b.CreatedAt,
+			Visibility:     b.Visibility,
+			Status:         b.Status,
+			HasPolicy:      len(b.PolicyJSON) > 0,
+			ObjectCount:    count,
+			TotalSizeBytes: size,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := jsonv2.MarshalWrite(w, out); err != nil {
+		h.log.Error("encode list-buckets response", "err", err)
+	}
+}
+
+type createBucketRequest struct {
+	Name           string `json:"name"`
+	OwnerAccountID string `json:"owner_account_id"`
+}
+
+// handleCreateBucket answers POST /_jay/buckets: a bucket owned by an account,
+// for the operator who has no token of that account to PUT one with.
+func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
+	var req createBucketRequest
+	if err := jsonv2.UnmarshalRead(r.Body, &req, jsonx.Strict); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.OwnerAccountID == "" {
+		writeJSONError(w, http.StatusBadRequest, "owner_account_id is required")
+		return
+	}
+	if _, err := h.db.GetAccount(req.OwnerAccountID); err != nil {
+		if errors.Is(err, meta.ErrAccountNotFound) {
+			writeJSONError(w, http.StatusBadRequest, "account not found")
+			return
+		}
+		h.log.Error("get account", "err", err, "account_id", req.OwnerAccountID)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	bucket, err := h.objops.CreateBucket(req.Name, req.OwnerAccountID)
+	switch {
+	case errors.Is(err, objops.ErrInvalidBucketName):
+		writeJSONError(w, http.StatusBadRequest, "bucket name is invalid: 3-63 characters, lowercase letters, "+
+			"digits, '.' and '-', starting and ending with a letter or digit, no '..' or '--', not an IP address")
+		return
+	case errors.Is(err, meta.ErrBucketExists):
+		writeJSONError(w, http.StatusConflict, "bucket already exists")
+		return
+	case errors.Is(err, meta.ErrBucketLimitExceeded):
+		writeJSONError(w, http.StatusConflict,
+			"account bucket limit exceeded ("+strconv.Itoa(meta.MaxBucketsPerAccount)+")")
+		return
+	case err != nil:
+		h.log.Error("create bucket", "err", err, "bucket", req.Name)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if h.metrics != nil {
+		h.metrics.CreateBucketTotal.Add(1)
+	}
+	h.audit(r, "bucket.create",
+		slog.String("bucket", bucket.Name),
+		slog.String("bucket_id", bucket.ID),
+		slog.String("owner_account_id", bucket.OwnerAccountID))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	if err := jsonv2.MarshalWrite(w, newBucketResponse(bucket)); err != nil {
+		h.log.Error("encode create-bucket response", "err", err)
+	}
+}
+
+// handleDeleteBucket answers DELETE /_jay/buckets/{name}. Only an empty bucket
+// goes: there is deliberately no recursive delete, so removing data stays a
+// decision made object by object (quarantined ones included).
+func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, name string) {
+	bucket, err := h.objops.DeleteBucket(name)
+	switch {
+	case errors.Is(err, objops.ErrBucketNotFound):
+		writeJSONError(w, http.StatusNotFound, "bucket not found")
+		return
+	case errors.Is(err, meta.ErrBucketNotEmpty):
+		writeJSONError(w, http.StatusConflict,
+			"bucket is not empty: delete its objects, including any in quarantine, first")
+		return
+	case err != nil:
+		h.log.Error("delete bucket", "err", err, "bucket", name)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if h.metrics != nil {
+		h.metrics.DeleteBucketTotal.Add(1)
+	}
+	h.audit(r, "bucket.delete",
+		slog.String("bucket", bucket.Name),
+		slog.String("bucket_id", bucket.ID))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handlePutBucketPolicy answers PUT /_jay/buckets/{name}/policy. The request

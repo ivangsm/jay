@@ -43,6 +43,7 @@ import (
 
 const (
 	ctlBucket      = "control-bucket"
+	ctlEmptyBucket = "control-empty-bucket"
 	ctlTokenID     = "control-token"
 	ctlTokenSecret = "control-token-secret-value"
 	healthyKey     = "healthy.txt"
@@ -96,6 +97,17 @@ func newControlFixture(t *testing.T) *controlFixture {
 	}
 	if err := db.CreateBucket(bucket); err != nil {
 		t.Fatalf("create bucket: %v", err)
+	}
+	// A second bucket with nothing in it: the only kind DELETE /buckets/{name}
+	// may remove.
+	if err := db.CreateBucket(&meta.Bucket{
+		ID:             uuid.New().String(),
+		Name:           ctlEmptyBucket,
+		OwnerAccountID: account.AccountID,
+		Visibility:     meta.VisibilityPrivate,
+		Status:         "active",
+	}); err != nil {
+		t.Fatalf("create empty bucket: %v", err)
 	}
 
 	au := auth.New(db)
@@ -310,6 +322,7 @@ func fixed(s string) func(*controlFixture) string { return func(*controlFixture)
 // authentication test below.
 var adminRoutes = []adminRoute{
 	{"POST /accounts", http.MethodPost, fixed("/_jay/accounts"), fixed(`{"name":"from-the-table"}`), http.StatusCreated},
+	{"GET /accounts", http.MethodGet, fixed("/_jay/accounts"), fixed(""), http.StatusOK},
 	{"POST /tokens", http.MethodPost, fixed("/_jay/tokens"), func(f *controlFixture) string {
 		return `{"account_id":"` + f.account.AccountID + `","name":"t","allowed_actions":["object:get"]}`
 	}, http.StatusCreated},
@@ -324,6 +337,11 @@ var adminRoutes = []adminRoute{
 	{"POST /quarantine/revalidate", http.MethodPost, fixed("/_jay/quarantine/revalidate"), func(f *controlFixture) string {
 		return `{"bucket_id":"` + f.bucketID + `","key":"` + sickKey + `"}`
 	}, http.StatusOK},
+	{"GET /buckets", http.MethodGet, fixed("/_jay/buckets"), fixed(""), http.StatusOK},
+	{"POST /buckets", http.MethodPost, fixed("/_jay/buckets"), func(f *controlFixture) string {
+		return `{"name":"created-from-the-table","owner_account_id":"` + f.account.AccountID + `"}`
+	}, http.StatusCreated},
+	{"DELETE /buckets/{name}", http.MethodDelete, fixed("/_jay/buckets/" + ctlEmptyBucket), fixed(""), http.StatusNoContent},
 	{"GET /buckets/{name}", http.MethodGet, fixed("/_jay/buckets/" + ctlBucket), fixed(""), http.StatusOK},
 	{"PUT /buckets/{name}/policy", http.MethodPut, fixed("/_jay/buckets/" + ctlBucket + "/policy"),
 		fixed(`{"statements":[{"effect":"deny","actions":["object:delete"],"subjects":["*"]}]}`), http.StatusOK},
@@ -697,8 +715,8 @@ func TestAdminRouter_UnservedMethodIs405WithAllow(t *testing.T) {
 	before := f.dbDigest(t)
 
 	for _, c := range []struct{ method, path, body, allow string }{
-		{http.MethodGet, "/_jay/accounts", "", "POST"},
-		{http.MethodPut, "/_jay/accounts", `{"name":"x"}`, "POST"},
+		{http.MethodDelete, "/_jay/accounts", "", "GET, POST"},
+		{http.MethodPut, "/_jay/accounts", `{"name":"x"}`, "GET, POST"},
 		{http.MethodDelete, "/_jay/tokens", "", "GET, POST"},
 		{http.MethodPost, "/_jay/tokens/" + ctlTokenID, "", "DELETE"},
 		{http.MethodGet, "/_jay/tokens/" + ctlTokenID, "", "DELETE"},
@@ -708,8 +726,10 @@ func TestAdminRouter_UnservedMethodIs405WithAllow(t *testing.T) {
 		{http.MethodPut, "/_jay/quarantine", `{"mode":"all"}`, "DELETE, GET"},
 		{http.MethodGet, "/_jay/quarantine/revalidate", "", "POST"},
 		{http.MethodDelete, "/_jay/quarantine/revalidate", `{"mode":"all"}`, "POST"},
-		{http.MethodPost, "/_jay/buckets/" + ctlBucket, "", "GET"},
-		{http.MethodDelete, "/_jay/buckets/" + ctlBucket, "", "GET"},
+		{http.MethodPut, "/_jay/buckets", `{"name":"x"}`, "GET, POST"},
+		{http.MethodDelete, "/_jay/buckets", "", "GET, POST"},
+		{http.MethodPost, "/_jay/buckets/" + ctlBucket, "", "DELETE, GET"},
+		{http.MethodPut, "/_jay/buckets/" + ctlBucket, "", "DELETE, GET"},
 		{http.MethodGet, "/_jay/buckets/" + ctlBucket + "/policy", "", "DELETE, PUT"},
 		{http.MethodPost, "/_jay/buckets/" + ctlBucket + "/policy", `{"statements":[]}`, "DELETE, PUT"},
 		{http.MethodDelete, "/_jay/buckets/" + ctlBucket + "/visibility", "", "PUT"},

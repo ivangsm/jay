@@ -93,3 +93,47 @@ func TestCreateTokenIfNotExists_SecretMismatch(t *testing.T) {
 		t.Fatalf("expected TokenSeedMismatch, got %v", status)
 	}
 }
+
+func TestListAccounts_ReturnsEveryAccountAndNothingElse(t *testing.T) {
+	db := openTestDB(t)
+
+	empty, err := db.ListAccounts()
+	if err != nil {
+		t.Fatalf("list on an empty store: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("an empty store listed %d accounts", len(empty))
+	}
+
+	want := map[string]string{}
+	for _, name := range []string{"falco", "birdple", "colibri"} {
+		a := &Account{AccountID: "id-" + name, Name: name}
+		if err := db.CreateAccount(a); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		want[a.AccountID] = name
+	}
+	// A token is not an account: it lives in its own bucket and must not leak
+	// into the listing.
+	if err := db.CreateToken(&Token{TokenID: "tok", AccountID: "id-falco", Name: "t", SecretKey: "s",
+		SecretHash: "h", AllowedActions: []string{"*"}}); err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	got, err := db.ListAccounts()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("listed %d accounts, want %d: %+v", len(got), len(want), got)
+	}
+	for _, a := range got {
+		if want[a.AccountID] != a.Name || a.Status != "active" || a.CreatedAt.IsZero() {
+			t.Fatalf("listed %+v, want name %q, active, with a creation time", a, want[a.AccountID])
+		}
+		delete(want, a.AccountID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("accounts missing from the listing: %v", want)
+	}
+}

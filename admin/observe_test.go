@@ -586,6 +586,8 @@ var auditedRoutes = map[string]string{
 	"POST /presign":                  "presign.issue",
 	"DELETE /quarantine":             "quarantine.purge_all", // adminRoutes sends mode=all
 	"POST /quarantine/revalidate":    "quarantine.revalidate",
+	"POST /buckets":                  "bucket.create",
+	"DELETE /buckets/{name}":         "bucket.delete",
 	"PUT /buckets/{name}/policy":     "bucket.policy.put",
 	"DELETE /buckets/{name}/policy":  "bucket.policy.delete",
 	"PUT /buckets/{name}/visibility": "bucket.visibility.put",
@@ -668,6 +670,29 @@ func TestAudit_RecordsTheIDsItCreated(t *testing.T) {
 	}
 
 	o.log.Reset()
+	w = o.do(t, http.MethodPost, "/_jay/buckets",
+		`{"name":"audited-bucket","owner_account_id":"`+account.AccountID+`"}`, adminBearer, defaultRemote)
+	requireStatus(t, w, http.StatusCreated)
+	audit = requireOneAccessAndOneAudit(t, o.lines(t), w)
+	created, err := o.db.GetBucket("audited-bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.str("action") != "bucket.create" || audit.str("bucket") != "audited-bucket" ||
+		audit.str("bucket_id") != created.ID || audit.str("owner_account_id") != account.AccountID {
+		t.Fatalf("bucket.create audit line = %v, created bucket %+v", audit, created)
+	}
+
+	o.log.Reset()
+	w = o.do(t, http.MethodDelete, "/_jay/buckets/audited-bucket", "", adminBearer, defaultRemote)
+	requireStatus(t, w, http.StatusNoContent)
+	audit = requireOneAccessAndOneAudit(t, o.lines(t), w)
+	if audit.str("action") != "bucket.delete" || audit.str("bucket") != "audited-bucket" ||
+		audit.str("bucket_id") != created.ID {
+		t.Fatalf("bucket.delete audit line = %v, deleted bucket %s", audit, created.ID)
+	}
+
+	o.log.Reset()
 	w = o.do(t, http.MethodDelete, "/_jay/quarantine", o.quarantineBody(sickKey), adminBearer, defaultRemote)
 	requireStatus(t, w, http.StatusNoContent)
 	audit = requireOneAccessAndOneAudit(t, o.lines(t), w)
@@ -688,6 +713,10 @@ func TestAudit_AFailedChangeWritesNoAuditLine(t *testing.T) {
 		{"revoke of an unknown token", http.MethodDelete, "/_jay/tokens/nope", "", http.StatusNotFound},
 		{"presign for an unknown token", http.MethodPost, "/_jay/presign", `{"token_id":"nope","method":"GET","bucket":"b"}`, http.StatusBadRequest},
 		{"purge of an active object", http.MethodDelete, "/_jay/quarantine", `{"bucket_id":"x","key":"y"}`, http.StatusNotFound},
+		{"bucket for no account", http.MethodPost, "/_jay/buckets", `{"name":"valid-name","owner_account_id":"ghost"}`, http.StatusBadRequest},
+		{"bucket that exists", http.MethodPost, "/_jay/buckets", `{"name":"` + ctlBucket + `","owner_account_id":"x"}`, http.StatusBadRequest},
+		{"delete of a bucket with objects", http.MethodDelete, "/_jay/buckets/" + ctlBucket, "", http.StatusConflict},
+		{"delete of a missing bucket", http.MethodDelete, "/_jay/buckets/nope-nope", "", http.StatusNotFound},
 		{"an inert policy", http.MethodPut, "/_jay/buckets/" + ctlBucket + "/policy", `{"statements":[]}`, http.StatusBadRequest},
 		{"an unknown visibility", http.MethodPut, "/_jay/buckets/" + ctlBucket + "/visibility", `{"visibility":"open"}`, http.StatusBadRequest},
 	} {
@@ -790,5 +819,103 @@ func TestAudit_ThePresignedURLNeverReachesTheLog(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AuthenticateAdminToken: the web console's login shares the listener's backoff
+// ---------------------------------------------------------------------------
+
+func (o *observed) login(candidate, remoteAddr string) CredentialResult {
+	req := httptest.NewRequest(http.MethodPost, "http://jay.test/console/api/session", nil)
+	req.RemoteAddr = remoteAddr
+	return o.admin.AuthenticateAdminToken(req, candidate)
+}
+
+func TestAuthenticateAdminToken_AcceptsOnlyTheAdminTokenAndClearsFailures(t *testing.T) {
+	o := newObserved(t, slog.LevelInfo, func(c *AdminConfig) { c.MetricsToken = testMetricsToken })
+	const source = "192.0.2.210:1"
+
+	for range maxAuthFailures - 1 {
+		if got := o.login("guess", source); got != CredentialRejected {
+			t.Fatalf("a wrong token = %v, want CredentialRejected", got)
+		}
+	}
+	if got := o.login(testMetricsToken, source); got != CredentialRejected {
+		t.Fatalf("the metrics token = %v, want CredentialRejected: it is not an admin credential", got)
+	}
+	// The metrics token above was the fifth failure: the address is locked out,
+	// so even the right token is refused until the window passes.
+	if got := o.login(testAdminToken, source); got != CredentialLockedOut {
+		t.Fatalf("the admin token after %d failures = %v, want CredentialLockedOut", maxAuthFailures, got)
+	}
+
+	// Under the limit the right token is accepted and wipes the count: a full
+	// set of fresh failures is needed to lock the address again.
+	const other = "192.0.2.211:1"
+	for range maxAuthFailures - 1 {
+		o.login("guess", other)
+	}
+	if got := o.login(testAdminToken, other); got != CredentialAccepted {
+		t.Fatalf("the admin token = %v, want CredentialAccepted", got)
+	}
+	for range maxAuthFailures - 1 {
+		o.login("guess", other)
+	}
+	if got := o.login(testAdminToken, other); got != CredentialAccepted {
+		t.Fatalf("the accepted login did not clear the failure count: %v", got)
+	}
+}
+
+// The backoff is ONE counter: failures at the login lock the address out of
+// /_jay too, and failures on /_jay lock it out of the login. A login with its
+// own counter would give an attacker a second set of guesses.
+func TestAuthenticateAdminToken_SharesTheBackoffWithTheAdminAPI(t *testing.T) {
+	o := newObserved(t, slog.LevelInfo, nil)
+	const source = "192.0.2.220:1"
+	const elsewhere = "192.0.2.221:1"
+	before := o.metrics.AdminAuthFailures.Load()
+
+	for range maxAuthFailures {
+		if got := o.login("guess", source); got != CredentialRejected {
+			t.Fatalf("a wrong token = %v, want CredentialRejected", got)
+		}
+	}
+	if got := o.metrics.AdminAuthFailures.Load() - before; got != maxAuthFailures {
+		t.Fatalf("admin auth failures moved by %d, want %d: the login does not use the shared metric", got, maxAuthFailures)
+	}
+
+	// The correct bearer on /_jay from the locked address is a 401.
+	if w := o.do(t, http.MethodGet, "/_jay/tokens", "", adminBearer, source); w.Code != http.StatusUnauthorized {
+		t.Fatalf("login failures did not lock the address out of /_jay: %d", w.Code)
+	}
+	if got := o.login(testAdminToken, source); got != CredentialLockedOut {
+		t.Fatalf("the locked address logging in with the right token = %v, want CredentialLockedOut", got)
+	}
+	// Another address is unaffected, in both directions.
+	if w := o.do(t, http.MethodGet, "/_jay/tokens", "", adminBearer, elsewhere); w.Code != http.StatusOK {
+		t.Fatalf("another address was locked out too: %d", w.Code)
+	}
+	if got := o.login(testAdminToken, elsewhere); got != CredentialAccepted {
+		t.Fatalf("another address cannot log in: %v", got)
+	}
+
+	// And the other way round: failures on /_jay count at the login.
+	const third = "192.0.2.222:1"
+	for range maxAuthFailures {
+		_ = o.do(t, http.MethodGet, "/_jay/tokens", "", "Bearer guess", third)
+	}
+	if got := o.login(testAdminToken, third); got != CredentialLockedOut {
+		t.Fatalf("failures on /_jay did not lock the login: %v", got)
+	}
+}
+
+// An unconfigured admin token must never be matched by an empty candidate.
+func TestAuthenticateAdminToken_AnEmptyCandidateIsRejected(t *testing.T) {
+	o := newObserved(t, slog.LevelInfo, nil)
+	for i, candidate := range []string{"", " ", testAdminToken + " ", " " + testAdminToken} {
+		if got := o.login(candidate, remote(300+i)); got != CredentialRejected {
+			t.Fatalf("candidate %q = %v, want CredentialRejected", candidate, got)
+		}
 	}
 }

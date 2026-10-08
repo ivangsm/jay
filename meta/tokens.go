@@ -32,6 +32,13 @@ func (db *DB) GetAccount(id string) (*Account, error) {
 	return db.getRecord[Account](bucketAccounts, id, ErrAccountNotFound)
 }
 
+// ListAccounts returns every account. The order is bbolt's key order (the
+// account id), which means nothing to a caller; one that shows the list to a
+// person sorts it.
+func (db *DB) ListAccounts() ([]Account, error) {
+	return db.listRecords(bucketAccounts, func(*Account) bool { return true })
+}
+
 // CreateToken stores a new token in bbolt. The caller passes a Token with
 // a plaintext SecretKey; it is encrypted before being persisted.
 func (db *DB) CreateToken(t *Token) error {
