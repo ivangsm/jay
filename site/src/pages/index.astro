@@ -6,16 +6,161 @@ import '@fontsource/ibm-plex-mono/latin-500.css';
 
 const base = import.meta.env.BASE_URL;
 const github = 'https://github.com/ivangsm/jay';
-const title = 'Jay — object storage that never lies about what it stored';
+const title = 'Jay — your own S3, in one binary';
 const description =
-  'An embedded object store in Go. An S3-compatible HTTP API and a binary protocol share one authorization layer, one metadata file and one static binary.';
+  'Jay is open-source object storage you host yourself. Store files with the S3 API you already use, on your own server, with no database and nothing else to run.';
 
-// The frame header is 17 bytes. The cells are sized to the real byte widths.
-const frameFields = [
-  { name: 'op', bytes: 1, note: 'opcode or status' },
-  { name: 'stream_id', bytes: 4, note: 'multiplexing' },
-  { name: 'meta_len', bytes: 4, note: 'header size' },
-  { name: 'data_len', bytes: 8, note: 'payload size' },
+// The landing page sells the idea; the mechanics (frame layout, fsync order,
+// status codes, benchmark tables) live in the docs. Keep jargon out of this file.
+
+// The hero demo: the same upload through every door into the same store.
+// `code` is pre-highlighted HTML; `copy` is what the Copy button puts on the
+// clipboard, without prompts or output.
+const demos = [
+  {
+    id: 'cli',
+    label: 'AWS CLI',
+    file: 'terminal',
+    code: `<span class="p">$</span> export AWS_ENDPOINT_URL=http://localhost:9000
+<span class="p">$</span> aws s3 mb s3://photos
+<span class="o">make_bucket: photos</span>
+<span class="p">$</span> aws s3 cp cat.jpg s3://photos/
+<span class="o">upload: ./cat.jpg to s3://photos/cat.jpg</span>`,
+    copy: `export AWS_ENDPOINT_URL=http://localhost:9000
+aws s3 mb s3://photos
+aws s3 cp cat.jpg s3://photos/`,
+    note: 'Your existing S3 tools work unchanged. Only the endpoint is new.',
+  },
+  {
+    id: 'python',
+    label: 'Python',
+    file: 'upload.py',
+    code: `<span class="k">import</span> boto3
+
+s3 = boto3.client(<span class="s">"s3"</span>, endpoint_url=<span class="s">"http://localhost:9000"</span>)
+s3.create_bucket(Bucket=<span class="s">"photos"</span>)
+s3.upload_file(<span class="s">"cat.jpg"</span>, <span class="s">"photos"</span>, <span class="s">"cat.jpg"</span>)`,
+    copy: `import boto3
+
+s3 = boto3.client("s3", endpoint_url="http://localhost:9000")
+s3.create_bucket(Bucket="photos")
+s3.upload_file("cat.jpg", "photos", "cat.jpg")`,
+    note: 'boto3 and the AWS SDKs connect like they would to Amazon S3.',
+  },
+  {
+    id: 'go',
+    label: 'Go client',
+    file: 'main.go',
+    code: `<span class="c">// The native protocol: no HTTP, no XML, no re-hashing.</span>
+c, err := client.Dial(ctx, <span class="s">"localhost:4444"</span>, tokenID, secret)
+<span class="k">if</span> err != <span class="k">nil</span> { log.Fatal(err) }
+<span class="k">defer</span> c.Close()
+
+c.CreateBucket(ctx, <span class="s">"photos"</span>)
+c.PutObject(ctx, <span class="s">"photos"</span>, <span class="s">"cat.jpg"</span>, f, size, <span class="k">nil</span>)`,
+    copy: `c, err := client.Dial(ctx, "localhost:4444", tokenID, secret)
+if err != nil { log.Fatal(err) }
+defer c.Close()
+
+c.CreateBucket(ctx, "photos")
+c.PutObject(ctx, "photos", "cat.jpg", f, size, nil)`,
+    note: 'From Go, a faster binary protocol on the same server and the same data.',
+  },
+  {
+    id: 'embedded',
+    label: 'Embedded',
+    file: 'main.go',
+    code: `<span class="c">// No server at all: the same engine, inside your program.</span>
+s, err := jay.Open(<span class="s">"./data"</span>)
+<span class="k">if</span> err != <span class="k">nil</span> { log.Fatal(err) }
+<span class="k">defer</span> s.Close()
+
+s.CreateBucket(ctx, <span class="s">"photos"</span>)
+s.Put(ctx, <span class="s">"photos"</span>, <span class="s">"cat.jpg"</span>, f, <span class="k">nil</span>)`,
+    copy: `s, err := jay.Open("./data")
+if err != nil { log.Fatal(err) }
+defer s.Close()
+
+s.CreateBucket(ctx, "photos")
+s.Put(ctx, "photos", "cat.jpg", f, nil)`,
+    note: 'Or skip the server: import Jay as a Go package and keep it in-process.',
+  },
+];
+
+const tools = ['AWS CLI', 'boto3', 'AWS SDKs', 'Go', 'Docker'];
+
+const features = [
+  {
+    title: 'S3, without changing your code',
+    body: 'Buckets, uploads, downloads, listings, multipart and presigned links all speak the S3 API. Point your app at a new endpoint and it keeps working.',
+    icon: 'M7 18a5 5 0 1 1 .9-9.9A6 6 0 0 1 19 10a4 4 0 0 1 0 8z',
+  },
+  {
+    title: 'Up to 5× faster from Go',
+    body: 'Go services can use a lightweight binary protocol instead of HTTP. Same server, same files, a fraction of the overhead.',
+    icon: 'M13 2 3 14h8l-1 8 10-12h-8l1-8z',
+  },
+  {
+    title: 'Or embed it as a library',
+    body: 'Import Jay into your Go program and get the whole storage engine in-process. No network, no tokens, nothing to deploy.',
+    icon: 'M21 8 12 3 3 8v8l9 5 9-5zM3 8l9 5 9-5M12 13v8',
+  },
+  {
+    title: 'Files that stay intact',
+    body: 'Every object is checksummed on the way in and re-checked in the background. A crash mid-upload never leaves a half-written file behind.',
+    icon: 'M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6zM9 12l2 2 4-4',
+  },
+  {
+    title: 'Keys with exactly the access they need',
+    body: 'Give each app or teammate its own key, limited to certain buckets, folders and actions. Share files with links that expire.',
+    icon: 'M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4',
+  },
+  {
+    title: 'Nothing else to run',
+    body: 'No database, no message queue, no cluster. Everything Jay knows lives in one folder you can copy, inspect and back up.',
+    icon: 'M3 6h6l2 2h10v11H3z',
+  },
+];
+
+const extras = [
+  'Multipart uploads',
+  'Range reads',
+  'Server-side copy',
+  'Hourly metadata backups',
+  'Health checks',
+  'Metrics and JSON logs',
+  'TLS',
+  'Linux and macOS binaries',
+];
+
+// Time per request, lower is better. From the performance page.
+const bench = [
+  { label: 'Read a small file', s3: 81.3, native: 38.9, unit: 'µs', ratio: '2.1×' },
+  { label: 'Look up a file’s details', s3: 59.8, native: 27.0, unit: 'µs', ratio: '2.2×' },
+  { label: 'Small reads, 16 at once', s3: 26.3, native: 5.0, unit: 'µs', ratio: '5.2×' },
+];
+
+const useCases = [
+  {
+    title: 'Your app’s uploads',
+    body: 'Avatars, attachments and documents, stored next to the app instead of on a third-party bill.',
+    icon: 'M12 16V4M7 9l5-5 5 5M4 20h16',
+  },
+  {
+    title: 'Build and CI caches',
+    body: 'Fast, local artifact and cache storage that any S3-aware tool already knows how to use.',
+    icon: 'M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5',
+  },
+  {
+    title: 'Media backends',
+    body: 'Photos and video for a site or an image server, served with range reads straight from disk.',
+    icon: 'M3 5h18v14H3zM3 16l5-5 4 4 3-3 6 6',
+  },
+  {
+    title: 'S3 for development and tests',
+    body: 'A real S3 endpoint on your laptop and in CI, in one container that starts in seconds.',
+    icon: 'M4 5h16v14H4zM8 10l2 2-2 2M13 14h3',
+  },
 ];
 ---
 
@@ -42,209 +187,217 @@ const frameFields = [
         <span class="wordmark-text">jay</span>
       </a>
       <nav aria-label="Main">
-        <a href={`${base}quickstart/`}>Quickstart</a>
-        <a href={`${base}reference/s3-compatibility/`}>S3 API</a>
-        <a href={`${base}internals/performance/`}>Benchmarks</a>
-        <a href={github} rel="noopener">GitHub</a>
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href={`${base}what-jay-is/`}>Docs</a>
+        <a class="nav-gh" href={github} rel="noopener">GitHub</a>
       </nav>
     </header>
 
     <main id="main">
       <section class="hero">
         <div class="hero-copy">
-          <h1>Object storage that never lies about what it stored.</h1>
+          <p class="eyebrow">Open-source object storage</p>
+          <h1>Your own S3.<br /><span>In one binary.</span></h1>
           <p class="lede">
-            Jay is an embedded object store written in Go. An S3-compatible HTTP API
-            and a binary protocol run on the same server, over one authorization
-            layer, one metadata file and one static binary.
+            Jay stores your files behind the same S3 API your tools already
+            speak — on your own server, with no database and nothing else to
+            run. Start it in a minute, keep it for years.
           </p>
           <div class="actions">
             <a class="btn btn-primary" href={`${base}quickstart/`}>Get started</a>
-            <a class="btn" href={github} rel="noopener">Read the source</a>
+            <a class="btn" href={github} rel="noopener">View on GitHub</a>
           </div>
-          <div class="run">
-            <pre><code>docker run -p 9000:9000 -v jay-data:/data \
-  -e JAY_ADMIN_TOKEN=$(openssl rand -hex 32) \
-  -e JAY_SIGNING_SECRET=$(openssl rand -hex 32) \
-  ghcr.io/ivangsm/jay:latest</code></pre>
-            <button type="button" class="copy" data-copy>Copy</button>
-          </div>
+          <p class="fine">Free and open source (MIT) · No database to set up · Linux and macOS</p>
         </div>
 
-        <figure class="frame">
-          <figcaption>Native protocol frame header</figcaption>
-          <div class="frame-handshake">
-            <span>4A</span><span>41</span><span>59</span><span>00</span>
-            <em>magic — "JAY\0"</em>
+        <figure class="demo" data-demo>
+          <div class="demo-bar">
+            <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <div class="tabs" role="tablist" aria-label="Ways to talk to Jay">
+              {demos.map((d, i) => (
+                <button
+                  type="button"
+                  role="tab"
+                  class="tab"
+                  id={`tab-${d.id}`}
+                  aria-controls={`panel-${d.id}`}
+                  aria-selected={i === 0 ? 'true' : 'false'}
+                  tabindex={i === 0 ? 0 : -1}
+                >
+                  {d.label}
+                </button>
+              ))}
+            </div>
           </div>
-          <div class="frame-cells">
-            {frameFields.map((f) => (
-              <div class="cell" style={`--w:${f.bytes}`}>
-                <span class="cell-name">{f.name}</span>
-                <span class="cell-bytes">{f.bytes}B</span>
-                <span class="cell-note">{f.note}</span>
+          {demos.map((d, i) => (
+            <div
+              class="panel"
+              role="tabpanel"
+              id={`panel-${d.id}`}
+              aria-labelledby={`tab-${d.id}`}
+              hidden={i !== 0}
+            >
+              <div class="panel-head">
+                <span class="file">{d.file}</span>
+                <button type="button" class="copy" data-copy={d.copy}>Copy</button>
               </div>
-            ))}
-          </div>
-          <div class="frame-rule"><span>17 bytes, big-endian, then meta, then body</span></div>
+              <pre><code set:html={d.code} /></pre>
+              <p class="panel-note">{d.note}</p>
+            </div>
+          ))}
+          <figcaption>One store, four ways in. Every one of them reaches the same buckets.</figcaption>
         </figure>
       </section>
 
-      <section class="facts">
-        <dl>
-          <div><dt>Direct dependencies</dt><dd>4</dd></div>
-          <div><dt>Runtime services</dt><dd>0</dd></div>
-          <div><dt>Metadata files</dt><dd>1</dd></div>
-          <div><dt>License</dt><dd>MIT</dd></div>
-        </dl>
+      <section class="tools" aria-label="Works with">
+        <p>Works with the tools you already use</p>
+        <ul>
+          {tools.map((t) => <li>{t}</li>)}
+        </ul>
       </section>
 
-      <section class="band">
-        <h2>Two protocols. One authorization layer.</h2>
-        <p class="band-lede">
-          Reach for the S3 API when you want your existing SDK, CLI or tool to
-          work unchanged. Reach for the native protocol when the client is Go and
-          the overhead of HTTP, XML and re-hashing the body is the thing you are
-          paying for. Both land in <code>internal/objops</code>, so a permission
-          check cannot be right on one path and wrong on the other.
-        </p>
-        <div class="split">
-          <div class="split-half">
-            <h3>S3 over HTTP</h3>
-            <pre><code>aws s3 cp ./photo.jpg s3://media/photo.jpg \
-  --endpoint-url http://localhost:9000</code></pre>
-            <p>SigV4 or bearer tokens, presigned URLs, multipart, range reads.</p>
-          </div>
-          <div class="split-half">
-            <h3>Native protocol</h3>
-            <pre><code>c, _ := client.Dial(addr, tokenID, secret, 8)
-defer c.Close()
-
-c.PutObject(ctx, "media", "photo.jpg", r, size)</code></pre>
-            <p>Pooled connections, binary encoding, size-scaled deadlines.</p>
-          </div>
-        </div>
-      </section>
-
-      <section class="band band-alt" id="performance">
-        <h2>Reads never leave the kernel.</h2>
-        <p class="band-lede">
-          <code>GetObject</code> hands the open file to <code>sendfile(2)</code> on
-          both transports, so the bytes go from page cache to socket without a
-          trip through userspace. That is also why a read does not re-verify its
-          checksum: hashing on the way out would mean copying every byte back
-          into the process. Verification is the scrubber's job, on a throttled
-          background pass, where it costs nothing on the hot path.
-        </p>
-        <table class="bench">
-          <caption>Measured on a 16-thread Ryzen 7 desktop. Ratios transfer; absolute numbers are this machine's.</caption>
-          <thead>
-            <tr>
-              <th scope="col">Operation</th>
-              <th scope="col">S3 over HTTP</th>
-              <th scope="col">Native</th>
-              <th scope="col">Difference</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><th scope="row">GetObject, 10 MB</th><td>5.5 GB/s</td><td>7.5 GB/s</td><td class="ratio">1.36&times;</td></tr>
-            <tr><th scope="row">GetObject, 1 KB</th><td>81.3 &micro;s</td><td>38.9 &micro;s</td><td class="ratio">2.09&times;</td></tr>
-            <tr><th scope="row">HeadObject</th><td>59.8 &micro;s</td><td>27.0 &micro;s</td><td class="ratio">2.21&times;</td></tr>
-            <tr><th scope="row">GetObject 1 KB, 16 in flight</th><td>26.3 &micro;s</td><td>5.0 &micro;s</td><td class="ratio">5.23&times;</td></tr>
-            <tr><th scope="row">PutObject, 10 MB (<code>SkipETag</code>)</th><td>23.0 ms</td><td>10.8 ms</td><td class="ratio">2.13&times;</td></tr>
-          </tbody>
-        </table>
-        <p class="band-foot">
-          Writes get the same treatment: <code>PutOptions.SkipETag</code> drops
-          the MD5 checksum S3 is required to compute but the native protocol
-          isn't — MD5 has no hardware acceleration on this CPU, and costs
-          roughly twice what the SHA-256 Jay always computes does. Skip it and
-          native wins at every size measured, with the margin <em>growing</em>
-          instead of shrinking as objects get bigger — up to 5.2&times; with 16
-          requests in flight, because a smaller fixed cost per connection gets
-          paid more often as concurrency rises.
-          <a href={`${base}internals/performance/`}>The full table, and how to reproduce it</a>.
-        </p>
-      </section>
-
-      <section class="band">
-        <h2>Compatibility you can check.</h2>
-        <p class="band-lede">
-          "S3-compatible" here is a list, not an adjective. Everything Jay
-          implements is exercised in CI against the real aws-cli, MinIO's
-          <code>mc</code> and <code>warp</code> — and if a tool is missing, the run
-          exits non-zero rather than reporting a pass it never made. Everything
-          Jay does not implement answers <strong>501</strong>. It never answers 200
-          and quietly drops your data.
-        </p>
-        <div class="two-col">
-          <div>
-            <h3>Implemented</h3>
-            <p>
-              Buckets, objects, <code>CopyObject</code>, <code>ListObjectsV2</code>,
-              batch <code>DeleteObjects</code>, the full multipart lifecycle,
-              range reads and presigned URLs in both the SigV4 and Jay forms.
-            </p>
-          </div>
-          <div>
-            <h3>Answers 501</h3>
-            <p>
-              Versioning, ACLs, tagging, lifecycle, CORS, policy endpoints,
-              encryption, object lock, <code>GetObjectAttributes</code>,
-              <code>SelectObjectContent</code> and <code>aws-chunked</code> bodies.
-            </p>
-          </div>
-        </div>
-        <p class="band-foot">
-          <a href={`${base}reference/s3-compatibility/`}>See the full compatibility table</a>
-        </p>
-      </section>
-
-      <section class="band band-alt">
-        <h2>What a write actually does.</h2>
-        <p class="band-lede">
-          Durability here is an ordering, not a promise. Each step is on disk
-          before the next one starts, and a crash anywhere in the middle is
-          recoverable because the evidence survives.
+      <section class="section" id="how">
+        <p class="kicker">How it works</p>
+        <h2>From nothing to a stored file in about a minute.</h2>
+        <p class="section-lede">
+          No cluster to plan, no database to provision, no migrations. One
+          container and a folder for your data.
         </p>
         <ol class="steps">
           <li>
-            <h3>Write to a temporary file</h3>
-            <p>SHA-256 is computed in the same pass, along with any checksum the client declared.</p>
+            <span class="step-n">1</span>
+            <h3>Start one container</h3>
+            <p>Give it a volume and two secrets. That is the whole setup.</p>
+            <code class="step-code">docker run … ghcr.io/ivangsm/jay</code>
           </li>
           <li>
-            <h3>fsync the temporary file</h3>
-            <p>If the declared digest does not match, the write stops here and nothing is committed.</p>
+            <span class="step-n">2</span>
+            <h3>Create a key</h3>
+            <p>Mint a key for your app and choose exactly what it is allowed to do.</p>
+            <code class="step-code">POST /_jay/tokens</code>
           </li>
           <li>
-            <h3>Rename into place</h3>
-            <p>Atomic. There is never a partially visible object under the final key.</p>
-          </li>
-          <li>
-            <h3>fsync the parent directory</h3>
-            <p>The rename itself is now durable, not just the bytes it points at.</p>
-          </li>
-          <li>
-            <h3>Commit metadata in one bbolt transaction</h3>
-            <p>The object record and the bucket's statistics move together, or neither moves.</p>
+            <span class="step-n">3</span>
+            <h3>Point your S3 client at it</h3>
+            <p>Change the endpoint in your app or CLI. Everything else stays the same.</p>
+            <code class="step-code">--endpoint-url http://localhost:9000</code>
           </li>
         </ol>
-        <p class="band-foot">
-          Crash between the file and the record and startup recovery finds the
-          mismatch and <strong>quarantines</strong> it. Jay never deletes an
-          inconsistency: it is the only evidence of whatever went wrong.
+      </section>
+
+      <section class="section" id="features">
+        <p class="kicker">Features</p>
+        <h2>Everything you need from object storage. Nothing you have to babysit.</h2>
+        <div class="grid">
+          {features.map((f) => (
+            <article class="card">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d={f.icon} /></svg>
+              <h3>{f.title}</h3>
+              <p>{f.body}</p>
+            </article>
+          ))}
+        </div>
+        <ul class="extras" aria-label="Also included">
+          {extras.map((e) => <li>{e}</li>)}
+        </ul>
+      </section>
+
+      <section class="section speed">
+        <div class="speed-copy">
+          <p class="kicker">Performance</p>
+          <h2>Fast over S3. Faster over its own protocol.</h2>
+          <p class="section-lede">
+            Reads go straight from disk to the network without passing through
+            the program. And when the caller is Go, the native protocol drops
+            HTTP and XML altogether — the busier the server, the bigger the gap.
+          </p>
+          <a class="more" href={`${base}internals/performance/`}>See every benchmark and how to reproduce it →</a>
+        </div>
+        <figure class="bars">
+          <figcaption>
+            Time per request, lower is better
+            <span class="legend"><i class="sw sw-s3"></i>S3 API <i class="sw sw-native"></i>Native</span>
+          </figcaption>
+          {bench.map((b) => (
+            <div class="bar-row">
+              <div class="bar-label">
+                <span>{b.label}</span>
+                <b>{b.ratio} faster</b>
+              </div>
+              <div class="bar" style="--v:1">
+                <span class="bar-fill s3"></span>
+                <span class="bar-val">{b.s3.toFixed(1)} {b.unit}</span>
+              </div>
+              <div class="bar" style={`--v:${b.native / b.s3}`}>
+                <span class="bar-fill native"></span>
+                <span class="bar-val">{b.native.toFixed(1)} {b.unit}</span>
+              </div>
+            </div>
+          ))}
+          <p class="bars-foot">Measured on a 16-thread Ryzen 7 desktop.</p>
+        </figure>
+      </section>
+
+      <section class="section">
+        <p class="kicker">Made for</p>
+        <h2>Anywhere you would reach for S3.</h2>
+        <div class="uses">
+          {useCases.map((u) => (
+            <article class="use">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d={u.icon} /></svg>
+              <div>
+                <h3>{u.title}</h3>
+                <p>{u.body}</p>
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section class="section why">
+        <p class="kicker">Why Jay</p>
+        <h2>Small on purpose. Honest about it.</h2>
+        <div class="why-grid">
+          <div>
+            <h3>You own everything</h3>
+            <p>
+              Your files live on your disk, in a folder you can see. No
+              per-request bill, no egress fees, no lock-in.
+            </p>
+          </div>
+          <div>
+            <h3>No silent surprises</h3>
+            <p>
+              If Jay does not support something, it says so with a clear error.
+              It never pretends a request worked and quietly drops your data.
+            </p>
+          </div>
+          <div>
+            <h3>Know where it stops</h3>
+            <p>
+              One server, not a cluster: no replication or versioning. If you
+              need those, Jay will tell you upfront instead of half-doing them.
+            </p>
+          </div>
+        </div>
+        <p class="why-links">
+          <a href={`${base}what-jay-is/`}>What Jay is, and is not →</a>
+          <a href={`${base}reference/s3-compatibility/`}>Full S3 compatibility list →</a>
         </p>
       </section>
 
       <section class="cta">
-        <h2>Run it in about a minute.</h2>
-        <p>
-          One container, two secrets, a volume. No database to provision, no
-          broker to point it at, nothing to migrate.
-        </p>
-        <div class="actions">
-          <a class="btn btn-primary" href={`${base}quickstart/`}>Quickstart</a>
-          <a class="btn" href={`${base}what-jay-is/`}>What Jay is and is not</a>
+        <div class="cta-inner">
+          <h2>Run your own S3 in about a minute.</h2>
+          <p>
+            One container, two secrets, a volume. Try it on your laptop today
+            and move it to production when you are ready.
+          </p>
+          <div class="actions">
+            <a class="btn btn-primary" href={`${base}quickstart/`}>Get started</a>
+            <a class="btn" href={github} rel="noopener">Star on GitHub</a>
+          </div>
         </div>
       </section>
     </main>
@@ -252,23 +405,49 @@ c.PutObject(ctx, "media", "photo.jpg", r, size)</code></pre>
     <footer class="foot">
       <p>MIT licensed. Built by <a href="https://github.com/ivangsm" rel="noopener">Iván Salazar</a>.</p>
       <nav aria-label="Footer">
+        <a href={`${base}quickstart/`}>Quickstart</a>
         <a href={`${base}what-jay-is/`}>Docs</a>
+        <a href={`${base}reference/s3-compatibility/`}>S3 API</a>
         <a href={`${base}internals/limits/`}>Limits</a>
         <a href={github} rel="noopener">GitHub</a>
       </nav>
     </footer>
 
     <script>
-      document.querySelector('[data-copy]')?.addEventListener('click', async (e) => {
-        const btn = e.currentTarget as HTMLButtonElement;
-        const code = btn.parentElement?.querySelector('code')?.textContent ?? '';
-        try {
-          await navigator.clipboard.writeText(code);
-          btn.textContent = 'Copied';
-        } catch {
-          btn.textContent = 'Press ⌘C';
-        }
-        setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+      const demo = document.querySelector('[data-demo]');
+      if (demo) {
+        const tabs = Array.from(demo.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+        const select = (tab: HTMLButtonElement) => {
+          tabs.forEach((t) => {
+            const on = t === tab;
+            t.setAttribute('aria-selected', String(on));
+            t.tabIndex = on ? 0 : -1;
+            const panel = document.getElementById(t.getAttribute('aria-controls') ?? '');
+            if (panel) panel.hidden = !on;
+          });
+        };
+        tabs.forEach((tab, i) => {
+          tab.addEventListener('click', () => select(tab));
+          tab.addEventListener('keydown', (e) => {
+            const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+            if (!step) return;
+            const next = tabs[(i + step + tabs.length) % tabs.length];
+            select(next);
+            next.focus();
+          });
+        });
+      }
+
+      document.querySelectorAll<HTMLButtonElement>('[data-copy]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(btn.dataset.copy ?? '');
+            btn.textContent = 'Copied';
+          } catch {
+            btn.textContent = 'Press ⌘C';
+          }
+          setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+        });
       });
     </script>
   </body>
@@ -282,19 +461,21 @@ c.PutObject(ctx, "media", "photo.jpg", r, size)</code></pre>
 		--blue: #2e7de9;
 		--blue-bright: #4a90f0;
 		--blue-deep: #1f63cb;
-		--blue-deeper: #164f9f;
 		--sky: #7fc4e8;
 		--tan: #ebca9a;
 		--paper: #f2f6fb;
+		--text-2: #c3d2e6;
 		--muted: #93a8c4;
 		--line: #1b3559;
-		--measure: 68ch;
+		--code-bg: #061529;
+		--radius: 14px;
+		--wrap: 1140px;
 		color-scheme: dark;
 	}
 
 	* { box-sizing: border-box; }
 
-	html { -webkit-text-size-adjust: 100%; }
+	html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
 
 	body {
 		margin: 0;
@@ -303,12 +484,13 @@ c.PutObject(ctx, "media", "photo.jpg", r, size)</code></pre>
 		font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
 		font-size: 16px;
 		line-height: 1.6;
+		overflow-x: hidden;
 	}
 
 	a { color: var(--sky); text-decoration-thickness: 1px; text-underline-offset: 3px; }
 	a:hover { color: var(--paper); }
-	code { font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 0.92em; }
-	h1, h2, h3 { font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; }
+	code, pre { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+	h1, h2, h3 { font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; text-wrap: balance; }
 
 	:focus-visible { outline: 2px solid var(--sky); outline-offset: 3px; }
 
@@ -321,8 +503,8 @@ c.PutObject(ctx, "media", "photo.jpg", r, size)</code></pre>
 	/* ---------- top bar ---------- */
 	.topbar {
 		display: flex; align-items: center; justify-content: space-between;
-		gap: 2rem; flex-wrap: wrap;
-		max-width: 1140px; margin: 0 auto; padding: 1.25rem 1.5rem;
+		gap: 1rem 2rem; flex-wrap: wrap;
+		max-width: var(--wrap); margin: 0 auto; padding: 1.25rem 1.5rem;
 	}
 	.wordmark { display: flex; align-items: center; gap: 0.6rem; text-decoration: none; color: var(--paper); }
 	.wordmark-text { font-size: 1.35rem; font-weight: 600; letter-spacing: -0.04em; }
@@ -332,213 +514,270 @@ c.PutObject(ctx, "media", "photo.jpg", r, size)</code></pre>
 		background:
 			linear-gradient(150deg, var(--sky) 0 50%, transparent 50%),
 			linear-gradient(30deg, var(--blue) 0 50%, #1a5cbe 50%);
-		border-radius: 4px;
+		border-radius: 6px;
 	}
-	.topbar nav { display: flex; gap: 1.5rem; font-size: 0.9375rem; flex-wrap: wrap; }
+	.topbar nav { display: flex; align-items: center; gap: 1.5rem; font-size: 0.9375rem; flex-wrap: wrap; }
 	.topbar nav a { color: var(--muted); text-decoration: none; }
 	.topbar nav a:hover { color: var(--paper); }
+	.topbar nav .nav-gh {
+		color: var(--paper); border: 1px solid var(--navy-3); border-radius: 999px;
+		padding: 0.3rem 0.9rem;
+	}
+	.topbar nav .nav-gh:hover { border-color: var(--blue); }
 
 	/* ---------- hero ---------- */
 	.hero {
-		max-width: 1140px; margin: 0 auto; padding: 4rem 1.5rem 3.5rem;
-		display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 4rem; align-items: center;
+		position: relative;
+		max-width: var(--wrap); margin: 0 auto; padding: 4.5rem 1.5rem 4rem;
+		display: grid; grid-template-columns: 1fr 1.05fr; gap: 4rem; align-items: center;
+	}
+	.hero::before {
+		content: ''; position: absolute; z-index: -1; pointer-events: none;
+		width: min(760px, 100%); aspect-ratio: 1; right: 0; top: -220px;
+		background: radial-gradient(closest-side, rgba(46, 125, 233, 0.3), transparent);
+	}
+	.hero-copy { min-width: 0; }
+	.eyebrow, .kicker {
+		margin: 0 0 1rem; font-size: 0.8125rem; font-weight: 600;
+		letter-spacing: 0.08em; text-transform: uppercase; color: var(--sky);
 	}
 	.hero h1 {
-		font-size: clamp(2.1rem, 4.6vw, 3.4rem);
-		letter-spacing: -0.035em; line-height: 1.03; margin: 0 0 1.25rem;
-		max-width: 17ch;
+		font-size: clamp(2.4rem, 5.4vw, 4rem);
+		letter-spacing: -0.04em; line-height: 1.02; margin: 0 0 1.5rem;
 	}
-	.lede { font-size: 1.0625rem; color: #c3d2e6; margin: 0 0 1.75rem; max-width: 52ch; }
+	.hero h1 span {
+		background: linear-gradient(90deg, var(--sky), var(--blue-bright));
+		-webkit-background-clip: text; background-clip: text; color: transparent;
+	}
+	.lede { font-size: 1.1875rem; color: var(--text-2); margin: 0 0 2rem; max-width: 46ch; }
+	.fine { margin: 1.5rem 0 0; font-size: 0.875rem; color: var(--muted); }
 
 	.actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
 	.btn {
-		display: inline-block; padding: 0.6rem 1.25rem;
-		border: 1px solid var(--navy-3); border-radius: 2px;
-		color: var(--paper); text-decoration: none; font-size: 0.9375rem; font-weight: 500;
-		transition: background-color 0.12s ease, border-color 0.12s ease;
+		display: inline-block; padding: 0.75rem 1.4rem;
+		border: 1px solid var(--navy-3); border-radius: 999px;
+		color: var(--paper); text-decoration: none; font-size: 0.9875rem; font-weight: 600;
+		transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
 	}
-	.btn:hover { background: var(--navy-2); border-color: var(--blue); color: var(--paper); }
+	.btn:hover { background: var(--navy-2); border-color: var(--blue); color: var(--paper); transform: translateY(-1px); }
 	.btn-primary { background: var(--blue-deep); border-color: var(--blue-deep); }
-	.btn-primary:hover { background: var(--blue-deeper); border-color: var(--blue-deeper); }
+	.btn-primary:hover { background: var(--blue); border-color: var(--blue); }
 
-	.run { position: relative; margin-top: 2rem; }
-	.run pre {
-		margin: 0; padding: 1rem 4.5rem 1rem 1rem;
-		background: var(--navy-2); border: 1px solid var(--line); border-radius: 2px;
-		overflow-x: auto; font-size: 0.8125rem; line-height: 1.7;
+	/* ---------- hero demo ---------- */
+	.demo {
+		margin: 0; min-width: 0;
+		background: var(--navy-2); border: 1px solid var(--line);
+		border-radius: var(--radius); overflow: hidden;
+		box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.75);
 	}
-	.run code { font-family: 'IBM Plex Mono', ui-monospace, monospace; color: #cfe0f5; }
+	.demo-bar {
+		display: flex; align-items: center; gap: 0.9rem;
+		padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--line);
+	}
+	.dots { display: flex; gap: 6px; flex: none; }
+	.dots i { width: 10px; height: 10px; border-radius: 50%; background: var(--navy-3); }
+	.tabs { display: flex; gap: 0.35rem; overflow-x: auto; scrollbar-width: none; min-width: 0; }
+	.tabs::-webkit-scrollbar { display: none; }
+	.tab {
+		font: inherit; font-size: 0.8125rem; cursor: pointer; white-space: nowrap;
+		background: transparent; color: var(--muted);
+		border: 1px solid transparent; border-radius: 999px; padding: 0.3rem 0.8rem;
+		transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+	}
+	.tab:hover { color: var(--paper); border-color: var(--navy-3); }
+	.tab[aria-selected='true'] { background: var(--blue-deep); border-color: var(--blue-deep); color: var(--paper); font-weight: 600; }
+
+	.panel { background: var(--code-bg); }
+	.panel-head {
+		display: flex; align-items: center; justify-content: space-between;
+		padding: 0.75rem 1.1rem 0;
+	}
+	.file { font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 0.75rem; color: var(--muted); }
 	.copy {
-		position: absolute; top: 0.6rem; right: 0.6rem;
-		background: var(--navy-3); color: var(--paper);
-		border: 1px solid var(--line); border-radius: 2px;
-		padding: 0.25rem 0.6rem; font: inherit; font-size: 0.75rem; cursor: pointer;
+		background: var(--navy-2); color: var(--text-2);
+		border: 1px solid var(--line); border-radius: 999px;
+		padding: 0.2rem 0.7rem; font: inherit; font-size: 0.75rem; cursor: pointer;
 	}
-	.copy:hover { background: var(--blue); border-color: var(--blue); }
-
-	/* ---------- frame diagram: cell widths are the real byte widths ---------- */
-	.frame { margin: 0.5rem 0 0; }
-	.frame figcaption {
-		font-size: 0.75rem; color: var(--muted); margin-bottom: 0.75rem;
-		font-family: 'IBM Plex Mono', ui-monospace, monospace;
+	.copy:hover { background: var(--blue-deep); border-color: var(--blue-deep); color: var(--paper); }
+	.panel pre {
+		margin: 0; padding: 0.9rem 1.1rem 1.1rem; min-height: 11.5rem;
+		overflow-x: auto; font-size: 0.8125rem; line-height: 1.75; color: #cfe0f5;
 	}
-	.frame-handshake {
-		display: flex; align-items: center; gap: 0.3rem; margin-bottom: 1.25rem;
-		font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 0.8125rem;
+	.panel pre :global(.p) { color: var(--muted); user-select: none; }
+	.panel pre :global(.o) { color: var(--muted); }
+	.panel pre :global(.c) { color: #6a83a3; font-style: italic; }
+	.panel pre :global(.s) { color: var(--tan); }
+	.panel pre :global(.k) { color: var(--sky); }
+	.panel-note {
+		margin: 0; padding: 0.8rem 1.1rem; border-top: 1px solid var(--line);
+		background: var(--navy-2); font-size: 0.875rem; color: var(--text-2);
 	}
-	.frame-handshake span {
-		border: 1px solid var(--line); background: var(--navy-2);
-		padding: 0.3rem 0.5rem; color: var(--sky);
-	}
-	.frame-handshake em { color: var(--muted); font-style: normal; font-size: 0.75rem; margin-left: 0.5rem; }
-
-	.frame-cells {
-		display: grid;
-		grid-template-columns: minmax(2.75rem, 1fr) repeat(16, 1fr);
-		gap: 3px;
-	}
-	.cell {
-		grid-column: span var(--w);
-		border: 1px solid var(--line); border-top: 3px solid var(--blue);
-		background: var(--navy-2);
-		padding: 0.7rem 0.5rem; min-width: 0; overflow: hidden;
-	}
-	.cell:nth-child(1) { border-top-color: var(--tan); }
-	.cell:nth-child(2) { border-top-color: var(--sky); }
-	.cell-name {
-		display: block; font-family: 'IBM Plex Mono', ui-monospace, monospace;
-		font-size: 0.8125rem; color: var(--paper); font-weight: 500;
-		white-space: nowrap; text-overflow: ellipsis; overflow: hidden;
-	}
-	.cell-bytes {
-		display: block; font-family: 'IBM Plex Mono', ui-monospace, monospace;
-		font-size: 0.75rem; color: var(--sky); margin-top: 0.15rem;
-	}
-	.cell-note { display: block; font-size: 0.6875rem; color: var(--muted); margin-top: 0.5rem; }
-	.cell:nth-child(1) { padding-left: 0.3rem; padding-right: 0.3rem; }
-	.cell:nth-child(1) .cell-name { font-size: 0.75rem; }
-	.cell:nth-child(1) .cell-note, .cell:nth-child(1) .cell-bytes { display: none; }
-
-	.frame-rule {
-		margin-top: 0.75rem; padding-top: 0.6rem; border-top: 1px solid var(--line);
-		font-family: 'IBM Plex Mono', ui-monospace, monospace;
-		font-size: 0.75rem; color: var(--muted);
+	.demo figcaption {
+		padding: 0 1.1rem 0.9rem; background: var(--navy-2);
+		font-size: 0.8125rem; color: var(--muted);
 	}
 
-	/* ---------- benchmark table ---------- */
-	.bench { width: 100%; border-collapse: collapse; font-size: 0.9375rem; }
-	.bench caption {
-		text-align: left; color: var(--muted); font-size: 0.8125rem;
-		padding-bottom: 0.75rem;
+	/* ---------- tools strip ---------- */
+	.tools {
+		border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+		max-width: var(--wrap); margin: 0 auto; padding: 1.5rem;
+		display: flex; align-items: center; justify-content: space-between; gap: 1rem 2rem; flex-wrap: wrap;
 	}
-	.bench th {
-		text-align: left; font-weight: 500; font-size: 0.8125rem; color: var(--muted);
-		padding: 0 1rem 0.5rem 0; border-bottom: 1px solid var(--line);
-	}
-	.bench td, .bench tbody th {
-		padding: 0.6rem 1rem 0.6rem 0; border-bottom: 1px solid var(--navy-2);
-	}
-	.bench tbody th {
-		font-weight: 400; color: var(--paper); text-align: left; font-size: 0.9375rem;
-	}
-	.bench td:not(:first-child) {
-		font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 0.875rem;
-	}
-	.bench .ratio { color: var(--sky); text-align: right; white-space: nowrap; }
-	.bench .tie .ratio { color: var(--tan); }
+	.tools p { margin: 0; color: var(--muted); font-size: 0.9375rem; }
+	.tools ul { list-style: none; margin: 0; padding: 0; display: flex; gap: 0.75rem 2.5rem; flex-wrap: wrap; }
+	.tools li { font-weight: 600; color: var(--text-2); letter-spacing: -0.01em; }
 
-	/* ---------- facts ---------- */
-	.facts { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-	.facts dl {
-		max-width: 1140px; margin: 0 auto; padding: 1.75rem 1.5rem;
-		display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.5rem;
-	}
-	.facts div { display: flex; flex-direction: column-reverse; gap: 0.2rem; }
-	.facts dt { font-size: 0.8125rem; color: var(--muted); }
-	.facts dd {
-		margin: 0; font-family: 'IBM Plex Mono', ui-monospace, monospace;
-		font-size: 1.5rem; color: var(--sky); font-weight: 500; line-height: 1.1;
+	/* ---------- sections ---------- */
+	.section { max-width: var(--wrap); margin: 0 auto; padding: 5.5rem 1.5rem 1rem; }
+	.section h2, .cta h2 { font-size: clamp(1.8rem, 3.6vw, 2.6rem); margin: 0 0 1rem; max-width: 26ch; letter-spacing: -0.03em; }
+	.section > h2:last-of-type { margin-bottom: 2.5rem; }
+	.section-lede { font-size: 1.125rem; color: var(--text-2); max-width: 60ch; margin: 0 0 3rem; }
+
+	.icon {
+		width: 26px; height: 26px; flex: none;
+		fill: none; stroke: var(--sky); stroke-width: 1.6;
+		stroke-linecap: round; stroke-linejoin: round;
 	}
 
-	/* ---------- bands ---------- */
-	.band { max-width: 1140px; margin: 0 auto; padding: 4.5rem 1.5rem; }
-	.band + .band { border-top: 1px solid var(--line); }
-	.band-alt { background: transparent; }
-	.band h2 {
-		font-size: clamp(1.6rem, 3vw, 2.25rem); margin: 0 0 1rem; max-width: 22ch;
+	/* how it works */
+	.steps {
+		list-style: none; margin: 0; padding: 0;
+		display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.25rem;
 	}
-	.band-lede { font-size: 1.0625rem; color: #c3d2e6; max-width: var(--measure); margin: 0 0 2.5rem; }
-	.band-foot { color: var(--muted); max-width: var(--measure); margin: 2rem 0 0; font-size: 0.9375rem; }
-	.band-foot strong { color: var(--tan); font-weight: 500; }
-
-	.split { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
-	.split-half h3 { font-size: 1rem; margin: 0 0 0.75rem; color: var(--sky); }
-	.split-half pre {
-		margin: 0 0 0.75rem; padding: 1rem; background: var(--navy-2);
-		border: 1px solid var(--line); border-radius: 2px;
-		overflow-x: auto; font-size: 0.8125rem; line-height: 1.65;
-	}
-	.split-half code { color: #cfe0f5; }
-	.split-half p { color: var(--muted); font-size: 0.9375rem; margin: 0; }
-
-	.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 2.5rem; }
-	.two-col h3 { font-size: 1rem; margin: 0 0 0.6rem; }
-	.two-col > div:first-child h3 { color: var(--sky); }
-	.two-col > div:last-child h3 { color: var(--tan); }
-	.two-col p { margin: 0; color: #c3d2e6; font-size: 0.9375rem; }
-
-	/* The write path is an actual sequence, so it is actually numbered. */
-	.steps { list-style: none; counter-reset: step; margin: 0; padding: 0; }
 	.steps li {
-		counter-increment: step; position: relative;
-		padding: 0 0 1.5rem 3.25rem; border-left: 1px solid var(--line); margin-left: 0.9rem;
+		display: flex; flex-direction: column;
+		background: var(--navy-2); border: 1px solid var(--line); border-radius: var(--radius);
+		padding: 1.75rem; min-width: 0;
 	}
-	.steps li:last-child { border-left-color: transparent; padding-bottom: 0; }
-	.steps li::before {
-		content: counter(step);
-		position: absolute; left: -0.9rem; top: 0;
-		width: 1.8rem; height: 1.8rem; display: grid; place-items: center;
-		background: var(--navy); border: 1px solid var(--blue); border-radius: 50%;
-		font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 0.8125rem; color: var(--sky);
+	.step-n {
+		display: grid; place-items: center; width: 2.25rem; height: 2.25rem; margin-bottom: 1.25rem;
+		border-radius: 50%; background: rgba(46, 125, 233, 0.18); color: var(--sky);
+		font-weight: 600;
 	}
-	.steps h3 { font-size: 1rem; margin: 0.15rem 0 0.3rem; }
-	.steps p { margin: 0; color: var(--muted); font-size: 0.9375rem; max-width: 60ch; }
+	.steps h3 { font-size: 1.1875rem; margin: 0 0 0.5rem; }
+	.steps p { margin: 0 0 1.25rem; color: var(--text-2); }
+	.step-code {
+		margin-top: auto; display: block;
+		background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+		padding: 0.5rem 0.75rem; font-size: 0.75rem; color: var(--sky);
+		white-space: nowrap; overflow-x: auto;
+	}
+
+	/* features */
+	.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.25rem; }
+	.card {
+		background: var(--navy-2); border: 1px solid var(--line); border-radius: var(--radius);
+		padding: 1.75rem; transition: border-color 0.15s ease, transform 0.15s ease;
+	}
+	.card:hover { border-color: var(--blue); transform: translateY(-2px); }
+	.card h3 { font-size: 1.125rem; margin: 1rem 0 0.5rem; }
+	.card p { margin: 0; color: var(--text-2); font-size: 0.9875rem; }
+
+	.extras { list-style: none; margin: 1.75rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.6rem; }
+	.extras li {
+		font-size: 0.875rem; color: var(--text-2);
+		border: 1px solid var(--line); border-radius: 999px; padding: 0.35rem 0.9rem;
+	}
+
+	/* performance */
+	.speed {
+		display: grid; grid-template-columns: 1fr 1fr; gap: 4rem; align-items: center;
+	}
+	.speed .section-lede { margin-bottom: 1.75rem; }
+	.more { text-decoration: none; font-weight: 600; }
+	.more:hover { text-decoration: underline; }
+	.bars {
+		margin: 0; min-width: 0;
+		background: var(--navy-2); border: 1px solid var(--line); border-radius: var(--radius);
+		padding: 1.75rem;
+	}
+	.bars figcaption {
+		display: flex; justify-content: space-between; align-items: center; gap: 0.5rem 1rem; flex-wrap: wrap;
+		font-size: 0.8125rem; color: var(--muted); margin-bottom: 1.5rem;
+	}
+	.legend { display: inline-flex; align-items: center; gap: 0.4rem; }
+	.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
+	.sw-s3 { background: #2d4c78; }
+	.sw-native { background: var(--blue); margin-left: 0.6rem; }
+	.bar-row + .bar-row { margin-top: 1.4rem; }
+	.bar-label {
+		display: flex; justify-content: space-between; gap: 1rem;
+		font-size: 0.9375rem; margin-bottom: 0.5rem;
+	}
+	.bar-label b { color: var(--sky); font-weight: 600; white-space: nowrap; }
+	.bar { display: flex; align-items: center; gap: 0.6rem; height: 1.25rem; }
+	.bar + .bar { margin-top: 0.3rem; }
+	.bar-fill {
+		flex: none; height: 0.7rem; border-radius: 999px;
+		width: calc((100% - 5.5rem) * var(--v)); min-width: 6px;
+	}
+	.bar-fill.s3 { background: #2d4c78; }
+	.bar-fill.native { background: linear-gradient(90deg, var(--blue), var(--sky)); }
+	.bar-val {
+		font-family: 'IBM Plex Mono', ui-monospace, monospace;
+		font-size: 0.75rem; color: var(--muted); white-space: nowrap;
+	}
+	.bars-foot { margin: 1.5rem 0 0; font-size: 0.75rem; color: var(--muted); }
+
+	/* use cases */
+	.uses { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.25rem 3rem; }
+	.use { display: flex; gap: 1rem; padding: 1.25rem 0; border-top: 1px solid var(--line); }
+	.use h3 { font-size: 1.0625rem; margin: 0 0 0.25rem; }
+	.use p { margin: 0; color: var(--text-2); font-size: 0.9875rem; }
+
+	/* why */
+	.why-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2.5rem; }
+	.why-grid h3 { font-size: 1.1875rem; margin: 0 0 0.5rem; color: var(--sky); }
+	.why-grid p { margin: 0; color: var(--text-2); }
+	.why-links { display: flex; flex-wrap: wrap; gap: 0.75rem 2rem; margin: 2.5rem 0 0; }
+	.why-links a { text-decoration: none; font-weight: 600; }
+	.why-links a:hover { text-decoration: underline; }
 
 	/* ---------- cta + footer ---------- */
-	.cta {
-		max-width: 1140px; margin: 0 auto; padding: 4.5rem 1.5rem;
-		border-top: 1px solid var(--line);
+	.cta { max-width: var(--wrap); margin: 0 auto; padding: 6rem 1.5rem 5rem; }
+	.cta-inner {
+		text-align: center; padding: 4rem 2rem; border-radius: calc(var(--radius) * 1.5);
+		border: 1px solid var(--line);
+		background:
+			radial-gradient(ellipse at 50% 0%, rgba(46, 125, 233, 0.32), transparent 70%),
+			var(--navy-2);
 	}
-	.cta h2 { font-size: clamp(1.6rem, 3vw, 2.25rem); margin: 0 0 1rem; }
-	.cta p { color: #c3d2e6; max-width: var(--measure); margin: 0 0 1.75rem; }
+	.cta h2 { margin: 0 auto 1rem; }
+	.cta p { color: var(--text-2); max-width: 52ch; margin: 0 auto 2rem; font-size: 1.0625rem; }
+	.cta .actions { justify-content: center; }
 
 	.foot {
 		border-top: 1px solid var(--line);
-		max-width: 1140px; margin: 0 auto; padding: 2rem 1.5rem 3rem;
-		display: flex; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap;
+		max-width: var(--wrap); margin: 0 auto; padding: 2rem 1.5rem 3rem;
+		display: flex; justify-content: space-between; gap: 1rem 1.5rem; flex-wrap: wrap;
 		font-size: 0.875rem; color: var(--muted);
 	}
 	.foot p { margin: 0; }
-	.foot nav { display: flex; gap: 1.5rem; }
+	.foot nav { display: flex; gap: 0.75rem 1.5rem; flex-wrap: wrap; }
 
 	/* ---------- responsive ---------- */
-	@media (max-width: 900px) {
-		.hero { grid-template-columns: 1fr; gap: 3rem; padding-top: 2.5rem; }
-		.hero h1 { max-width: none; }
-		.split, .two-col { grid-template-columns: 1fr; }
-		.facts dl { grid-template-columns: repeat(2, 1fr); }
+	@media (max-width: 960px) {
+		.hero, .speed { grid-template-columns: 1fr; gap: 3rem; }
+		.hero { padding-top: 2.5rem; }
+		.grid { grid-template-columns: repeat(2, 1fr); }
+		.steps, .why-grid { grid-template-columns: 1fr; }
+		.why-grid { gap: 1.75rem; }
 	}
 
-	@media (max-width: 600px) {
-		/* Proportional cells stop being readable long before this width. */
-		.frame-cells { grid-template-columns: 1fr; }
-		.cell { grid-column: span 1; border-top-width: 2px; }
-		.cell:nth-child(1) .cell-note, .cell:nth-child(1) .cell-bytes { display: block; }
-		.band, .cta { padding-top: 3rem; padding-bottom: 3rem; }
+	@media (max-width: 640px) {
+		.topbar, .hero, .tools, .section, .cta, .foot { padding-left: 1rem; padding-right: 1rem; }
 		.topbar nav { gap: 1rem; font-size: 0.875rem; }
+		.grid, .uses { grid-template-columns: 1fr; }
+		.section { padding-top: 4rem; }
+		.dots { display: none; }
+		.panel pre { min-height: 0; font-size: 0.75rem; }
+		.bars { padding: 1.25rem; }
+		.cta { padding-top: 4rem; padding-bottom: 3rem; }
+		.cta-inner { padding: 3rem 1.25rem; }
 	}
 
 	@media (prefers-reduced-motion: reduce) {
+		html { scroll-behavior: auto; }
 		* { transition: none !important; animation: none !important; }
 	}
 </style>
