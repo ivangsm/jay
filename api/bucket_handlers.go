@@ -9,9 +9,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"uuid"
 
 	"github.com/ivangsm/jay/auth"
+	"github.com/ivangsm/jay/internal/objops"
 	"github.com/ivangsm/jay/meta"
 )
 
@@ -25,41 +25,25 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	if !meta.ValidBucketName(bucketName) {
-		writeS3Error(w, r, http.StatusBadRequest, S3ErrInvalidBucketName,
-			"Bucket name is invalid", "/"+bucketName)
-		return
-	}
-
 	accountID := ""
 	if token != nil {
 		accountID = token.AccountID
 	}
 
-	bucket := &meta.Bucket{
-		ID:             uuid.New().String(),
-		Name:           bucketName,
-		OwnerAccountID: accountID,
-		Visibility:     meta.VisibilityPrivate,
-		Status:         "active",
-	}
-
-	if err := h.db.CreateBucket(bucket); err != nil {
-		if errors.Is(err, meta.ErrBucketExists) {
+	if _, err := h.objops.CreateBucket(bucketName, accountID); err != nil {
+		switch {
+		case errors.Is(err, objops.ErrInvalidBucketName):
+			writeS3Error(w, r, http.StatusBadRequest, S3ErrInvalidBucketName,
+				"Bucket name is invalid", "/"+bucketName)
+		case errors.Is(err, meta.ErrBucketExists):
 			writeS3Error(w, r, http.StatusConflict, S3ErrBucketAlreadyExists,
 				"Bucket already exists", "/"+bucketName)
-			return
+		default:
+			h.log.Error("create bucket", "err", err, "bucket", bucketName)
+			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+				"Internal error", "/"+bucketName)
 		}
-		h.log.Error("create bucket", "err", err, "bucket", bucketName)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-			"Internal error", "/"+bucketName)
 		return
-	}
-
-	// Create the physical directory
-	if err := h.store.EnsureBucketDir(bucket.ID); err != nil {
-		h.log.Error("create bucket dir", "err", err, "bucket", bucketName)
-		// Best effort: metadata is already committed
 	}
 
 	if h.metrics != nil {
@@ -100,21 +84,21 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	if err := h.db.DeleteBucket(bucketName); err != nil {
-		if errors.Is(err, meta.ErrBucketNotEmpty) {
+	if _, err := h.objops.DeleteBucket(bucketName); err != nil {
+		switch {
+		case errors.Is(err, meta.ErrBucketNotEmpty):
 			writeS3Error(w, r, http.StatusConflict, S3ErrBucketNotEmpty,
 				"Bucket is not empty", "/"+bucketName)
-			return
+		case errors.Is(err, objops.ErrBucketNotFound):
+			// Deleted by someone else after the authorization above.
+			writeS3Error(w, r, http.StatusNotFound, S3ErrNoSuchBucket,
+				"Bucket not found", "/"+bucketName)
+		default:
+			h.log.Error("delete bucket", "err", err)
+			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
+				"Internal error", "/"+bucketName)
 		}
-		h.log.Error("delete bucket", "err", err)
-		writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError,
-			"Internal error", "/"+bucketName)
 		return
-	}
-
-	// Clean up physical directory (best-effort; metadata is already deleted)
-	if err := h.store.RemoveBucketDir(bucket.ID); err != nil {
-		h.log.Error("remove bucket dir", "err", err, "bucket", bucketName)
 	}
 
 	if h.metrics != nil {
