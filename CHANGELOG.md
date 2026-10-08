@@ -11,6 +11,44 @@ change bumps the minor version and is called out as such below.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-08
+
+### Highlights
+
+- **A web console.** The admin listener can serve a browser UI for accounts,
+  tokens, buckets and objects. It is off by default.
+- **The admin API can list accounts and manage buckets**, and `jay-admin`
+  gains matching commands.
+
+### Added
+
+- **A web console**, served by the admin listener under `/console/`: accounts,
+  tokens, buckets, bucket policy and visibility, quarantine, and an object
+  browser with upload, download and preview. **Off by default**: set
+  `JAY_CONSOLE_ENABLED=true` (`console.enabled` in YAML). You sign in with
+  `JAY_ADMIN_TOKEN`; objects are browsed as one of your tokens, so the S3
+  handler makes every access decision. See the
+  [guide](https://ivangsm.github.io/jay/guides/console/). `make console-smoke`
+  drives it end to end against a real jay.
+- **Four admin endpoints**: `GET /_jay/accounts`, `GET /_jay/buckets`,
+  `POST /_jay/buckets` and `DELETE /_jay/buckets/{name}`, with `jay-admin`
+  commands `list-accounts`, `list-buckets`, `create-bucket` and `delete-bucket`.
+  Creating or deleting a bucket writes a `bucket.create` / `bucket.delete`
+  audit line.
+
+### Changed
+
+- Creating and deleting a bucket over S3 now share one implementation with the
+  admin endpoints above. The S3 behavior is unchanged.
+
+### Upgrade notes
+
+- No data migration. The console stays off unless `JAY_CONSOLE_ENABLED` is
+  set; the bundled `docker-compose.yml` and `docker-compose.dev.yml` set it,
+  and the dev compose now publishes the admin port on `127.0.0.1` only.
+- The console is served from the admin port: keep that port off untrusted
+  networks, or put TLS in front of it.
+
 ## [0.18.0] - 2026-09-23
 
 ### Highlights
@@ -359,7 +397,8 @@ the handshake, which carries the token secret, stops travelling in the clear.
 - If you set `JAY_BACKUP_DIR`, rename it to `JAY_METADATA_BACKUP_DIR` at your
   convenience; the old name keeps working.
 
-[Unreleased]: https://github.com/ivangsm/jay/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/ivangsm/jay/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/ivangsm/jay/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/ivangsm/jay/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/ivangsm/jay/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/ivangsm/jay/compare/v0.16.0...v0.17.0
