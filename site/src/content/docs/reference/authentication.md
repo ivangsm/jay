@@ -90,7 +90,7 @@ authorization header. Jay accepts two forms.
 ### SigV4, the standard one
 
 Anything that speaks S3 can mint one — boto3's `generate_presigned_url`,
-`aws s3 presign`, minio-go's `PresignedGetObject`, the AWS SDK presigners.
+`aws s3 presign`, the AWS SDK presigners.
 
 ```python
 url = s3.generate_presigned_url(

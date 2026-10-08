@@ -73,7 +73,7 @@ announcements are treated as framing, because a client may send any of them:
 
 Refusing is not the ideal answer. It is the honest one. Jay used to *recognise*
 the mode — SigV4 skipped the payload check for `STREAMING-*` — and then store
-the body verbatim. A 15-byte file uploaded with `mc` became a 187-byte object
+the body verbatim. A 15-byte file uploaded in streaming mode became a 187-byte object
 whose content began `f;chunk-signature=…`, answered `200`, and carried an ETag
 and a SHA-256 computed over the corrupted bytes. Nothing could detect it
 afterwards: the scrubber verified the object against its own bad digest and
@@ -84,14 +84,9 @@ reported it healthy forever.
 | Client | Status |
 |---|---|
 | **AWS CLI**, AWS SDKs, boto3 | Fully working, up and down, single-part and multipart, with or without `--checksum-algorithm`. They send a real payload hash |
-| **minio-go over plain HTTP** — `mc`, `warp` | **Uploads fail** with `501`. Downloads, listings, `stat`, presigned URLs and deletes work normally |
-| **minio-go over HTTPS** — same clients | **Fully working**, uploads included. minio-go only reaches for the streaming signature when the connection is not secure |
 | **Presigned URLs**, both styles | Working. A presigned `PUT` that adds framing is refused like any other |
 | **Jay's CLI and native protocol** | Unaffected. The native protocol has no SigV4 and no framing |
-
-The practical workaround, if you need `mc` for uploads, is to
-[put Jay behind TLS](/jay/guides/deployment/) rather than to wait for the
-decoder.
+| **MinIO clients** — `mc`, `warp`, minio-go | **Not supported.** Jay does not test them and makes no promise about them. Over plain HTTP they sign uploads in streaming mode, which is refused with `501` as described above |
 
 ## Checksums
 
@@ -179,18 +174,14 @@ Each of those refuses the whole batch rather than applying part of it.
 ## How the claim is verified
 
 Everything on this page is checked by `scripts/conformance.sh`, which runs on
-every CI build. It boots two throwaway Jays — one plain HTTP, one TLS, both on
-random high ports, both deleted on exit — and drives them with clients Jay did
-not write.
+every CI build. It boots a throwaway Jay on random high ports, deleted on exit,
+and drives it with clients Jay did not write.
 
 | Client | What it exercises |
 |---|---|
 | **aws-cli** (botocore) | `mb`/`rb --force`, `cp` up and down, `sync`, `rm --recursive`, `ListObjectsV2` with prefix and delimiter, multipart upload and ranged download of a 12 MiB object, `presign` including an expired URL, `GetBucketLocation`, `ListMultipartUploads`, `DeleteObjects` whole and partial, a `501` sub-resource, and that `--checksum-algorithm` answers with the algorithm it asked for — all five, on `put-object` and on `copy-object`, the copy compared against the digest the upload returned for the same bytes |
-| **curl** | That a deliberately wrong digest is refused and writes nothing. No correct client would ever send one, so it has to be forged by hand |
+| **curl** | That a deliberately wrong digest is refused and writes nothing, and that an `aws-chunked` body is refused with `501` and writes nothing. No correct client sends the first, and no supported client sends the second, so both are forged by hand |
 | **aws-cli, second account** | That a token of account B can neither list, read, write, delete nor batch-delete inside a bucket of account A — each asserted against A's own view of the bucket, not against B's error message |
-| **mc** (minio-go) over HTTP | Listing, `stat`, `get`, bucket create/delete, `rm`, a presigned URL minted by minio-go, and that an upload is refused with `501` leaving nothing behind |
-| **mc** over HTTPS | That the same client uploads fine over TLS, small and 12 MiB, byte for byte |
-| **warp** (minio-go) | That `warp put` over HTTP is refused and writes nothing, and that `warp mixed` over TLS runs PUT/GET/DELETE/STAT with zero errors |
 
 Three things about how it reports:
 
@@ -201,7 +192,7 @@ Three things about how it reports:
   absent, a status code — never a confirmation message. `aws s3 cp --quiet`
   hides its own failure line, so the checks read the exit code and then ask the
   server what actually happened.
-- **The known limitations are asserted, not tolerated.** The `mc` and `warp`
-  upload refusals are checks that pass *because* the answer is `501` and nothing
-  was written. If the `aws-chunked` decoder ever lands, they go red on purpose,
-  so nobody can ship it without updating this page.
+- **The known limitations are asserted, not tolerated.** The `aws-chunked`
+  refusal is a check that passes *because* the answer is `501` and nothing was
+  written. If a decoder ever lands, it goes red on purpose, so nobody can ship
+  it without updating this page.

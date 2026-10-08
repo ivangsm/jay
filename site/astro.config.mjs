@@ -9,7 +9,7 @@ export default defineConfig({
 	site: 'https://ivangsm.github.io',
 	base: '/jay',
 	// Astro's HTML compressor strips the whitespace between text and inline tags,
-	// which glues prose to <code> and <a> ("MinIO'smc", "does.The full table").
+	// which glues prose to <code> and <a> ("theaws-cli", "does.The full table").
 	compressHTML: false,
 	trailingSlash: 'always',
 	integrations: [

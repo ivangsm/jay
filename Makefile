@@ -25,8 +25,8 @@ test: ## Tests unitarios
 build: ## Compila todo
 	go build ./...
 
-# Fuera de `check` a propósito: necesita aws-cli, mc y warp instalados y tarda
+# Fuera de `check` a propósito: necesita aws-cli instalado y tarda
 # alrededor de un minuto. `go test` prueba que jay coincide consigo mismo; esto
 # prueba que coincide con clientes que no escribió.
-conformance: ## Suite de conformidad S3 contra aws-cli, mc y warp
+conformance: ## Suite de conformidad S3 contra aws-cli
 	./scripts/conformance.sh

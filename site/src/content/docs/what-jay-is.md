@@ -56,12 +56,13 @@ versioning, or any of the S3 features listed above. Those are not on the
 roadmap; Jay would rather be honest about the surface it has than grow a
 half-working version of a big one.
 
-## The one compatibility caveat to know upfront
+## Which clients are supported
 
-minio-go clients — `mc` and `warp` — **cannot upload over plain HTTP**. They
-sign non-TLS uploads with SigV4's streaming mode, which frames the body in
-`aws-chunked`, and Jay refuses that framing with `501` rather than storing it
-raw. Over HTTPS the same clients work completely, uploads included. The full
-explanation is in [S3 compatibility](/jay/reference/s3-compatibility/).
+aws-cli, the AWS SDKs and boto3, over plain HTTP and over HTTPS, plus Jay's own
+Go client and library.
 
-Everything else — aws-cli, the AWS SDKs, boto3 — works over both.
+**MinIO's clients — `mc`, `warp` and minio-go — are not supported.** Jay does
+not test against them. Over plain HTTP they sign every upload with SigV4's
+streaming mode, which frames the body in `aws-chunked`, and Jay refuses that
+framing with `501` rather than storing it raw. The full explanation is in
+[S3 compatibility](/jay/reference/s3-compatibility/).

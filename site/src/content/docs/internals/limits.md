@@ -56,9 +56,9 @@ operator surface already lives.
 
 ## aws-chunked bodies are refused
 
-SigV4's streaming upload mode is answered with `501`, which means **`mc` and
-`warp` cannot upload over plain HTTP**. Over HTTPS they work completely. The
-reasoning is in
+SigV4's streaming upload mode is answered with `501`. MinIO's clients (`mc`,
+`warp`, minio-go) send it for every upload over plain HTTP, and they are not
+supported. The reasoning is in
 [S3 compatibility](/jay/reference/s3-compatibility/).
 
 ## No Windows build

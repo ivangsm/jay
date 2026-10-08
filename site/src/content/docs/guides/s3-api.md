@@ -1,6 +1,6 @@
 ---
 title: The S3 API
-description: Using Jay with the AWS CLI, boto3, the AWS SDKs and minio-go clients.
+description: Using Jay with the AWS CLI, boto3 and the AWS SDKs.
 ---
 
 Jay's S3 API is an HTTP endpoint your existing tooling can point at. There is no
@@ -66,19 +66,15 @@ url = s3.generate_presigned_url(
 | Client | Status |
 |---|---|
 | AWS CLI (`aws s3`, `aws s3api`), AWS SDKs, boto3 | Fully working, up and down, single-part and multipart, with or without `--checksum-algorithm` |
-| minio-go over **HTTPS** — `mc`, `warp` | Fully working, uploads included |
-| minio-go over **plain HTTP** — `mc`, `warp` | **Uploads fail with `501`.** Downloads, listings, `stat`, presigned URLs and deletes work normally |
 | Presigned URLs, both styles | Working |
+| MinIO clients — `mc`, `warp`, minio-go | **Not supported** |
 
-The minio-go limitation is not arbitrary. Over a non-TLS connection minio-go
-signs uploads with SigV4's *streaming* mode, which wraps the body in
-`aws-chunked` framing. Jay has no decoder for that framing, so it refuses the
-mode instead of storing the frames as if they were your file. Over TLS minio-go
-sends an unframed body and everything works.
-
-**If you need `mc` for uploads, the fix is to put Jay behind TLS**, not to wait
-for a decoder. The full story, including what went wrong when Jay used to accept
-the mode, is in [S3 compatibility](/jay/reference/s3-compatibility/).
+MinIO's clients are not supported and not tested. Over plain HTTP minio-go
+signs every upload with SigV4's *streaming* mode, which wraps the body in
+`aws-chunked` framing; Jay has no decoder for that framing and refuses it with
+`501` instead of storing the frames as if they were your file. The full story,
+including what went wrong when Jay used to accept the mode, is in
+[S3 compatibility](/jay/reference/s3-compatibility/).
 
 ## Checksums are verified, not decorated
 
