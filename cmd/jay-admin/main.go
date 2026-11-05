@@ -18,13 +18,27 @@ import (
 	"strings"
 
 	"github.com/ivangsm/jay/internal/jsonx"
+	"github.com/ivangsm/jay/meta"
 )
 
 func main() {
-	addr := envOr("JAY_ADMIN_ADDR", "http://localhost:9001")
-	token := os.Getenv("JAY_ADMIN_TOKEN")
+	os.Exit(run(os.Args[1:], os.Getenv, os.Stdin, os.Stdout, os.Stderr))
+}
 
-	args := os.Args[1:]
+// client carries what every subcommand needs: where the admin API is, the
+// bearer token, and the streams it reads from and prints to.
+type client struct {
+	addr   string
+	token  string
+	stdin  io.Reader
+	stdout io.Writer
+}
+
+// run is main with its environment passed in, so the argument handling and
+// every subcommand can be driven from a test. It returns the exit code.
+func run(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	addr := envOr(getenv, "JAY_ADMIN_ADDR", "http://localhost:9001")
+	token := getenv("JAY_ADMIN_TOKEN")
 
 	// Parse global flags
 	for len(args) >= 2 {
@@ -42,13 +56,13 @@ func main() {
 done:
 
 	if len(args) == 0 {
-		usage()
-		os.Exit(1)
+		usage(stderr)
+		return 1
 	}
 
 	if token == "" {
-		fmt.Fprintln(os.Stderr, "Error: admin token required. Set JAY_ADMIN_TOKEN or use -token flag.")
-		os.Exit(1)
+		_, _ = fmt.Fprintln(stderr, "Error: admin token required. Set JAY_ADMIN_TOKEN or use -token flag.")
+		return 1
 	}
 
 	// Ensure addr has scheme
@@ -56,51 +70,61 @@ done:
 		addr = "http://" + addr
 	}
 
+	c := &client{addr: addr, token: token, stdin: stdin, stdout: stdout}
 	cmd := args[0]
 	cmdArgs := args[1:]
 
 	var err error
 	switch cmd {
 	case "create-account":
-		err = createAccount(addr, token, cmdArgs)
+		err = c.createAccount(cmdArgs)
 	case "create-token":
-		err = createToken(addr, token, cmdArgs)
+		err = c.createToken(cmdArgs)
 	case "list-tokens":
-		err = listTokens(addr, token)
+		err = c.listTokens()
 	case "revoke-token":
-		err = revokeToken(addr, token, cmdArgs)
+		err = c.revokeToken(cmdArgs)
 	case "metrics":
-		err = metrics(addr, token)
+		err = c.metrics()
 	case "presign":
-		err = presign(addr, token, cmdArgs)
+		err = c.presign(cmdArgs)
 	case "quarantine-list":
-		err = quarantineList(addr, token)
+		err = c.quarantineList()
 	case "quarantine-revalidate":
-		err = quarantineRevalidate(addr, token, cmdArgs)
+		err = c.quarantineRevalidate(cmdArgs)
 	case "quarantine-purge":
-		err = quarantinePurge(addr, token)
+		err = c.quarantinePurge(cmdArgs)
+	case "list-accounts":
+		err = c.listAccounts()
+	case "list-buckets":
+		err = c.listBuckets(cmdArgs)
+	case "create-bucket":
+		err = c.createBucket(cmdArgs)
+	case "delete-bucket":
+		err = c.deleteBucket(cmdArgs)
 	case "get-bucket":
-		err = getBucket(addr, token, cmdArgs)
+		err = c.getBucket(cmdArgs)
 	case "set-bucket-policy":
-		err = setBucketPolicy(addr, token, cmdArgs)
+		err = c.setBucketPolicy(cmdArgs)
 	case "delete-bucket-policy":
-		err = deleteBucketPolicy(addr, token, cmdArgs)
+		err = c.deleteBucketPolicy(cmdArgs)
 	case "set-bucket-visibility":
-		err = setBucketVisibility(addr, token, cmdArgs)
+		err = c.setBucketVisibility(cmdArgs)
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", cmd)
-		usage()
-		os.Exit(1)
+		_, _ = fmt.Fprintf(stderr, "Unknown command: %s\n\n", cmd)
+		usage(stderr)
+		return 1
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
+	return 0
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `jay-admin — CLI tool for Jay object storage administration
+func usage(w io.Writer) {
+	_, _ = fmt.Fprintln(w, `jay-admin — CLI tool for Jay object storage administration
 
 Usage: jay-admin [-addr URL] [-token TOKEN] <command> [args]
 
@@ -110,7 +134,16 @@ Global flags:
 
 Commands:
   create-account  -name <name>                         Create a new account
-  create-token    -account <id> -name <name>            Create a new token
+  list-accounts                                         List all accounts
+  create-token    -account <id> -actions <a,b,...>      Create a new token
+                  [-name <name>] [-bucket-scope b1,b2]
+                  [-prefix-scope p1,p2]
+                  [-expires-at 2030-01-02T15:04:05Z]
+                  -actions is required: a comma-separated list of
+                  bucket:list, bucket:read-meta, bucket:write-meta,
+                  object:get, object:put, object:delete, object:list,
+                  multipart:create, multipart:upload-part,
+                  multipart:complete, multipart:abort — or '*'
   list-tokens                                           List all tokens
   revoke-token    -id <token-id>                        Revoke a token
   metrics                                               Show server metrics
@@ -123,7 +156,11 @@ Commands:
                   JAY_LISTEN_ADDR carries a hostname
   quarantine-list                                       List quarantined objects
   quarantine-revalidate -bucket-id <id> -key <key>      Revalidate object
-  quarantine-purge                                      Purge all quarantined
+  quarantine-purge [-bucket-id <id> -key <key>]         Purge one quarantined object,
+                                                        or all of them
+  list-buckets    [-owner <account-id>]                 List buckets, optionally of one account
+  create-bucket   -name <name> -owner <account-id>      Create a bucket owned by an account
+  delete-bucket   -name <name>                          Delete an empty bucket
   get-bucket      -bucket <name>                        Show visibility and policy
   set-bucket-policy -bucket <name> -file <path|->       Install a bucket policy
                   reads the policy document from a file,
@@ -133,8 +170,8 @@ Commands:
                   -visibility private|public-read       Open or close anonymous reads`)
 }
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
+func envOr(getenv func(string) string, key, fallback string) string {
+	if v := getenv(key); v != "" {
 		return v
 	}
 	return fallback
@@ -197,16 +234,16 @@ func doRawRequest(method, url, token string, body []byte) ([]byte, int, error) {
 	return data, resp.StatusCode, err
 }
 
-func prettyJSON(data []byte) {
+func prettyJSON(w io.Writer, data []byte) {
 	// PreserveRawStrings leaves literals exactly as they arrived, which is what
 	// v1's json.Indent did: this is a pretty-print, not a re-encode.
 	pretty, err := jsontext.AppendFormat(nil, data,
 		jsontext.WithIndent("  "), jsontext.PreserveRawStrings(true))
 	if err != nil {
-		fmt.Println(string(data))
+		_, _ = fmt.Fprintln(w, string(data))
 		return
 	}
-	fmt.Println(string(pretty))
+	_, _ = fmt.Fprintln(w, string(pretty))
 }
 
 func parseFlag(args []string, name string) string {
@@ -218,91 +255,126 @@ func parseFlag(args []string, name string) string {
 	return ""
 }
 
-func createAccount(addr, token string, args []string) error {
+func (c *client) createAccount(args []string) error {
 	name := parseFlag(args, "-name")
 	if name == "" {
 		return errors.New("usage: create-account -name <name>")
 	}
 
-	data, status, err := doRequest("POST", addr+"/_jay/accounts", token, map[string]string{"name": name})
+	data, status, err := doRequest("POST", c.addr+"/_jay/accounts", c.token, map[string]string{"name": name})
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
 		return fmt.Errorf("server error (%d): %s", status, data)
 	}
-	prettyJSON(data)
+	prettyJSON(c.stdout, data)
 	return nil
 }
 
-func createToken(addr, token string, args []string) error {
+const createTokenUsage = "usage: create-token -account <id> -actions <a,b,...|'*'> [-name <name>] " +
+	"[-bucket-scope <b1,b2>] [-prefix-scope <p1,p2>] [-expires-at <RFC 3339 time>]"
+
+func (c *client) createToken(args []string) error {
 	accountID := parseFlag(args, "-account")
-	name := parseFlag(args, "-name")
-	if accountID == "" {
-		return errors.New("usage: create-token -account <id> -name <name>")
+	actions := splitList(parseFlag(args, "-actions"))
+	if accountID == "" || len(actions) == 0 {
+		return errors.New(createTokenUsage)
+	}
+	// The server refuses these too; checking here fails a typo before anything
+	// is sent, with the list of the actions that exist.
+	for _, action := range actions {
+		if !meta.ValidAction(action) {
+			return fmt.Errorf("unknown action %q: use '*' or any of %s",
+				action, strings.Join(meta.AllActions, ", "))
+		}
 	}
 
-	body := map[string]string{
-		"account_id": accountID,
-		"name":       name,
+	body := map[string]any{
+		"account_id":      accountID,
+		"name":            parseFlag(args, "-name"),
+		"allowed_actions": actions,
+	}
+	// Only send the optional fields that were given: the server's defaults
+	// (no scope, no expiry) are the ones it documents.
+	if scope := splitList(parseFlag(args, "-bucket-scope")); len(scope) > 0 {
+		body["bucket_scope"] = scope
+	}
+	if scope := splitList(parseFlag(args, "-prefix-scope")); len(scope) > 0 {
+		body["prefix_scope"] = scope
+	}
+	if expiresAt := parseFlag(args, "-expires-at"); expiresAt != "" {
+		body["expires_at"] = expiresAt
 	}
 
-	data, status, err := doRequest("POST", addr+"/_jay/tokens", token, body)
+	data, status, err := doRequest("POST", c.addr+"/_jay/tokens", c.token, body)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
 		return fmt.Errorf("server error (%d): %s", status, data)
 	}
-	prettyJSON(data)
+	prettyJSON(c.stdout, data)
 	return nil
 }
 
-func listTokens(addr, token string) error {
-	data, status, err := doRequest("GET", addr+"/_jay/tokens", token, nil)
+// splitList parses a comma-separated flag value, trimming the spaces around
+// each entry and dropping empty ones.
+func splitList(value string) []string {
+	var out []string
+	for item := range strings.SplitSeq(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (c *client) listTokens() error {
+	data, status, err := doRequest("GET", c.addr+"/_jay/tokens", c.token, nil)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
 		return fmt.Errorf("server error (%d): %s", status, data)
 	}
-	prettyJSON(data)
+	prettyJSON(c.stdout, data)
 	return nil
 }
 
-func revokeToken(addr, token string, args []string) error {
+func (c *client) revokeToken(args []string) error {
 	id := parseFlag(args, "-id")
 	if id == "" {
 		return errors.New("usage: revoke-token -id <token-id>")
 	}
 
-	_, status, err := doRequest("DELETE", addr+"/_jay/tokens/"+id, token, nil)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("server error (%d)", status)
-	}
-	fmt.Println("Token revoked.")
-	return nil
-}
-
-func metrics(addr, token string) error {
-	data, status, err := doRequest("GET", addr+"/_jay/metrics", token, nil)
+	data, status, err := doRequest("DELETE", c.addr+"/_jay/tokens/"+id, c.token, nil)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
 		return fmt.Errorf("server error (%d): %s", status, data)
 	}
-	prettyJSON(data)
+	_, _ = fmt.Fprintln(c.stdout, "Token revoked.")
+	return nil
+}
+
+func (c *client) metrics() error {
+	data, status, err := doRequest("GET", c.addr+"/_jay/metrics", c.token, nil)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("server error (%d): %s", status, data)
+	}
+	prettyJSON(c.stdout, data)
 	return nil
 }
 
 const presignUsage = "usage: presign -bucket <b> -key <k> -token-id <id> " +
 	"[-method GET] [-expires 3600] [-style jay|aws] [-host s3.example.com] [-region us-east-1]"
 
-func presign(addr, token string, args []string) error {
+func (c *client) presign(args []string) error {
 	bucket := parseFlag(args, "-bucket")
 	key := parseFlag(args, "-key")
 	method := parseFlag(args, "-method")
@@ -317,9 +389,8 @@ func presign(addr, token string, args []string) error {
 	if expires == "" {
 		expires = "3600"
 	}
-	// expires_seconds is a number on the wire. Sending it as the string the
-	// flag arrived as made the admin API answer 400 "invalid request body" on
-	// every single presign, because its decoder rejects a string for an int.
+	// expires_seconds is a number on the wire: the admin API's strict decoder
+	// answers 400 to a string where it expects an int.
 	expiresSeconds, err := strconv.Atoi(expires)
 	if err != nil || expiresSeconds <= 0 {
 		return fmt.Errorf("-expires must be a positive number of seconds, got %q", expires)
@@ -346,30 +417,30 @@ func presign(addr, token string, args []string) error {
 		}
 	}
 
-	data, status, err := doRequest("POST", addr+"/_jay/presign", token, body)
+	data, status, err := doRequest("POST", c.addr+"/_jay/presign", c.token, body)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
 		return fmt.Errorf("server error (%d): %s", status, data)
 	}
-	prettyJSON(data)
+	prettyJSON(c.stdout, data)
 	return nil
 }
 
-func quarantineList(addr, token string) error {
-	data, status, err := doRequest("GET", addr+"/_jay/quarantine", token, nil)
+func (c *client) quarantineList() error {
+	data, status, err := doRequest("GET", c.addr+"/_jay/quarantine", c.token, nil)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
 		return fmt.Errorf("server error (%d): %s", status, data)
 	}
-	prettyJSON(data)
+	prettyJSON(c.stdout, data)
 	return nil
 }
 
-func quarantineRevalidate(addr, token string, args []string) error {
+func (c *client) quarantineRevalidate(args []string) error {
 	bucketID := parseFlag(args, "-bucket-id")
 	key := parseFlag(args, "-key")
 	if bucketID == "" || key == "" {
@@ -381,25 +452,52 @@ func quarantineRevalidate(addr, token string, args []string) error {
 		"key":       key,
 	}
 
-	data, status, err := doRequest("POST", addr+"/_jay/quarantine/revalidate", token, body)
+	data, status, err := doRequest("POST", c.addr+"/_jay/quarantine/revalidate", c.token, body)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
 		return fmt.Errorf("server error (%d): %s", status, data)
 	}
-	prettyJSON(data)
+	prettyJSON(c.stdout, data)
 	return nil
 }
 
-func quarantinePurge(addr, token string) error {
-	_, status, err := doRequest("DELETE", addr+"/_jay/quarantine", token, nil)
+const quarantinePurgeUsage = "usage: quarantine-purge [-bucket-id <id> -key <key>]"
+
+// quarantinePurge purges one quarantined object when -bucket-id and -key are
+// given, and the whole quarantine otherwise. The line it prints comes from the
+// server's answer: a partial purge is a server error that names what failed,
+// never "purged".
+func (c *client) quarantinePurge(args []string) error {
+	bucketID := parseFlag(args, "-bucket-id")
+	key := parseFlag(args, "-key")
+	if (bucketID == "") != (key == "") {
+		return errors.New(quarantinePurgeUsage)
+	}
+
+	body := map[string]string{"mode": "all"}
+	if bucketID != "" {
+		body = map[string]string{"bucket_id": bucketID, "key": key}
+	}
+	data, status, err := doRequest("DELETE", c.addr+"/_jay/quarantine", c.token, body)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return fmt.Errorf("server error (%d)", status)
+		return fmt.Errorf("server error (%d): %s", status, data)
 	}
-	fmt.Println("All quarantined objects purged.")
+
+	if bucketID != "" {
+		_, _ = fmt.Fprintf(c.stdout, "Purged %s from bucket %s.\n", key, bucketID)
+		return nil
+	}
+	var resp struct {
+		Purged *int `json:"purged"`
+	}
+	if err := jsonv2.Unmarshal(data, &resp); err != nil || resp.Purged == nil {
+		return fmt.Errorf("unexpected answer from the server (%d): %s", status, data)
+	}
+	_, _ = fmt.Fprintf(c.stdout, "Purged %d quarantined object(s).\n", *resp.Purged)
 	return nil
 }

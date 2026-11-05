@@ -135,11 +135,8 @@ func TestReadinessHandler_LowDiskSpaceReports503(t *testing.T) {
 	}
 }
 
-// The readiness payload has to say that object bytes have no backup. jay
-// snapshots its metadata hourly, verifies it and prunes it — a maintenance
-// story confident enough that an operator reading only the logs concludes their
-// objects are covered. They are not, and the probe they look at during an
-// incident is where that has to be written down.
+// The readiness payload has to say that object bytes have no backup: the
+// hourly metadata snapshot is the only one jay takes.
 func TestReadinessHandler_ReportsThatObjectBytesAreNotBackedUp(t *testing.T) {
 	hc, _ := newTestHealthChecker(t, 1)
 	hc.SetReady(true)
@@ -156,10 +153,8 @@ func TestReadinessHandler_ReportsThatObjectBytesAreNotBackedUp(t *testing.T) {
 	}
 }
 
-// An isolation check that cannot run must degrade to the unsafe answer. A
-// backup directory jay could not even create is not an isolated one, and
-// reporting `false` there would be the reassuring lie this whole change exists
-// to remove.
+// An isolation check that cannot run must degrade to the unsafe answer: a
+// backup directory jay could not even create is not an isolated one.
 func TestDescribeDurability_UnknownIsolationDegradesToShared(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 

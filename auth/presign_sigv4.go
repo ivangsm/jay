@@ -188,10 +188,11 @@ func (a *Auth) AuthenticatePresignedSigV4(r *http.Request) (*meta.Token, error) 
 	// header form does. Only reached after the signature verified, so an
 	// unauthenticated caller can never make jay buffer a body.
 	//
-	// Called unconditionally: verifyPayloadHash skips UNSIGNED-PAYLOAD on its
-	// own, and it is also where an aws-chunked body is refused — a presigned
-	// PUT can carry the framing just as a header-signed one can, and guarding
-	// the call with `payloadHash != unsignedPayload` left that door open.
+	// Called unconditionally, not behind `payloadHash != unsignedPayload`:
+	// verifyPayloadHash skips UNSIGNED-PAYLOAD on its own, and it is also
+	// where an aws-chunked body is refused. A presigned PUT can carry the
+	// framing just as a header-signed one can, but only the header form has a
+	// request signature to seed the chunk chain with, so only it is decoded.
 	if err := verifyPayloadHash(r, payloadHash); err != nil {
 		return nil, err
 	}

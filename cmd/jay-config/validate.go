@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -90,6 +92,8 @@ func validateDocument(root *yaml.Node, path string) (errs []string, warns []stri
 	validateSeedToken(path, fields, top, &errs)
 	validateScrub(path, fields, &errs, &warns)
 	validateRate(path, fields, &errs)
+	validateNative(path, fields, &errs)
+	validateMetrics(path, fields, &errs, &warns)
 	validateLogLevel(path, fields, &errs)
 	return errs, warns
 }
@@ -145,6 +149,11 @@ func typeName(k fieldType) string {
 	return "unknown"
 }
 
+// checkScalarType reports whether the server's loader would accept n for kind.
+// It mirrors toBool, toInt64 and toFloat64 in cmd/jay: a quoted scalar such as
+// "true" or "5" reaches the server as a string and is parsed with strconv, and
+// a whole float is a valid integer. A validator stricter than the server
+// rejects configs that run, which teaches people to stop running it.
 func checkScalarType(n *yaml.Node, kind fieldType) bool {
 	if n.Kind != yaml.ScalarNode {
 		return false
@@ -156,11 +165,36 @@ func checkScalarType(n *yaml.Node, kind fieldType) bool {
 	case typeString:
 		return true
 	case typeBool:
-		return n.Tag == "!!bool" || n.Tag == ""
+		switch n.Tag {
+		case "!!bool", "":
+			return true
+		case "!!str":
+			_, err := strconv.ParseBool(n.Value)
+			return err == nil
+		}
 	case typeInt:
-		return n.Tag == "!!int" || (n.Tag == "" && isIntLiteral(n.Value))
+		switch n.Tag {
+		case "!!int":
+			return true
+		case "":
+			return isIntLiteral(n.Value)
+		case "!!str":
+			_, err := strconv.ParseInt(n.Value, 10, 64)
+			return err == nil
+		case "!!float":
+			f, err := strconv.ParseFloat(n.Value, 64)
+			return err == nil && f == math.Trunc(f) && !math.IsInf(f, 0)
+		}
 	case typeFloat:
-		return n.Tag == "!!int" || n.Tag == "!!float" || (n.Tag == "" && (isIntLiteral(n.Value) || isFloatLiteral(n.Value)))
+		switch n.Tag {
+		case "!!int", "!!float":
+			return true
+		case "":
+			return isIntLiteral(n.Value) || isFloatLiteral(n.Value)
+		case "!!str":
+			_, err := strconv.ParseFloat(n.Value, 64)
+			return err == nil
+		}
 	}
 	return false
 }
@@ -318,6 +352,77 @@ func validateRate(path string, fields map[string]*yaml.Node, errs *[]string) {
 			*errs = append(*errs, locLabel(path, n)+": rate_burst must be >= 0")
 		}
 	}
+}
+
+// validateNative checks the native listener's limits against what the server
+// accepts: a connection cap of zero would refuse every client, and a negative
+// byte rate means nothing.
+func validateNative(path string, fields map[string]*yaml.Node, errs *[]string) {
+	if n, ok := fields["native_max_conns"]; ok && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
+		if i, ok := parseInt(n.Value); ok && i <= 0 {
+			*errs = append(*errs, locLabel(path, n)+": native_max_conns must be > 0")
+		}
+	}
+	if n, ok := fields["native_token_bytes_per_sec"]; ok && n.Kind == yaml.ScalarNode && !isInterpolation(n.Value) {
+		if i, ok := parseInt(n.Value); ok && i < 0 {
+			*errs = append(*errs, locLabel(path, n)+": native_token_bytes_per_sec must be >= 0")
+		}
+	}
+}
+
+// validateMetrics applies the server's checkMetricsAccess to the file: the
+// metrics token is a secret with the admin token's floor, it must not BE the
+// admin token, and it cannot be combined with public scraping. A value that is
+// still an ${VAR} interpolation is not judged — only the running server sees
+// what it resolves to.
+func validateMetrics(path string, fields map[string]*yaml.Node, errs, warns *[]string) {
+	section, ok := fields["metrics"]
+	if !ok || section.Kind != yaml.MappingNode {
+		return // a non-mapping is already reported by validateTypes
+	}
+	for i := 0; i+1 < len(section.Content); i += 2 {
+		k := section.Content[i]
+		if !nestedKnownKeys["metrics"][k.Value] {
+			*warns = append(*warns, fmt.Sprintf("%s: unknown metrics key %q", locLabel(path, k), k.Value))
+		}
+	}
+
+	token := literalScalar(findChild(section, "token"))
+	public := literalScalar(findChild(section, "public"))
+	isPublic := false
+	if public != nil {
+		// The server reads the value with strconv.ParseBool; so does this.
+		isPublic, _ = strconv.ParseBool(public.Value)
+	}
+
+	if token != nil && token.Value != "" {
+		if isPublic {
+			*errs = append(*errs, locLabel(path, token)+
+				": metrics.token and metrics.public: true are mutually exclusive")
+		}
+		if len(token.Value) < 32 {
+			*errs = append(*errs, fmt.Sprintf("%s: metrics.token must be >= 32 characters when set (got %d)",
+				locLabel(path, token), len(token.Value)))
+		}
+		if admin := literalScalar(fields["admin_token"]); admin != nil && admin.Value == token.Value {
+			*errs = append(*errs, locLabel(path, token)+
+				": metrics.token must differ from admin_token, or every scraper holds the admin credential")
+		}
+	}
+	if isPublic {
+		*warns = append(*warns, locLabel(path, public)+
+			": metrics.public is true: GET /metrics answers without authentication")
+	}
+}
+
+// literalScalar returns n when it is a scalar whose value is written out in
+// the file, and nil for anything else — absent, a mapping, or an ${VAR}
+// interpolation that only resolves at runtime.
+func literalScalar(n *yaml.Node) *yaml.Node {
+	if n == nil || n.Kind != yaml.ScalarNode || isInterpolation(n.Value) {
+		return nil
+	}
+	return n
 }
 
 func validateLogLevel(path string, fields map[string]*yaml.Node, errs *[]string) {

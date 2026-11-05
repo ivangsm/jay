@@ -17,15 +17,10 @@ type Config struct {
 	TLSCert       string
 	TLSKey        string
 
-	// Native protocol TLS. Deliberately NOT defaulted to TLSCert/TLSKey: the
-	// native handshake sends the token secret in the clear, so whether that
-	// transport is encrypted has to be an explicit decision. Inheriting the S3
-	// certificate would mean enabling TLS on the S3 port silently changed the
-	// native transport and broke every client already speaking to it in the
-	// clear — a transport switch as a side effect of an unrelated setting.
-	//
-	// Both or neither: one without the other aborts startup rather than
-	// quietly serving in the clear.
+	// Native protocol TLS. Not defaulted to TLSCert/TLSKey: inheriting the S3
+	// certificate would switch the native transport as a side effect of an
+	// unrelated setting and break every client speaking to it in the clear.
+	// Both or neither: one without the other aborts startup.
 	NativeTLSCert     string  // JAY_NATIVE_TLS_CERT / native_tls_cert
 	NativeTLSKey      string  // JAY_NATIVE_TLS_KEY / native_tls_key
 	RateLimit         float64 // requests per second per token (0 = disabled)
@@ -38,37 +33,42 @@ type Config struct {
 	ScrubBytesPerSec  int64
 	ScrubMaxPerRun    int
 	// MetadataBackupDir is where the hourly bbolt snapshots land
-	// (JAY_METADATA_BACKUP_DIR / metadata_backup.dir; the old JAY_BACKUP_DIR /
-	// backup.dir still works and warns). It defaults to <DataDir>/backups,
-	// which is the same disk — point it at a separate volume for real DR.
-	//
-	// The name says metadata because that is all that goes there. Object bytes
-	// are never copied by jay, and "backup" without a qualifier promised a
-	// recovery path that does not exist.
+	// (JAY_METADATA_BACKUP_DIR / metadata_backup.dir; the deprecated
+	// JAY_BACKUP_DIR / backup.dir still works and warns). It defaults to
+	// <DataDir>/backups, which is the same disk — point it at a separate volume
+	// for real DR. Only metadata goes there: jay never copies object bytes.
 	MetadataBackupDir string
 	MinFreeBytes      int64 // JAY_MIN_FREE_BYTES / min_free_bytes — readiness fails when the DataDir filesystem has less free space; 0 disables the check
-	MaxObjectSize     int64 // JAY_MAX_OBJECT_SIZE / max_object_size — largest accepted object body (and multipart part), in bytes; 0 disables the limit
+
+	// Who may scrape GET /metrics on the admin listener. With neither set, it
+	// takes JAY_ADMIN_TOKEN like every other admin route.
+	MetricsToken  string // JAY_METRICS_TOKEN / metrics.token — read-only bearer for /metrics only; a secret: >= 32 bytes, never equal to AdminToken
+	MetricsPublic bool   // JAY_METRICS_PUBLIC / metrics.public — serve /metrics with no auth at all; explicit opt-in, excludes MetricsToken
+	MaxObjectSize int64  // JAY_MAX_OBJECT_SIZE / max_object_size — largest accepted object body (and multipart part), in bytes; 0 disables the limit
+
+	// ConsoleEnabled serves the web console under /console/ on the admin
+	// listener. Off by default: an unset or empty value is false, and /console/**
+	// answers 404 saying how to turn it on. It adds no secret; it signs in with
+	// JAY_ADMIN_TOKEN.
+	ConsoleEnabled bool // JAY_CONSOLE_ENABLED / console.enabled
 
 	// Client credentials for the `jay` subcommands (ls, cp, rm, sync). The
 	// server itself never reads them; they live here so they go through
 	// bindings() like every other setting and stay visible to jay-config.
 	ClientTokenID     string // JAY_TOKEN_ID / client.token_id
 	ClientTokenSecret string // JAY_TOKEN_SECRET / client.token_secret
+
+	// Native back-pressure limits. The S3 API has neither.
+	NativeMaxConns         int   // JAY_NATIVE_MAX_CONNS / native_max_conns — connections held at once; the next one is refused with ServerBusy
+	NativeTokenBytesPerSec int64 // JAY_NATIVE_TOKEN_BYTES_PER_SEC / native_token_bytes_per_sec — body bytes per second per token, both directions; 0 = no cap
 }
 
-// LoadConfig keeps the legacy env-only contract. It delegates to
-// LoadConfigFromSources with an empty YAML path so the precedence rules
-// (env > YAML > defaults) collapse to the pre-existing "env > defaults"
-// behaviour.
-//
-// New callers should prefer LoadConfigFromSources directly so they can pass
-// a --config-file value.
+// LoadConfig is the env-only form of LoadConfigFromSources: no YAML, so the
+// precedence collapses to env > defaults. Prefer LoadConfigFromSources, which
+// takes a --config-file value and a logger.
 func LoadConfig() Config {
-	// The env-only path never surfaces YAML conflicts, so the logger only
-	// ever receives parse-error messages. Route them to a discard handler
-	// to preserve the original LoadConfig signature (no logger parameter,
-	// no error return) without losing the slog.Error calls the legacy
-	// implementation emitted for invalid env values.
+	// The signature has no logger, so the loader's own lines (invalid env
+	// values) are discarded; only the impossible-error guard below logs.
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	cfg, err := LoadConfigFromSources("", log)
 	if err != nil {

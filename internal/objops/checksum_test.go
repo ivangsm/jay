@@ -74,8 +74,7 @@ func TestChecksumVerifier_AcceptsEveryAlgorithmS3Defines(t *testing.T) {
 	}
 }
 
-// A wrong digest for every algorithm has to fail. This is the assertion that
-// would have caught PND-0189: before it, every one of these was a 200.
+// A wrong digest for every algorithm has to fail.
 func TestChecksumVerifier_RejectsEveryWrongDigest(t *testing.T) {
 	// The CRC64NVME digest, offered as if it were each algorithm's — well
 	// formed base64, wrong bytes, and the right length only for its own.
@@ -226,5 +225,108 @@ func TestChecksumVerifier_ResponseDigestAnswersTheAlgorithmAsked(t *testing.T) {
 func TestChecksumVerifier_AlgorithmWithoutDigestVerifiesNothing(t *testing.T) {
 	if err := runVerifier(t, objops.ChecksumRequest{Algorithm: objops.ChecksumCRC32}); err != nil {
 		t.Fatalf("declaring an algorithm with no digest must not fail: %v", err)
+	}
+}
+
+// ── Trailing digests (aws-chunked trailers) ────────────────────────────────
+
+// runTrailing feeds the check vector through a verifier whose digest arrives
+// after the body, the way the aws-chunked decoder hands it over: build, wrap,
+// read every byte, set the trailing digest (unless deliver is false), verify.
+func runTrailing(t *testing.T, alg objops.ChecksumAlgorithm, digest string, deliver bool) error {
+	t.Helper()
+	v, err := objops.NewChecksumVerifier(objops.ChecksumRequest{Algorithm: alg, Trailing: true})
+	if err != nil {
+		t.Fatalf("NewChecksumVerifier: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, v.Wrap(strings.NewReader(checkVector))); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if deliver {
+		if err := v.SetTrailingDigest(digest); err != nil {
+			return err
+		}
+	}
+	return v.Verify(vecSHA256Hex(), vecMD5Hex())
+}
+
+func TestChecksumVerifier_TrailingDigestVerified(t *testing.T) {
+	cases := map[objops.ChecksumAlgorithm]string{
+		objops.ChecksumCRC32:     vecCRC32,
+		objops.ChecksumCRC32C:    vecCRC32C,
+		objops.ChecksumCRC64NVME: vecCRC64NVME,
+		objops.ChecksumSHA1:      vecSHA1,
+		objops.ChecksumSHA256:    vecSHA256,
+	}
+	for alg, digest := range cases {
+		t.Run(string(alg), func(t *testing.T) {
+			if err := runTrailing(t, alg, digest, true); err != nil {
+				t.Fatalf("a correct trailing %s digest was rejected: %v", alg, err)
+			}
+			// An all-zero digest of the right length is well formed and wrong.
+			wrong := base64.StdEncoding.EncodeToString(make([]byte, len(mustDecode(t, digest))))
+			if err := runTrailing(t, alg, wrong, true); !errors.Is(err, objops.ErrBadDigest) {
+				t.Fatalf("a wrong trailing %s digest: want ErrBadDigest, got %v", alg, err)
+			}
+		})
+	}
+}
+
+func mustDecode(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		t.Fatalf("decode %q: %v", s, err)
+	}
+	return b
+}
+
+// A trailing digest that was promised and never arrived is not "nothing
+// declared": Verify must fail, whatever let the body end without it.
+func TestChecksumVerifier_TrailingDigestMissingFails(t *testing.T) {
+	if err := runTrailing(t, objops.ChecksumCRC32, "", false); !errors.Is(err, objops.ErrBadDigest) {
+		t.Fatalf("want ErrBadDigest for a trailer that never arrived, got %v", err)
+	}
+}
+
+func TestChecksumVerifier_TrailingDigestShapeAndOnce(t *testing.T) {
+	v, err := objops.NewChecksumVerifier(objops.ChecksumRequest{Algorithm: objops.ChecksumCRC32, Trailing: true})
+	if err != nil {
+		t.Fatalf("NewChecksumVerifier: %v", err)
+	}
+	if err := v.SetTrailingDigest("not base64!"); !errors.Is(err, objops.ErrInvalidDigest) {
+		t.Fatalf("malformed trailing digest: want ErrInvalidDigest, got %v", err)
+	}
+	if err := v.SetTrailingDigest(vecSHA256); !errors.Is(err, objops.ErrInvalidDigest) {
+		t.Fatalf("a SHA-256 offered as a CRC32: want ErrInvalidDigest, got %v", err)
+	}
+	if err := v.SetTrailingDigest(vecCRC32); err != nil {
+		t.Fatalf("well-formed trailing digest: %v", err)
+	}
+	if err := v.SetTrailingDigest(vecCRC32); err == nil {
+		t.Fatal("a second trailing digest was accepted")
+	}
+
+	// A verifier that declared nothing, or declared its digest up front, has
+	// no trailer to receive.
+	for _, req := range []objops.ChecksumRequest{{}, {Algorithm: objops.ChecksumCRC32, Digest: vecCRC32}} {
+		v, err := objops.NewChecksumVerifier(req)
+		if err != nil {
+			t.Fatalf("NewChecksumVerifier: %v", err)
+		}
+		if err := v.SetTrailingDigest(vecCRC32); err == nil {
+			t.Fatalf("an undeclared trailing digest was accepted for %+v", req)
+		}
+	}
+}
+
+func TestNewChecksumVerifier_TrailingNeedsAnAlgorithmAndNoDigest(t *testing.T) {
+	for _, req := range []objops.ChecksumRequest{
+		{Trailing: true},
+		{Algorithm: objops.ChecksumCRC32, Digest: vecCRC32, Trailing: true},
+	} {
+		if _, err := objops.NewChecksumVerifier(req); err == nil {
+			t.Fatalf("NewChecksumVerifier accepted %+v", req)
+		}
 	}
 }

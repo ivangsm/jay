@@ -2,10 +2,7 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -13,21 +10,20 @@ import (
 	"time"
 
 	"github.com/ivangsm/jay/auth"
+	"github.com/ivangsm/jay/internal/accesslog"
 	"github.com/ivangsm/jay/meta"
 )
 
 type ctxKey int
 
-const (
-	ctxKeyRequestID ctxKey = iota
-	ctxKeyToken
-)
+const ctxKeyToken ctxKey = iota
 
+// requestIDFromContext returns the ID withRequestID installed. The ID itself —
+// how it is minted, where it lives in the context, which header carries it —
+// is internal/accesslog's, shared with the admin listener so the two cannot
+// drift.
 func requestIDFromContext(ctx context.Context) string {
-	if id, ok := ctx.Value(ctxKeyRequestID).(string); ok {
-		return id
-	}
-	return ""
+	return accesslog.RequestID(ctx)
 }
 
 func tokenFromContext(ctx context.Context) *meta.Token {
@@ -37,33 +33,16 @@ func tokenFromContext(ctx context.Context) *meta.Token {
 	return nil
 }
 
-// generateRequestID produces a cryptographically random hex request ID.
-//
-// crypto/rand.Read's error is discarded because as of Go 1.24 it cannot happen:
-// the function is documented as "never returns an error, and always fills b
-// entirely" — if the OS cannot supply entropy, the runtime kills the process.
-// The `_, _` is for the linter, not to paper over a possible failure.
-func generateRequestID() string {
-	var buf [8]byte
-	_, _ = rand.Read(buf[:])
-	return hex.EncodeToString(buf[:])
-}
-
 // withRequestID mints the request ID and is the OUTERMOST middleware of the
 // chain. Everything else — the access log, the x-amz-request-id header, the
 // <RequestId> inside every error document — reads it from the context this
 // middleware installs, so all three carry the same value by construction.
 //
 // It has to be first because a middleware only ever sees the request it was
-// handed. While the ID was minted halfway down the chain (in the old
-// withRequestIDAndAuth), the logger wrapping it kept reading the ORIGINAL
-// request and logged request_id="" on every single line, while the client got
-// a real ID in its header: the one thing a request ID is for — finding the
-// request someone reports by the ID the server gave them — did not work.
-//
-// Minting it here also covers the paths that never reach the credential
-// middleware, all of which used to answer with no ID at all: the pre-auth IP
-// rate limiter's 429, the aws-chunked 501, and a presigned URL that fails to
+// handed: an ID minted further down the chain leaves an outer logger reading
+// the ORIGINAL request and logging request_id="". Minting it here also covers
+// the paths that never reach the credential middleware: the pre-auth IP rate
+// limiter's 429, a refused aws-chunked body, and a presigned URL that fails to
 // verify.
 //
 // The ID is always generated, never taken from an inbound header: a client
@@ -71,9 +50,7 @@ func generateRequestID() string {
 // forge log entries.
 func (h *Handler) withRequestID(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		reqID := generateRequestID()
-		w.Header().Set("x-amz-request-id", reqID)
-		next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyRequestID, reqID)))
+		next(w, accesslog.Stamp(w, r))
 	}
 }
 
@@ -100,13 +77,11 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w, status: 200}
+		sw := accesslog.NewRecorder(w)
 		// Deferred, not written after next() returns: a panic below skips
-		// everything after the call, so the ONE request that broke the process
-		// was the only one with no access line at all. withRecover normally
-		// absorbs the panic before it gets here, but the defer is what makes
-		// that a belt rather than the only strap — including for a panic
-		// raised by withRecover's own re-panic path.
+		// everything after the call, and the request that panicked is the one
+		// that most needs an access line. withRecover normally absorbs the
+		// panic first; the defer also covers its own re-panic path.
 		defer func() {
 			// remote_ip is the key the pre-auth rate limiter buckets by, so
 			// without it a 429 names no one and JAY_TRUST_PROXY_HEADERS cannot
@@ -114,17 +89,15 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 			// limiter derives it, from the same function, so the log cannot
 			// disagree with the decision.
 			//
-			// The token is deliberately NOT logged: withAuth resolves it
-			// further down the chain, into a context this middleware never
-			// sees, and the only way to hoist it back out is the shared mutable
-			// pointer the request-ID fix just removed. An identity in the log is
-			// not worth re-introducing the bug the log line is here to expose.
+			// The token is NOT logged: withAuth resolves it further down the
+			// chain, into a context this middleware never sees, and hoisting
+			// it back out would take a shared mutable pointer across the chain.
 			h.log.Info("request",
 				slog.String("request_id", requestIDFromContext(r.Context())),
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.String("remote_ip", clientIP(r, h.trustProxyHeaders)),
-				slog.Int("status", sw.status),
+				slog.Int("status", sw.Status()),
 				slog.Duration("duration", time.Since(start)),
 			)
 		}()
@@ -132,30 +105,17 @@ func (h *Handler) withLogging(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// withRecover turns a panic below it into a 500 that names the request.
+// withRecover turns a panic below it into a 500 that names the request. Left
+// to net/http, a panic closes the connection with no response and writes its
+// stack as plain text to the package-level `log`. Here the client gets an S3
+// error document with the same <RequestId> as its header, one Error line goes
+// out in the JSON stream with the panic value and the stack, and the counter
+// moves. It sits INSIDE withLogging, so the access line still comes out with
+// status 500 through the same statusWriter.
 //
-// Three things have to happen and none of them happened before: net/http's own
-// recovery closes the connection with no response at all, and writes its stack
-// to the package-level `log` — plain text on a stream that is JSON everywhere
-// else, which a collector that parses JSON drops on the floor. So the request
-// that broke the process was the only one leaving no trace, on exactly the
-// occasion when knowing which request it was matters most.
-//
-//   - The client gets a real S3 error document whose <RequestId> is the same
-//     string as the x-amz-request-id header it already received.
-//   - One Error line goes out in the same JSON stream as everything else,
-//     carrying the request id, the panic value and the stack.
-//   - The counter moves, so /_jay/metrics shows a process that is panicking.
-//
-// It sits INSIDE withLogging, so the access line still comes out and carries
-// status 500 — the recovered response goes through the same statusWriter.
-//
-// Recovering keeps the process alive with state that may be inconsistent, which
-// in an object store is a real trade rather than an obvious win. It is taken
-// deliberately: dying takes every other in-flight request down as well and
-// still explains nothing, whereas this answers the broken request honestly,
-// counts it, and leaves /health/ready as the thing that decides whether this
-// instance keeps taking traffic.
+// Recovering keeps the process alive with state that may be inconsistent:
+// /health/ready and the panic counter decide whether this instance keeps
+// taking traffic.
 func (h *Handler) withRecover(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
@@ -207,7 +167,7 @@ func (h *Handler) withRecover(next http.HandlerFunc) http.HandlerFunc {
 // is the reading that still produces an answer for the client.
 func responseStarted(w http.ResponseWriter) bool {
 	sw, ok := w.(*statusWriter)
-	return ok && sw.wroteHeader
+	return ok && sw.Started()
 }
 
 // requireAuth returns 401/403 if no valid token is present and the operation
@@ -298,57 +258,12 @@ func (h *Handler) authorizeLoadedBucket(
 	return true
 }
 
-// statusWriter wraps ResponseWriter to capture the status code and enable sendfile.
-//
-// wroteHeader records whether anything has reached the client yet. It is what
-// lets withRecover tell a panic that happened before the response started
-// (answerable with a 500) from one that happened halfway through a body
-// (answerable only by tearing the connection down).
-type statusWriter struct {
-	http.ResponseWriter
-	status      int
-	wroteHeader bool
-}
-
-func (sw *statusWriter) WriteHeader(code int) {
-	// The FIRST status is the one the client sees: net/http ignores every
-	// later WriteHeader. Recording the last one would have made the access log
-	// disagree with the response on any handler that tried twice.
-	if !sw.wroteHeader {
-		sw.status = code
-		sw.wroteHeader = true
-	}
-	sw.ResponseWriter.WriteHeader(code)
-}
-
-// Write records that the response has begun. A handler that writes without
-// calling WriteHeader first has implicitly sent a 200.
-func (sw *statusWriter) Write(b []byte) (int, error) {
-	sw.wroteHeader = true
-	return sw.ResponseWriter.Write(b)
-}
-
-// ReadFrom enables sendfile(2) when copying from *os.File to the response.
-func (sw *statusWriter) ReadFrom(r io.Reader) (int64, error) {
-	sw.wroteHeader = true
-	if rf, ok := sw.ResponseWriter.(io.ReaderFrom); ok {
-		return rf.ReadFrom(r)
-	}
-	return io.Copy(sw.ResponseWriter, r)
-}
-
-// Ensure statusWriter implements http.Flusher if the underlying writer does.
-func (sw *statusWriter) Flush() {
-	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// Compile-time interface checks.
-var (
-	_ http.ResponseWriter = (*statusWriter)(nil)
-	_ io.ReaderFrom       = (*statusWriter)(nil)
-)
+// statusWriter is the recorder withLogging installs: the status that reached
+// the client, whether the response has started (what withRecover asks), and a
+// ReadFrom that keeps sendfile(2) reachable. It is accesslog.Recorder, shared
+// with the admin listener; the name stays because the sendfile comments in
+// object_handlers.go and the middleware order in router.go refer to it.
+type statusWriter = accesslog.Recorder
 
 // sanitizeHeaderValue removes \r and \n characters to prevent CRLF header injection.
 var headerSanitizer = strings.NewReplacer("\r", "", "\n", "")

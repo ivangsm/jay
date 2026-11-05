@@ -158,7 +158,10 @@ func presignedTarget(t *testing.T, spec presignSpec) string {
 		if h != "host" {
 			value = s.headerValues[h]
 		}
-		canonicalHeaders.WriteString(h + ":" + strings.TrimSpace(value) + "\n")
+		canonicalHeaders.WriteString(h)
+		canonicalHeaders.WriteString(":")
+		canonicalHeaders.WriteString(strings.TrimSpace(value))
+		canonicalHeaders.WriteString("\n")
 	}
 
 	canonicalURI := awsURIEncode(s.path, false)

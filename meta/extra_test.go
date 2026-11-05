@@ -205,12 +205,8 @@ func TestBucketLimitExceeded(t *testing.T) {
 	var origMax int64 = MaxBucketsPerAccount
 	_ = origMax
 
-	// Test the limit at scale would be too slow; instead verify that at exactly
-	// MaxBucketsPerAccount the next create fails. We use a custom per-test by
-	// indirectly exercising the accountBucketCount path with a single overshoot
-	// via direct manipulation is not available — instead we create one bucket
-	// and verify stats tracking, as the limit guard is already tested by CreateBucket.
-	// Verify the counter is incremented on create and decremented on delete.
+	// MaxBucketsPerAccount is not reached here (too slow at scale); this only
+	// checks that the per-account listing follows a create and a delete.
 	b := &Bucket{ID: uuid.New().String(), Name: "count-test", OwnerAccountID: ownerID}
 	if err := db.CreateBucket(b); err != nil {
 		t.Fatalf("create: %v", err)

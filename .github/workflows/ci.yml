@@ -96,27 +96,6 @@ jobs:
       - name: Verify aws-cli
         run: aws --version
 
-      # Built from source like warp: dl.min.io stopped serving the prebuilt
-      # binary (410 Gone) on 2026-09-12 and took this job down with it. mc has
-      # no semver tags, so @latest resolves to the head of its default branch —
-      # which is the point: track what a current minio-go client does. It lands
-      # in $(go env GOPATH)/bin, which conformance.sh looks in.
-      - name: Install mc (minio-go)
-        run: |
-          set -euo pipefail
-          go install github.com/minio/mc@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      # GITHUB_PATH only affects later steps, so the version check is its own.
-      - name: Verify mc
-        run: mc --version
-
-      # warp lands in $(go env GOPATH)/bin, which conformance.sh looks in.
-      # Unpinned on purpose: the point is to track what a current minio-go
-      # client does, not to freeze one.
-      - name: Install warp
-        run: go install github.com/minio/warp@latest
-
       - name: Run the conformance suite
         run: scripts/conformance.sh --require-all
 
@@ -129,8 +108,10 @@ jobs:
   # The targets parse bytes straight off a socket, and ReadHandshake and
   # ReadHeader do it BEFORE authentication: anything that can reach the native
   # port can drive them. A crash there is reachable by an unauthenticated peer.
+  # FuzzChunkedReader parses an aws-chunked S3 body: it runs after the request
+  # signature verifies, but every byte past the headers is still the client's.
   fuzz:
-    name: Fuzz the wire decoder
+    name: Fuzz the wire decoders
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -146,13 +127,15 @@ jobs:
       - name: Fuzz
         run: |
           set -euo pipefail
-          for target in FuzzDecoder FuzzDecodeMessages FuzzReadHandshake FuzzReadHeader FuzzRoundTrip; do
-            echo "::group::$target"
-            go test ./proto/ -run "^${target}\$" -fuzz "^${target}\$" -fuzztime 60s
+          for spec in proto:FuzzDecoder proto:FuzzDecodeMessages proto:FuzzReadHandshake \
+            proto:FuzzReadHeader proto:FuzzRoundTrip auth:FuzzChunkedReader; do
+            pkg="${spec%%:*}" target="${spec#*:}"
+            echo "::group::$pkg/$target"
+            go test "./$pkg/" -run "^${target}\$" -fuzz "^${target}\$" -fuzztime 60s
             echo "::endgroup::"
           done
 
-      # A failing input is written to proto/testdata/fuzz/<target>/. Without
+      # A failing input is written to <pkg>/testdata/fuzz/<target>/. Without
       # this the job reports a crash whose reproducer lives only on a runner
       # that is about to be destroyed.
       - name: Upload failing corpus
@@ -160,5 +143,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-corpus
-          path: proto/testdata/fuzz/
+          path: |
+            proto/testdata/fuzz/
+            auth/testdata/fuzz/
           if-no-files-found: ignore

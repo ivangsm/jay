@@ -40,7 +40,9 @@ func deleteRequest(keys ...string) string {
 	var sb strings.Builder
 	sb.WriteString(`<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
 	for _, k := range keys {
-		sb.WriteString("<Object><Key>" + k + "</Key></Object>")
+		sb.WriteString("<Object><Key>")
+		sb.WriteString(k)
+		sb.WriteString("</Key></Object>")
 	}
 	sb.WriteString("</Delete>")
 	return sb.String()

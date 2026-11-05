@@ -21,10 +21,6 @@ func Run(db *meta.DB, st *store.Store, log *slog.Logger) error {
 	return RunWithMetrics(db, st, log, nil)
 }
 
-// RunWithMetrics is Run with an optional metrics sink. m may be nil, in which
-// case no counters are recorded. Every effective quarantine (metadata entry
-// quarantined or orphaned physical file moved aside) increments
-// ObjectsQuarantined.
 // recoveryTally counts what one reconciliation pass had to fix.
 type recoveryTally struct {
 	quarantinedMeta  int
@@ -32,19 +28,13 @@ type recoveryTally struct {
 	orphanedFiles    int
 }
 
-// RunWithMetrics reconciles metadata against what is actually on disk, and is
-// what makes jay safe to restart after a crash.
+// RunWithMetrics reconciles metadata against what is actually on disk. m may be
+// nil; otherwise every effective quarantine increments ObjectsQuarantined.
 //
-// Two kinds of inconsistency exist and both are quarantined rather than
-// deleted:
-//
-//   - metadata pointing at a file that is not there — the record is quarantined,
-//     because serving it would 500 on every read;
-//   - a file with no metadata pointing at it — the file is quarantined, because
-//     nothing can reach it and it would otherwise occupy disk forever.
-//
-// Quarantine, never delete: an inconsistency is evidence of something that went
-// wrong, and deleting it destroys the only trace of what.
+// Both kinds of inconsistency are quarantined, never deleted: metadata pointing
+// at a missing file (serving it would 500 on every read) and a file no metadata
+// points at (unreachable, and otherwise on disk forever). An inconsistency is
+// evidence of something that went wrong, and deleting it destroys the trace.
 func RunWithMetrics(db *meta.DB, st *store.Store, log *slog.Logger, m *maintenance.Metrics) error {
 	log.Info("recovery: starting reconciliation")
 

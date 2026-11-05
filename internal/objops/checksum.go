@@ -54,11 +54,10 @@ func (e *ChecksumError) Unwrap() error { return e.Kind }
 // ChecksumAlgorithm names one of the digests a client may declare on an upload.
 //
 // The set is closed and complete: these five are every algorithm S3 defines for
-// object payloads, and jay computes all five. That is deliberate — the
-// alternative (accepting an algorithm and answering with a SHA-256 nobody asked
-// for) is the defect this file exists to remove, and answering 501 instead
-// would break the reference client, which declares CRC64NVME on every single
-// upload it makes.
+// object payloads, and jay computes all five. Answering 501 to one of them
+// would break the AWS CLI, which declares CRC64NVME on every upload; accepting
+// it and answering with a SHA-256 nobody asked for is a verification that never
+// happened.
 type ChecksumAlgorithm string
 
 // The algorithms S3 defines for object checksums.
@@ -124,12 +123,9 @@ func (a ChecksumAlgorithm) newHash() hash.Hash {
 	case ChecksumCRC64NVME:
 		return crc64.New(crc64NVMETable)
 	case ChecksumSHA1:
-		// Semgrep's weak-crypto rule flags this, and it is right about SHA-1 in
-		// general and wrong about it here: S3 defines x-amz-checksum-sha1 as
-		// SHA-1, so the only way to "fix" it would be to answer a different
-		// algorithm than the client asked for. No nolint directive: gosec is
-		// not in the lint gate, and a directive that suppresses nothing is
-		// worse than the comment that explains why.
+		// Not a security choice: S3 defines x-amz-checksum-sha1 as SHA-1, and
+		// the only way to "fix" a weak-crypto finding here would be to answer
+		// a different algorithm than the client asked for.
 		return sha1.New()
 	case ChecksumSHA256, "":
 		return nil
@@ -168,6 +164,11 @@ type ChecksumRequest struct {
 	// Algorithm is set: some clients name the algorithm and let the server
 	// compute it, which jay honours by echoing the value back.
 	Digest string
+	// Trailing marks a digest that is not known yet: it arrives in the
+	// trailer of an aws-chunked body, after the last byte of data, and is
+	// handed over with SetTrailingDigest. Unlike an empty Digest it is a
+	// promise — Verify fails if the digest never came.
+	Trailing bool
 }
 
 // Empty reports whether the request declared nothing at all.
@@ -191,6 +192,8 @@ type ChecksumVerifier struct {
 	// extra is the hasher for req.Algorithm, nil when the algorithm is SHA-256
 	// (the store already produces it) or when no algorithm was declared.
 	extra hash.Hash
+	// trailingSet records that a Trailing digest has arrived.
+	trailingSet bool
 }
 
 // NewChecksumVerifier validates the declaration itself and builds the hasher it
@@ -218,18 +221,56 @@ func NewChecksumVerifier(req ChecksumRequest) (*ChecksumVerifier, error) {
 				return nil, err
 			}
 		}
-	} else if req.Digest != "" {
+	} else if req.Digest != "" || req.Trailing {
 		// Unreachable through the HTTP parser, which always sets both. Guarded
 		// anyway: a digest with no algorithm cannot be checked against
-		// anything, and accepting it would be the silent pass this file removes.
+		// anything, and must not pass silently.
 		return nil, &ChecksumError{
 			Header: checksumHeaderPrefix + "*",
 			Kind:   ErrUnknownChecksumAlgorithm,
 			Detail: "a checksum was declared without an algorithm",
 		}
 	}
+	if req.Trailing && req.Digest != "" {
+		// Also unreachable through the parser: a digest cannot be both in a
+		// header and in the trailer, and the parser refuses that request.
+		return nil, &ChecksumError{
+			Header: req.Algorithm.Header(),
+			Kind:   ErrUnknownChecksumAlgorithm,
+			Detail: "a checksum cannot be declared both up front and in the trailer",
+		}
+	}
 
 	return &ChecksumVerifier{req: req, extra: req.Algorithm.newHash()}, nil
+}
+
+// SetTrailingDigest hands over the digest of a Trailing declaration once the
+// trailer carrying it has arrived — which is after the last byte of data and
+// before the body reports its end, so Verify, running in the store's
+// pre-rename hook, compares against it like against any declared digest.
+//
+// The value is shape-checked exactly as a header would be. A second call, or a
+// call on a verifier that did not expect a trailer, is refused: the trailer is
+// the one place a digest can arrive late, and only once.
+func (v *ChecksumVerifier) SetTrailingDigest(value string) error {
+	if v == nil || !v.req.Trailing {
+		return &ChecksumError{
+			Header: checksumHeaderPrefix + "*",
+			Kind:   ErrUnknownChecksumAlgorithm,
+			Detail: "a trailing checksum arrived that was not declared",
+		}
+	}
+	header := v.req.Algorithm.Header()
+	if v.trailingSet {
+		return &ChecksumError{Header: header, Kind: ErrInvalidDigest, Detail: "the trailing checksum arrived twice"}
+	}
+	size, _ := v.req.Algorithm.digestSize()
+	if err := checkDigestShape(header, value, size); err != nil {
+		return err
+	}
+	v.req.Digest = value
+	v.trailingSet = true
+	return nil
 }
 
 // checkDigestShape decodes a declared digest and checks its length.
@@ -272,6 +313,18 @@ func (v *ChecksumVerifier) Verify(sha256Hex, md5Hex string) error {
 	if v.req.ContentMD5 != "" {
 		if err := compareDigest(contentMD5Header, v.req.ContentMD5, hexToBase64(md5Hex)); err != nil {
 			return err
+		}
+	}
+
+	// A trailing digest that never arrived is not "nothing declared": the
+	// client promised one. The aws-chunked decoder already refuses a body whose
+	// declared trailer is missing; this is the second lock, so that no path can
+	// turn a missing trailer into an unverified 200.
+	if v.req.Trailing && !v.trailingSet {
+		return &ChecksumError{
+			Header: v.req.Algorithm.Header(),
+			Kind:   ErrBadDigest,
+			Detail: "the trailing checksum declared in x-amz-trailer never arrived",
 		}
 	}
 

@@ -36,11 +36,8 @@ func (h *Handler) denyMultipartPolicy(w http.ResponseWriter, r *http.Request, bu
 		return false
 	}
 
-	// Lenient rather than v2's defaults: bucket policies are written by hand,
-	// and v1 matched field names case-insensitively. Under v2's case-sensitive
-	// defaults an AWS-style policy ("Effect"/"Statements") would stop parsing
-	// and its Deny statement would vanish silently — opening access where it
-	// used to be refused. Lenient preserves v1's matching.
+	// Lenient, not v2's defaults: under case-sensitive matching an AWS-style
+	// policy ("Effect"/"Statements") parses with its Deny silently gone.
 	var policy auth.BucketPolicy
 	if err := jsonv2.Unmarshal(bucket.PolicyJSON, &policy, jsonx.Lenient); err != nil {
 		h.log.Warn("multipart: malformed bucket policy, failing closed", "bucket", bucket.Name, "err", err)
@@ -234,16 +231,26 @@ func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 
 	checksum, size, locationRef, err := h.store.WritePartVerified(uploadID, partNumber, body, verify)
 	if err != nil {
+		var chunkedErr *auth.ChunkedBodyError
 		switch {
 		case errors.Is(err, objops.ErrObjectTooLarge):
 			h.log.Warn("upload part exceeds max size",
 				"upload", uploadID, "part", partNumber, "size", seenSize, "max", maxSize)
 			writeS3Error(w, r, http.StatusBadRequest, s3ErrEntityTooLarge,
 				"Your proposed upload exceeds the maximum allowed object size", resource)
-		case errors.Is(err, objops.ErrBadDigest):
+		case errors.Is(err, objops.ErrBadDigest), errors.Is(err, objops.ErrInvalidDigest):
+			// ErrInvalidDigest can only surface here from a trailing checksum,
+			// which is shape-checked when it arrives after the data.
 			h.log.Warn("upload part checksum mismatch, nothing written",
 				"err", err, "upload", uploadID, "part", partNumber)
 			h.writeChecksumError(w, r, err, resource)
+		case errors.As(err, &chunkedErr):
+			// The aws-chunked decoder refused the part — a chunk signature that
+			// does not verify, or framing that does not parse — before the
+			// store renamed it, so the part it retries is untouched.
+			h.log.Warn("upload part aws-chunked body rejected, nothing written",
+				"err", err, "upload", uploadID, "part", partNumber)
+			h.writeChunkedBodyError(w, r, err, resource)
 		default:
 			h.log.Error("write part", "err", err, "upload", uploadID, "part", partNumber)
 			writeS3Error(w, r, http.StatusInternalServerError, S3ErrInternalError, "Failed to write part", resource)
@@ -297,11 +304,9 @@ func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	// A checksum declared here describes the ASSEMBLED object, and S3 computes
 	// it by composing the part digests rather than by hashing the result. jay
-	// does not implement that composition, and accepting the header would mean
-	// answering 200 to a verification that never happened — the exact defect
-	// PND-0189 removed from PutObject. 501, the same answer every other
-	// unimplemented S3 feature gets here. No measured client sends it: the AWS
-	// CLI's CompleteMultipartUpload carries part numbers and ETags only.
+	// does not implement that composition, so the header gets 501 like every
+	// other unimplemented S3 feature, never a 200 over a verification that did
+	// not happen. The AWS CLI does not send it.
 	for _, candidate := range checksumValueHeaders {
 		if strings.TrimSpace(r.Header.Get(candidate.header)) == "" {
 			continue

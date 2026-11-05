@@ -17,14 +17,9 @@ import (
 	"github.com/ivangsm/jay/store"
 )
 
-// These tests are the disaster-recovery runbook, executed.
-//
-// The hourly snapshot covers metadata and nothing else, so "jay has verified
-// backups" is only half a sentence: a restore needs the object bytes from
-// somewhere else, and it needs them FIRST. Both halves of that claim are
-// asserted here against real files and a real reconciliation pass, because the
-// alternative — a page of instructions nobody has ever run — is exactly the
-// kind of guarantee that turns out to be theatre at the worst possible moment.
+// These tests are the disaster-recovery runbook, executed against real files
+// and a real reconciliation pass: the hourly snapshot covers metadata only, so
+// a restore needs the object bytes from somewhere else, and needs them FIRST.
 //
 // The procedure under test is the one documented in
 // site/src/content/docs/guides/backup-and-restore.md. If it changes there, it
@@ -222,12 +217,10 @@ func TestDisasterRecovery_ObjectsThenMetadata(t *testing.T) {
 	}
 }
 
-// TestDisasterRecovery_MetadataSnapshotAloneRecoversNothing is the claim that
-// PND-0169 is about, asserted rather than documented: restoring only what jay
-// backs up gives an installation that quarantines every object it ever held.
-//
-// The snapshot verifies fine and reports its object count. Not one of those
-// records has bytes behind it.
+// TestDisasterRecovery_MetadataSnapshotAloneRecoversNothing: restoring only
+// what jay backs up gives an installation that quarantines every object it
+// ever held. The snapshot verifies fine and reports its object count; not one
+// of those records has bytes behind it.
 func TestDisasterRecovery_MetadataSnapshotAloneRecoversNothing(t *testing.T) {
 	keys := []string{"invoices/2026-09.pdf", "avatars/ivan.webp", "big/blob.bin"}
 	live := newLiveInstall(t, keys...)

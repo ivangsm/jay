@@ -189,9 +189,9 @@ func TestListMultipartUploads_OtherAccountUploadNotListed(t *testing.T) {
 		t.Fatalf("create account: %v", err)
 	}
 	// Seeded straight into bbolt, not through the API: a token of another
-	// account can no longer start an upload in this bucket at all (PND-0185).
-	// The row is planted anyway so the listing is asked the question it is
-	// here to answer — does it show an upload that is not this account's?
+	// account cannot start an upload in this bucket at all. The row is planted
+	// anyway so the listing is asked the question it is here to answer — does
+	// it show an upload that is not this account's?
 	bucket, err := db.GetBucket("photos")
 	if err != nil {
 		t.Fatalf("get bucket: %v", err)

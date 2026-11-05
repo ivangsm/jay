@@ -210,32 +210,6 @@ type ListObjectsResult struct {
 	NextStartAfter string
 }
 
-// ListObjects lists objects in a bucket with prefix, delimiter, pagination support.
-//
-// Iteration is split into short read transactions (batchSize keys each) so that
-// long listings do not starve bbolt writers (bbolt allows a single writer and
-// blocks it for the entire lifetime of any overlapping read tx). Between
-// batches the read tx is released, giving writers a chance to commit; the next
-// batch resumes from the last key seen.
-//
-// Externally observable semantics (returned object set, CommonPrefixes,
-// IsTruncated, delimiter handling, prefix matching, maxKeys cap) are preserved
-// bit-identical to the previous single-tx implementation.
-//
-// NextStartAfter is the last key fully consumed by the page — that is, the last
-// key that either produced an object, produced a CommonPrefix, or was folded
-// into a CommonPrefix already emitted in this page (as well as records skipped
-// because they were corrupt or not active). It is NOT necessarily the key of the
-// last object returned. This is what makes delimiter pagination terminate:
-// startAfter is exclusive, so the next page resumes strictly after the last key
-// this page looked at, which guarantees monotonic progress even when a page ends
-// on (or consists entirely of) CommonPrefixes. Because members of an already
-// emitted CommonPrefix are consumed before the maxKeys check, a prefix group is
-// never split across pages, so no CommonPrefix can be emitted twice.
-//
-// Real S3 uses an opaque NextContinuationToken; a plain "last key seen" cursor
-// is sufficient here and keeps the token human-readable and compatible with
-// start-after.
 // defaultMaxKeys is the page size S3 uses when a client does not ask for one.
 const defaultMaxKeys = 1000
 
@@ -273,6 +247,12 @@ type listCursor struct {
 // The listing is paged internally: bbolt is read in small batches and each batch
 // is processed after its transaction closes, so a large listing never holds a
 // read transaction open long enough to stall writers.
+//
+// NextStartAfter is the last key the page fully consumed (emitted, rolled into
+// a CommonPrefix, or skipped), not necessarily the last object returned;
+// startAfter is exclusive, so the next page always makes progress, even when
+// this one ends on a CommonPrefix. Members of an emitted prefix are consumed
+// before the maxKeys check, so a prefix is never split across pages.
 func (db *DB) ListObjects(bucketID, prefix, delimiter, startAfter string, maxKeys int) (*ListObjectsResult, error) {
 	if maxKeys <= 0 {
 		maxKeys = defaultMaxKeys
@@ -563,6 +543,99 @@ func (db *DB) RestoreObject(bucketID, key string) error {
 		}
 		return nil
 	})
+}
+
+// ErrObjectNotQuarantined is returned by the quarantine-only operations when
+// the record exists but is not (or is no longer) the quarantined object they
+// were asked about.
+var ErrObjectNotQuarantined = errors.New("object is not quarantined")
+
+// RestoreQuarantinedObject sets a quarantined object back to "active", but
+// only if the record is still quarantined AND still the object objectID — the
+// one whose bytes the caller verified. Checked in the same write transaction
+// that restores it, so a record overwritten or restored in between is never
+// restored on the strength of another object's checksum.
+func (db *DB) RestoreQuarantinedObject(bucketID, key, objectID string) error {
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return ErrBucketNotFound
+		}
+		data := bk.Get([]byte(key))
+		if data == nil {
+			return ErrObjectNotFound
+		}
+		var obj Object
+		if err := decodeObject(data, &obj); err != nil {
+			return err
+		}
+		if obj.State != "quarantined" || obj.ObjectID != objectID {
+			return ErrObjectNotQuarantined
+		}
+		obj.State = "active"
+		obj.UpdatedAt = time.Now().UTC()
+		updated, err := encodeObject(&obj)
+		if err != nil {
+			return err
+		}
+		if err := bk.Put([]byte(key), updated); err != nil {
+			return err
+		}
+		// Quarantining took the object out of the bucket stats; restoring it
+		// puts it back.
+		return addBucketStat(tx, bucketID, 1, obj.SizeBytes)
+	})
+}
+
+// DeleteQuarantinedObject deletes a quarantined object — its file and its
+// record — and refuses anything that is not quarantined, all inside ONE write
+// transaction.
+//
+// removeFile is called with the record, after the state check and before the
+// record is deleted, while the transaction holds bbolt's single writer lock.
+// Nothing can restore or overwrite the record between the check and the
+// delete, so a live object's file is never removed. The order is file first,
+// record second, and a removeFile error aborts the transaction:
+//
+//   - removeFile fails: nothing changes. The record stays quarantined and
+//     listed, and the purge can be retried.
+//   - removeFile succeeds and the commit fails: the record stays quarantined
+//     with no file behind it — exactly a "record without a file" quarantine,
+//     still listed, and a retry finishes the purge (a missing file is not an
+//     error for removeFile).
+//
+// The reverse order would, on a failed file removal, leave a file with no
+// record. Recovery quarantines such a file into quarantine/ at the next start,
+// where no API lists or purges it: an object reported as purged whose bytes
+// are still on disk, out of reach.
+//
+// The returned object is the record that was deleted.
+func (db *DB) DeleteQuarantinedObject(bucketID, key string, removeFile func(*Object) error) (*Object, error) {
+	var obj Object
+	err := db.bolt.Update(func(tx *bolt.Tx) error {
+		bk := tx.Bucket(objectsBucketName(bucketID))
+		if bk == nil {
+			return ErrBucketNotFound
+		}
+		data := bk.Get([]byte(key))
+		if data == nil {
+			return ErrObjectNotFound
+		}
+		if err := decodeObject(data, &obj); err != nil {
+			return err
+		}
+		if obj.State != "quarantined" {
+			return ErrObjectNotQuarantined
+		}
+		if err := removeFile(&obj); err != nil {
+			return fmt.Errorf("meta: remove the file of quarantined object %s: %w", key, err)
+		}
+		return bk.Delete([]byte(key))
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &obj, nil
 }
 
 // DeleteObjectMetaAny removes object metadata regardless of state.

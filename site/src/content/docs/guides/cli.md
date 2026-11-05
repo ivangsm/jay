@@ -7,6 +7,9 @@ The server binary is also the client. Any subcommand talks to a running Jay over
 the [native protocol](/jay/guides/native-protocol/); with no subcommand, `jay`
 starts the server.
 
+It authenticates with a token id and secret, which `jay-admin create-token`
+mints — see [the first token](/jay/install/#the-first-token).
+
 ```bash
 export JAY_TOKEN_ID=<token_id>
 export JAY_TOKEN_SECRET=<token-secret>

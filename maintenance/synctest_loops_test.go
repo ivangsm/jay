@@ -10,24 +10,17 @@ import (
 	"github.com/ivangsm/jay/meta"
 )
 
-// Los loops de temporizador del GC y del scrubber eran intesteables: la
-// primera pasada del GC llega al minuto y la del scrubber a los 30 s, y
-// después cada `interval` (1 h y 6 h en producción). Lo único que se podía
-// probar era llamar a RunOnce()/RunIncremental() directo, o sea, todo menos el
-// agendado — que es justamente donde estaban los bugs (el drenado muerto del
-// timer, el Reset después de NotifyDeletion).
+// The GC and scrubber timer loops (first pass at 1 min / 30 s, then every
+// `interval`) run under testing/synctest: synctest.Sleep advances the fake
+// clock at once and synctest.Wait blocks until the whole bubble is idle.
 //
-// testing/synctest corre el test en una burbuja con reloj falso: synctest.Sleep
-// adelanta el tiempo de golpe y synctest.Wait espera a que toda la burbuja
-// quede bloqueada. Un test de 25 horas simuladas tarda milisegundos.
-//
-// Ojo con el reloj falso: la burbuja arranca en 2000-01-01, así que cualquier
-// comparación contra el mtime REAL de un archivo en disco da tiempos negativos.
-// Por eso estos tests observan la limpieza de multipart (cuyo CreatedAt se
-// escribe dentro de la burbuja) y no la de archivos temporales.
+// The bubble's clock starts at 2000-01-01, so any comparison against the REAL
+// mtime of a file on disk goes negative. These tests therefore observe the
+// multipart cleanup (whose CreatedAt is written inside the bubble), never the
+// temp-file one.
 
-// seedStaleUpload deja un multipart upload "initiated" con la marca de tiempo
-// del reloj de la burbuja, para que envejezca cuando el test adelante el reloj.
+// seedStaleUpload leaves an "initiated" multipart upload stamped with the
+// bubble's clock, so it ages when the test advances time.
 func seedStaleUpload(t *testing.T, db *meta.DB) string {
 	t.Helper()
 	uploadID := uuid.New().String()
@@ -56,8 +49,8 @@ func uploadExists(t *testing.T, db *meta.DB, uploadID string) bool {
 	return false
 }
 
-// TestGCLoop_FirstPassAtOneMinute fija el agendado del loop del GC: no corre
-// nada antes del minuto, y a partir de ahí repite cada `interval`.
+// TestGCLoop_FirstPassAtOneMinute pins the GC schedule: nothing runs before
+// the first minute, then every `interval`.
 func TestGCLoop_FirstPassAtOneMinute(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		gc, db, _ := testGCWithStore(t, time.Hour)
@@ -98,10 +91,9 @@ func TestGCLoop_FirstPassAtOneMinute(t *testing.T) {
 	})
 }
 
-// TestGCLoop_NotifyDeletionCorreYaYReagenda cubre la rama que tocó la limpieza
-// del drenado muerto del timer: NotifyDeletion dispara una pasada inmediata y
-// deja el temporizador reagendado un `interval` completo, sin un disparo
-// espurio pegado atrás.
+// TestGCLoop_NotifyDeletionCorreYaYReagenda: NotifyDeletion triggers an
+// immediate pass and re-arms the timer for a full `interval`, with no spurious
+// tick behind it.
 func TestGCLoop_NotifyDeletionCorreYaYReagenda(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		gc, db, _ := testGCWithStore(t, time.Hour)

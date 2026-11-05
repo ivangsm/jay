@@ -64,11 +64,28 @@ Two properties of that table are contract, not implementation detail:
 - **A torn socket gets no answer at all.** If the handshake cannot be read
   because the peer went away, the server closes without writing. Absence of a
   response is therefore *not* a status — a client that sees EOF here saw a
-  network failure, not a rejection.
+  network failure, or the one flood case described below, never a rejection
+  of its credentials.
 
 `ServerBusy` is answered **before** the client's handshake is read. The reply is
 self-describing and the client is already blocked waiting for exactly these
 bytes, so the exchange completes; it just completes with a refusal.
+
+The server then half-closes and reads out whatever the client sent, until the
+client hangs up or 2 seconds pass. That is not politeness: the client's
+handshake is usually already in the server's receive buffer, and closing a
+socket with unread data makes the kernel send a reset. Linux and macOS still
+deliver the status that arrived before a reset, but a TCP stack is allowed to
+discard received data once one follows, and the status is the only thing the
+refusal exists to say. With the half-close the connection ends in a FIN.
+
+Refusing takes its own goroutine, never the accept loop — over TLS the status
+cannot be written before a TLS handshake, which waits on the peer's
+ClientHello — and at most **64** refusals are in flight at once. A connection
+that arrives while all 64 are busy is closed without a status. Under that
+flood a client sees the EOF it saw before `ServerBusy` existed; the bound is
+what keeps a flood past the connection cap from spending the file descriptors
+the cap exists to protect.
 
 The whole handshake must finish within **10 seconds**.
 
@@ -112,6 +129,9 @@ change the wire. Do not infer a maximum object size from this protocol.
 
 The header is followed by `meta_len` bytes of metadata, then `data_len` bytes
 of body. Both may be zero.
+
+A frame whose `meta_len` exceeds 1 MiB is a protocol error: the server closes
+the connection without answering and without reading the block.
 
 **There is no version byte in the frame header.** The version travels in the
 handshake only, so it pins the dialect for the connection and cannot report a
@@ -256,11 +276,86 @@ These codes are part of v1. A client may branch on them:
 | `NoSuchBucket` | Not found | — |
 | `NoSuchKey` | Not found | — |
 | `NoSuchUpload` | Not found | Unknown or expired multipart upload |
-| `RateLimitExceeded` | Bad request | **Retryable.** The only retryable `0x03` |
+| `RateLimitExceeded` | Bad request | **Retryable.** The only retryable `0x03`. May close the connection — see [Refusing a frame](#refusing-a-frame-without-reading-it) |
 | `UnknownOp` | Bad request | Opcode this server does not implement |
 
 The `message` field is for humans and may change at any time. **Never branch on
 it.**
+
+## Refusing a frame without reading it
+
+The server decides whether to serve a frame from its 17-byte header, before it
+reads the metadata or the body. When it refuses one, it has two ways to keep
+the stream aligned — read the rest of the frame and throw it away, or close
+the connection — and the choice depends on how much is left:
+
+| Refusal | Read and discarded, connection kept | Answered unread, connection closed |
+|---|---|---|
+| Rate limited (`RateLimitExceeded`) | `data_len` ≤ **10 MiB**; the metadata is read on top | `data_len` > 10 MiB |
+| Any other answer to a frame whose body was not read to the end — an error, or a body sent with an operation that takes none | unread rest of the body ≤ **10 MiB** | unread rest > 10 MiB |
+
+In the Go package these are `RateLimitDrainSize` and `MaxDrainSize`. Both
+bound the body alone: the metadata is capped by `MaxMetaSize` either way.
+
+**The answer is always written before the close.** A client refused mid-upload
+is told why — `RateLimitExceeded`, `AccessDenied`, `EntityTooLarge` — rather
+than finding a connection that dropped without a word.
+
+**Today the two thresholds coincide, for the sake of older clients.**
+Every native client up to v0.16.0 was built against a server that drained any
+rate-limited body up to 10 MiB, and it pools the connection after every answer
+it reads. A server that closed on it after a smaller rate-limited upload would
+turn its `RateLimitExceeded` into `broken pipe` and, when the body fitted in the
+socket buffers, fail its next request on the connection the server closed. So
+the rate limiter keeps the rule those clients know, the body against 10 MiB,
+and they see no change.
+
+`RateLimitDrainSize` is meant to come down to 1 MiB (`MaxMetaSize`). A rate
+limit fires under load, over and over, and draining 10 MiB per refused upload
+costs the server the full body in bandwidth every time; 1 MiB is what the server
+already reads from any frame before it knows what the frame is for. That waits
+until no client older than the release that introduced `RateLimitDrainSize` is
+left. Whatever its value, **a server keeps the connection after a rate-limited
+body of up to `MaxMetaSize`**: that floor is what current clients rely on.
+
+**Both thresholds are contract, each for a different reader.** A client decides
+from `MaxDrainSize` whether a connection survived an error answer, so lowering
+it makes a client built against the old value pool connections the server
+closed. `RateLimitDrainSize` is what the clients that predate it rely on;
+current clients rely only on its floor. Raising either is safe; lowering either
+breaks someone.
+
+What a client has to do about it:
+
+1. **When writing a body fails because the peer closed or reset the
+   connection, read the answer before reporting the failure.** The server
+   answered before closing, so the answer is in the receive buffer; it is the
+   true error, where the socket only knows "broken pipe". An answer read this
+   way is never `OK`: a body that was not written whole was not stored.
+2. **After an error answer, do not reuse the connection** if the request had
+   `data_len` > 10 MiB (`MaxDrainSize`), or if the answer is `RateLimitExceeded`
+   and the request had `data_len` > 1 MiB (`MaxMetaSize`). When the body fits in
+   the socket buffers the client's write completes before the close arrives, it
+   reads a perfectly ordinary answer, and nothing on the wire says the server
+   closed. The rule errs toward dropping: a connection the server kept costs one
+   reconnect, a dead one in the pool costs a failed request.
+
+The rate-limit half of rule 2 uses the floor, not today's
+`RateLimitDrainSize`, on purpose. A client that decided by today's value would
+have 10 MiB built in, and would pool connections the server closed on the day
+the server lowers it. Deciding by the floor costs a reconnect after a
+rate-limited upload between 1 and 10 MiB today, and keeps the client right
+about either value.
+
+The Go client does both. A client that predates these rules (v0.16.0 and
+earlier) never reports a refused request as a success and never hangs on one.
+Against today's thresholds, a rate-limited upload of up to 10 MiB still gets it
+`RateLimitExceeded` and a connection that keeps working, as it always did.
+Anything refused unread — a larger rate-limited body, or a refused body with
+more than 10 MiB left unread — reaches it as a transport error
+(`broken pipe`, `connection reset by peer`) instead of the code, because it
+does not look behind a failed write; the servers it was built against closed
+on those frames too.
 
 ## Stream IDs
 
@@ -291,20 +386,52 @@ cancelled 5 GiB upload costs the connection.
 
 ## Back pressure
 
-v1 defines **no flow control of its own** and relies entirely on TCP's. A
-reader that stops reading stops the writer through the socket buffer; there are
-no windows, credits or pause frames.
+v1 defines **no flow control of its own** and relies entirely on TCP's. That
+is a decision, not a gap. A connection carries one request at a time and
+`stream_id` is always zero, so there is no multiplexing whose streams would
+need windows or credits of their own. The server reads a body straight into
+the file it is writing, synchronously: when the disk falls behind, the copy
+slows, the socket buffer fills, and TCP stops the sender. Nothing queues in
+memory because nothing is queued. The same holds in the other direction for a
+client that stops reading.
 
 What bounds a stalled peer is deadlines, not back pressure. Both directions
 scale their deadline with the declared transfer size: a floor of 30 seconds
 plus an allowance of 1 MB/s. A transfer slower than that is cut off; a large
 transfer that keeps up is not.
 
+What the server adds on top are **limits**, each with its own answer:
+
+| Limit | Scope | Setting (default) | When exceeded |
+|---|---|---|---|
+| Concurrent connections | Server | `JAY_NATIVE_MAX_CONNS` (1000) | Handshake status `ServerBusy` |
+| Requests per second | Token, shared across its connections | `JAY_RATE_LIMIT` / `JAY_RATE_BURST` (100, burst 200) | `RateLimitExceeded`. A refused body up to 10 MiB is read out and the connection kept; a larger one is not read and the connection closes — see [Refusing a frame](#refusing-a-frame-without-reading-it) |
+| Body bytes per second | Token, shared across its connections and both directions | `JAY_NATIVE_TOKEN_BYTES_PER_SEC` (0, no cap) | Nothing is refused: the bytes wait |
+
+The byte cap meters object bodies on the wire — `PutObject` and `UploadPart`
+bodies read, `GetObject` and `GetObjectRange` bodies written. Server-side work
+that moves no bytes over the connection (`CopyObject`, assembling a multipart
+upload) and bodies drained after a refusal are not metered. The wait happens
+where the bytes are, so the peer is slowed by TCP exactly as it would be by a
+slow disk, and the time the server spends waiting is added to its own
+deadline: the cap never makes the server time out its client.
+
+It can make the **client** time out its own request. A client that sizes its
+deadlines by an expected throughput — the Go client assumes 1 MiB/s, like the
+server's floor — fails a large transfer when the cap, divided among that
+token's concurrent transfers, falls below it. Size the cap at or above
+1 MiB/s per transfer you expect to run at once, or lower the client's
+`Timeouts.BytesPerSec` to match.
+
+These limits exist on this transport only. The S3 API has the request rate
+limit and no byte cap.
+
 ## Connection lifecycle
 
 | Limit | Value |
 |---|---|
-| Concurrent connections | 1000 |
+| Concurrent connections | 1000 by default (`JAY_NATIVE_MAX_CONNS`) |
+| Busy refusals in flight | 64; each ends within 2 s |
 | Handshake timeout | 10 s |
 | Server idle timeout | 60 s |
 | Client pooled-idle discard | 45 s |

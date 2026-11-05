@@ -30,8 +30,7 @@ var (
 // CreateMultipartUpload starts a new multipart upload.
 //
 // The multipart bbolt bucket is created once by bootstrap() at Open time, so
-// this path only opens a single write transaction (previously it opened an
-// extra one per create just to CreateBucketIfNotExists).
+// this path opens a single write transaction, with no CreateBucketIfNotExists.
 func (db *DB) CreateMultipartUpload(upload *MultipartUpload) error {
 	if upload.CreatedAt.IsZero() {
 		upload.CreatedAt = time.Now().UTC()
@@ -150,11 +149,10 @@ func (db *DB) MarkMultipartUploadCompleted(uploadID string) error {
 
 // AbortMultipartUpload marks the upload as aborted.
 //
-// Only an upload still in the "initiated" state can be aborted. Aborting a
-// completed upload used to overwrite its record with state "aborted" and let
-// the caller delete the part files of an upload whose object had already been
-// committed; it now returns ErrUploadNotActive, which transports map to the
-// S3 NoSuchUpload semantics (the upload no longer exists as an active one).
+// Only an upload still in the "initiated" state can be aborted. Any other
+// state returns ErrUploadNotActive, which transports map to S3's NoSuchUpload:
+// marking a completed upload aborted would let the caller delete the parts of
+// an object already committed.
 func (db *DB) AbortMultipartUpload(uploadID string) (*MultipartUpload, error) {
 	var aborted *MultipartUpload
 	err := db.updateRecord(bucketMultipart, uploadID, ErrUploadNotFound, func(upload *MultipartUpload) error {

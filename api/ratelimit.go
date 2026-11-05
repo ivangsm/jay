@@ -24,27 +24,16 @@ func newRateLimiter(cfg RateLimiterConfig) *ratelimit.Limiter {
 }
 
 // withIPRateLimit is the PRE-authentication rate-limiting middleware, keyed by
-// client IP.
+// client IP. Authentication is expensive (bcrypt per Bearer, bbolt + HMAC per
+// SigV4), so a limiter that ran only after it would let a caller with no valid
+// credentials burn the CPU budget.
 //
-// It exists because authentication is expensive: a Bearer credential costs one
-// bcrypt comparison (~60-100ms of CPU) and SigV4 costs a bbolt read plus HMAC
-// derivation. With the limiter running only *after* auth, a caller with no
-// valid credentials at all could burn the whole CPU budget — every request paid
-// for bcrypt before the limiter ever saw it. This middleware is therefore the
-// outermost gate: nothing is authenticated until the source IP has a token in
-// its bucket.
-//
-// Accounting (deliberate, documented): every request consumes one token from
-// the "ip:<addr>" bucket. Authenticated requests additionally consume one token
-// from their "<token_id>" bucket in withRateLimit. There is no double counting
-// inside a single bucket — anonymous requests are limited by IP only (the
-// post-auth middleware skips them), authenticated ones by IP *and* token.
-//
-// Both buckets use the same configured Rate/Burst, which gives one statable
-// invariant: a single source IP can never exceed JAY_RATE_LIMIT req/s, no
-// matter how many tokens it holds. Deployments that front jay with a proxy or
-// NAT many clients behind one address must size JAY_RATE_LIMIT accordingly (and
-// set JAY_TRUST_PROXY_HEADERS so the real client IP is used as the key).
+// Every request consumes one token from the "ip:<addr>" bucket; authenticated
+// ones additionally consume one from their "<token_id>" bucket in
+// withRateLimit. Both use the same Rate/Burst, so a single source IP can never
+// exceed JAY_RATE_LIMIT req/s however many tokens it holds: a proxy or NAT in
+// front of jay needs JAY_RATE_LIMIT sized for it and JAY_TRUST_PROXY_HEADERS
+// set so the real client IP is the key.
 func (h *Handler) withIPRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !h.ipRateLimiter.Enabled() {
@@ -92,16 +81,14 @@ func writeRateLimited(w http.ResponseWriter, r *http.Request, retryAfter int) {
 // clientIP extracts the client IP from the request.
 //
 // When trustProxyHeaders is false, X-Forwarded-For is IGNORED entirely and
-// the direct TCP peer (RemoteAddr) is used. This is the safe default — the
-// old behaviour, which auto-trusted XFF whenever RemoteAddr looked "private
-// or loopback", was a spoofable heuristic that bypassed rate limiting and
-// source-IP policies for any caller able to reach jay over a private network
-// (which is... every deployment behind a docker-compose network).
+// the direct TCP peer (RemoteAddr) is used. Trusting XFF automatically
+// whenever the peer looks private is not an option: on a compose network every
+// caller is private, and a spoofed header bypasses rate limiting and source-IP
+// policies.
 //
 // When trustProxyHeaders is true, XFF is honoured only when the direct peer
-// is loopback or RFC1918 private — the standard "trust the proxy that
-// terminates TLS for us" arrangement. Set JAY_TRUST_PROXY_HEADERS=1 only
-// when you actually front jay with a reverse proxy you control.
+// is loopback or RFC1918 private. Set JAY_TRUST_PROXY_HEADERS=1 only when a
+// reverse proxy you control fronts jay.
 //
 //nolint:revive // trustProxyHeaders is deployment config, not a behaviour flag
 func clientIP(r *http.Request, trustProxyHeaders bool) string {

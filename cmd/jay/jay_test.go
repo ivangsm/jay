@@ -88,16 +88,13 @@ func setup(t *testing.T) *testEnv {
 	}
 }
 
-// newTestServer levanta un servidor de prueba con httptest.NewTestServer (Go
-// 1.27): registra el cierre solo y hace fallar el test si el handler panickea,
-// dos cosas que httptest.NewServer no da.
+// newTestServer wraps httptest.NewTestServer, which registers its own cleanup
+// and fails the test when the handler panics.
 //
-// El Start() explícito NO es opcional. Sin él, NewTestServer usa la red en
-// memoria, y ahí TODOS los servidores comparten la misma URL base
-// ("http://example.com") y cada cliente manda todo a su propio servidor sin
-// mirar el host. El harness de jay levanta DOS servidores a la vez (S3 y admin)
-// y los distingue por URL, así que la red en memoria no aplica acá: con Start()
-// cada uno queda en su puerto de loopback y vuelve a haber URLs distinguibles.
+// The explicit Start() is required: without it NewTestServer uses the in-memory
+// network, where every server shares the base URL "http://example.com". The
+// harness runs two servers at once (S3 and admin) and tells them apart by URL,
+// so each needs its own loopback port.
 func newTestServer(t testing.TB, h http.Handler) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewTestServer(t, h)

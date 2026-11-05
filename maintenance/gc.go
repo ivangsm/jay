@@ -94,9 +94,8 @@ func (gc *GC) loop() {
 			gc.RunOnce()
 			timer.Reset(gc.interval)
 		case <-gc.deleted:
-			// Since Go 1.23 a Timer's channel is unbuffered: Stop() already
-			// guarantees no stale value is left waiting, so the manual drain
-			// that used to be here was a no-op.
+			// No drain after Stop(): since Go 1.23 a Timer's channel is
+			// unbuffered and Stop() leaves no stale value waiting.
 			timer.Stop()
 			gc.RunOnce()
 			timer.Reset(gc.interval)

@@ -1,9 +1,7 @@
 package proto
 
-// PND-0193, native half. The stakes here are higher than on the HTTP side:
-// net/http recovers a panicking handler per connection, but every native
-// connection is a bare goroutine, so an unrecovered panic did not lose one
-// request — it killed the process.
+// Panic recovery on the native side, where every connection is a bare
+// goroutine and an unrecovered panic kills the process, not one request.
 //
 // Both tests panic for real, in real code, by handing the handler a nil
 // *meta.DB: the first credential check and the first bucket lookup dereference
@@ -61,8 +59,7 @@ func TestNativePanicDuringHandshake_LogsAndClosesInsteadOfKillingTheProcess(t *t
 	log, buf := jsonLogger()
 	metrics := maintenance.NewMetrics()
 	// auth.New(nil): validating the first credential pair dereferences a
-	// database that is not there. Before the fix this panic reached the top of
-	// the connection goroutine and took the whole test binary with it.
+	// database that is not there.
 	s := NewServer(nil, nil, auth.New(nil), log, metrics, 0, 0)
 
 	client, server := net.Pipe()

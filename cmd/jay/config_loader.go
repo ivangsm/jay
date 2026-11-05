@@ -43,33 +43,20 @@ type yamlKeyBinding struct {
 	deprecatedFor string
 }
 
-// deprecatedAlias marks a binding as the old spelling of another one.
-//
-// A renamed setting has exactly two failure modes and both are silent. Drop the
-// old name and a deployment that sets it falls back to the default without a
-// word: JAY_BACKUP_DIR pointing at a separate volume would start writing
-// snapshots back onto the data disk, and nothing would say so until the disk
-// that held both died. Keep the old name unmarked and the rename never
-// happens, because nothing ever tells anyone to move.
-//
-// So the alias keeps working and announces itself. It is ordered BEFORE the
-// canonical binding in bindings(), so when both are set the canonical value is
-// the one that survives the overlay.
+// deprecatedAlias marks a binding as the old spelling of another one. The alias
+// keeps working (dropping it would silently send a deployment that sets it back
+// to the default) and warns on every boot that uses it. It must be ordered
+// BEFORE the canonical binding in bindings(), so when both are set the
+// canonical value is the one that survives the overlay.
 func deprecatedAlias(b yamlKeyBinding, replacement string) yamlKeyBinding {
 	b.deprecatedFor = replacement
 	return b
 }
 
-// withEmptyAsValue marks a binding whose empty value MEANS something, so the
-// overlays apply it instead of falling back to the default.
-//
-// Only native_addr carries it. An empty JAY_NATIVE_ADDR is the documented off
-// switch for the native protocol (main.go binds no listener when it is empty),
-// and before this flag existed only the YAML door honoured it: the env var was
-// discarded as "unset" and the listener came up on the :4444 default, so a
-// deployment that believed it had turned the native protocol off had the port
-// open — with a protocol that carries the token secret in the clear and is not
-// meant to face the internet.
+// withEmptyAsValue marks a binding whose empty value means something, so both
+// overlays apply it instead of falling back to the default. Only native_addr
+// carries it: an empty JAY_NATIVE_ADDR is the off switch for the native
+// protocol, and treating it as unset would bring the listener up on :4444.
 func withEmptyAsValue(b yamlKeyBinding) yamlKeyBinding {
 	b.emptyIsValue = true
 	return b
@@ -78,18 +65,10 @@ func withEmptyAsValue(b yamlKeyBinding) yamlKeyBinding {
 // emptyMeansUnset reports whether an empty value for this binding must be
 // ignored, leaving the default (or an earlier layer) in place.
 //
-// The default answer is yes, for every key but the one above, and that is a
-// deliberate refusal to make "empty" mean "empty" everywhere. Config arrives
-// through templates that produce an empty string for an unset variable —
-// `JAY_LISTEN_ADDR: ${JAY_LISTEN_ADDR}` in a compose file, `${VAR}` inside the
-// YAML — so an empty value is nearly always "nobody configured this", not a
-// choice. Honouring it literally would make an unset variable move the store
-// (data_dir "") or serve on port 80 (net/http reads an empty Addr as ":http"),
-// and would turn an empty numeric variable into an "invalid JAY_*" error line
-// on every boot.
-//
-// The rule is applied identically to the YAML overlay and the env overlay. An
-// asymmetry there is not a fix, it is the same defect through the other door.
+// Yes for every key but native_addr: config arrives through templates that
+// produce "" for an unset variable, and honouring that literally would move the
+// store (data_dir "") or serve on port 80 (net/http reads an empty Addr as
+// ":http"). The rule applies identically to the YAML and the env overlay.
 func emptyMeansUnset(b yamlKeyBinding) bool { return !b.emptyIsValue }
 
 // LoadConfigFromSources loads config from a YAML file (optional) merged with
@@ -129,11 +108,8 @@ func LoadConfigFromSources(yamlPath string, log *slog.Logger) (Config, error) {
 	//    <DataDir>/backups, which must be computed AFTER overlays so an
 	//    overridden DataDir moves the default snapshot location with it.
 	//
-	//    The directory keeps its old name on disk on purpose. Renaming it to
-	//    match the setting would leave every existing snapshot in a directory
-	//    nothing prunes and nothing restores from — an unmanaged pile that
-	//    grows forever, which is a worse outcome than a directory whose name is
-	//    one word short.
+	//    The directory is "backups", not "metadata_backups": renaming it would
+	//    leave every existing snapshot where nothing prunes or restores it.
 	if cfg.MetadataBackupDir == "" {
 		cfg.MetadataBackupDir = filepath.Join(cfg.DataDir, "backups")
 	}
@@ -150,6 +126,7 @@ func defaultConfig() Config {
 		ListenAddr:       ":9000",
 		AdminAddr:        ":9001",
 		NativeAddr:       ":4444",
+		NativeMaxConns:   1000,
 		LogLevel:         "info",
 		RateLimit:        100,
 		RateBurst:        200,
@@ -181,6 +158,10 @@ func bindings() []yamlKeyBinding {
 		bindString("tls_key", "JAY_TLS_KEY", func(c *Config) *string { return &c.TLSKey }),
 		bindString("native_tls_cert", "JAY_NATIVE_TLS_CERT", func(c *Config) *string { return &c.NativeTLSCert }),
 		bindString("native_tls_key", "JAY_NATIVE_TLS_KEY", func(c *Config) *string { return &c.NativeTLSKey }),
+		// A cap of zero would refuse every client while the listener looks
+		// healthy, so it takes the same positive-only binding as rate_burst.
+		bindPositiveInt("native_max_conns", "JAY_NATIVE_MAX_CONNS", func(c *Config) *int { return &c.NativeMaxConns }),
+		bindNonNegativeInt64("native_token_bytes_per_sec", "JAY_NATIVE_TOKEN_BYTES_PER_SEC", func(c *Config) *int64 { return &c.NativeTokenBytesPerSec }),
 		bindFloat("rate_limit", "JAY_RATE_LIMIT", func(c *Config) *float64 { return &c.RateLimit }),
 		bindPositiveInt("rate_burst", "JAY_RATE_BURST", func(c *Config) *int { return &c.RateBurst }),
 		bindBool("trust_proxy_headers", "JAY_TRUST_PROXY_HEADERS", func(c *Config) *bool { return &c.TrustProxyHeaders }),
@@ -199,6 +180,15 @@ func bindings() []yamlKeyBinding {
 		bindString("metadata_backup.dir", "JAY_METADATA_BACKUP_DIR", func(c *Config) *string { return &c.MetadataBackupDir }),
 		bindMinFreeBytes(),
 		bindMaxObjectSize(),
+
+		// GET /metrics. A secret like admin_token: no default, and a short
+		// one aborts the boot (see checkMetricsAccess).
+		bindString("metrics.token", "JAY_METRICS_TOKEN", func(c *Config) *string { return &c.MetricsToken }),
+		bindBool("metrics.public", "JAY_METRICS_PUBLIC", func(c *Config) *bool { return &c.MetricsPublic }),
+
+		// The web console. No default but off: nothing new is exposed unless
+		// the operator asks.
+		bindBool("console.enabled", "JAY_CONSOLE_ENABLED", func(c *Config) *bool { return &c.ConsoleEnabled }),
 
 		bindString("seed_token.account", "JAY_SEED_TOKEN_ACCOUNT", func(c *Config) *string { return &c.SeedTokenAccount }),
 		bindString("seed_token.id", "JAY_SEED_TOKEN_ID", func(c *Config) *string { return &c.SeedTokenID }),
@@ -257,16 +247,9 @@ var discardLog = slog.New(slog.DiscardHandler)
 
 // reportIgnoredEmpty logs msg only when dropping the empty value actually
 // decided something — that is, when the value in place is not already the
-// empty one.
-//
-// The silent half matters as much as the loud half: the config file this repo
-// documents is written as `tls_cert: ${JAY_TLS_CERT:-}`, `metadata_backup.dir:
-// ${JAY_METADATA_BACKUP_DIR:-}`, `seed_token.*`, `client.*` — keys that interpolate to
-// an empty string on every ordinary boot and whose default is empty anyway.
-// Warning about those would put seven lines of noise in front of every
-// operator until they learned to skip config warnings, which is how the one
-// that matters (`listen_addr: ${JAY_LISTEN_ADDR}` with the variable unset,
-// silently keeping :9000) gets skipped too.
+// empty one. The documented config file interpolates several optional keys
+// (`tls_cert: ${JAY_TLS_CERT:-}` and friends) to "" on every ordinary boot;
+// warning about those would bury the one that matters.
 func reportIgnoredEmpty(b yamlKeyBinding, cfg *Config, log *slog.Logger, msg string, args ...any) {
 	if !applyingEmptyWouldChange(b, cfg) {
 		return
@@ -365,14 +348,11 @@ func bindFloat(path, env string, ptr func(*Config) *float64) yamlKeyBinding {
 	}
 }
 
-// bindPositiveInt binds an int key that has no meaning at or below zero.
-//
-// The range check is not decoration. Its only user is rate_burst, and
-// `rate.NewLimiter` with a burst of zero or less rejects EVERY request: a
-// `rate_burst: -1` typo used to be accepted in silence and turned the rate
-// limiter into a total outage. The upper bound exists because `int` is not
-// int64 on every platform, so the YAML value has to be proven to fit before
-// the conversion rather than after it.
+// bindPositiveInt binds an int key that has no meaning at or below zero. Its
+// user is rate_burst, and `rate.NewLimiter` with a burst <= 0 rejects every
+// request, so a `-1` typo must stop the boot. The upper bound exists because
+// `int` is not int64 on every platform: the YAML value has to be proven to fit
+// before the conversion, not after it.
 func bindPositiveInt(path, env string, ptr func(*Config) *int) yamlKeyBinding {
 	return yamlKeyBinding{
 		path:   path,
@@ -511,40 +491,21 @@ func bindScrubMaxPerRun() yamlKeyBinding {
 }
 
 func bindMinFreeBytes() yamlKeyBinding {
-	const env = "JAY_MIN_FREE_BYTES"
-	return yamlKeyBinding{
-		path:   "min_free_bytes",
-		envVar: env,
-		applyYAML: func(cfg *Config, raw any, log *slog.Logger) (string, bool, error) {
-			n, err := toInt64(raw)
-			if err != nil {
-				return "", false, err
-			}
-			if n < 0 {
-				log.Error("invalid min_free_bytes in YAML (must be >= 0), ignoring", "value", n)
-				return "", false, nil
-			}
-			cfg.MinFreeBytes = n
-			return strconv.FormatInt(n, 10), true, nil
-		},
-		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
-			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || parsed < 0 {
-				log.Error("invalid "+env+" (must be >= 0), keeping previous value", "value", value, "err", err)
-				return true
-			}
-			cfg.MinFreeBytes = parsed
-			return true
-		},
-	}
+	return bindNonNegativeInt64("min_free_bytes", "JAY_MIN_FREE_BYTES", func(c *Config) *int64 { return &c.MinFreeBytes })
 }
 
 // bindMaxObjectSize binds the maximum accepted object size (in bytes). 0 means
 // unlimited; negative values are invalid and are ignored (previous value kept).
 func bindMaxObjectSize() yamlKeyBinding {
-	const env = "JAY_MAX_OBJECT_SIZE"
+	return bindNonNegativeInt64("max_object_size", "JAY_MAX_OBJECT_SIZE", func(c *Config) *int64 { return &c.MaxObjectSize })
+}
+
+// bindNonNegativeInt64 binds a byte count or rate whose zero means "off" and
+// whose negative values mean nothing. A negative value is logged and ignored
+// at either door, leaving the previous value in place.
+func bindNonNegativeInt64(path, env string, ptr func(*Config) *int64) yamlKeyBinding {
 	return yamlKeyBinding{
-		path:   "max_object_size",
+		path:   path,
 		envVar: env,
 		applyYAML: func(cfg *Config, raw any, log *slog.Logger) (string, bool, error) {
 			n, err := toInt64(raw)
@@ -552,10 +513,10 @@ func bindMaxObjectSize() yamlKeyBinding {
 				return "", false, err
 			}
 			if n < 0 {
-				log.Error("invalid max_object_size in YAML (must be >= 0), ignoring", "value", n)
+				log.Error("invalid "+path+" in YAML (must be >= 0), ignoring", "value", n)
 				return "", false, nil
 			}
-			cfg.MaxObjectSize = n
+			*ptr(cfg) = n
 			return strconv.FormatInt(n, 10), true, nil
 		},
 		applyEnv: func(cfg *Config, value string, log *slog.Logger) bool {
@@ -564,7 +525,7 @@ func bindMaxObjectSize() yamlKeyBinding {
 				log.Error("invalid "+env+" (must be >= 0), keeping previous value", "value", value, "err", err)
 				return true
 			}
-			cfg.MaxObjectSize = parsed
+			*ptr(cfg) = parsed
 			return true
 		},
 	}

@@ -31,8 +31,9 @@ func mapObjopsStatus(err error) (status byte, msg, code string, handled bool) {
 }
 
 // handlePutObject delegates to objops.Service. On auth/bucket errors the
-// frame data MUST be drained (up to MaxDrainSize) so the connection stays
-// in a readable state for the next request.
+// frame data MUST be drained (up to MaxDrainSize; past it the answer goes out
+// and the connection closes, see drainData) so the connection stays in a
+// readable state for the next request.
 func (h *connHandler) handlePutObject(req *request) error {
 	bucket, key, contentType, metadata, skipETag, err := DecodePutObjectRequest(req.meta)
 	if err != nil {
@@ -42,16 +43,9 @@ func (h *connHandler) handlePutObject(req *request) error {
 		return h.writeError(StatusBadRequest, req.streamID, "invalid request", "InvalidArgument")
 	}
 
-	// objops authorizes internally; on auth failure the body may still be
-	// fully consumed because PutObject streams it into the store before
-	// returning. Authorization happens BEFORE streaming though (authorize
-	// runs immediately after bucket resolution), so an auth rejection aborts
-	// early and we drain the remainder of the frame.
-	//
-	// However, the current objops.PutObject does the authorize BEFORE writing
-	// bytes but does NOT drain req.data if authorize fails — so we handle
-	// that here. We call HeadObject-style auth first? No — simpler: let
-	// PutObject run; if it returns an auth error before reading, we drain.
+	// objops.PutObject authorizes before it reads a byte and never drains
+	// req.data on failure, so whatever it left unread is drained below to keep
+	// the frame boundary.
 	obj, err := h.objops.PutObject(
 		context.TODO(), h.token,
 		bucket, key, contentType,
@@ -62,8 +56,6 @@ func (h *connHandler) handlePutObject(req *request) error {
 	if err != nil {
 		// Drain any unread body bytes so the frame boundary is respected.
 		if derr := drainData(req); derr != nil {
-			// Data was larger than MaxDrainSize — the only safe response is
-			// to report the error and let the server loop close the conn.
 			return derr
 		}
 		if status, m, code, ok := mapObjopsStatus(err); ok {
@@ -134,7 +126,8 @@ func (h *connHandler) writeResponseStreaming(status byte, streamID uint32, meta 
 	// Arm a size-scaled write deadline so a client that stops reading cannot
 	// pin this goroutine in io.Copy below. Cleared after the final flush in
 	// handleOneRequest.
-	if err := h.armWriteDeadline(int64(len(meta)) + dataLen); err != nil {
+	deadline, err := h.armWriteDeadlineAt(int64(len(meta)) + dataLen)
+	if err != nil {
 		return err
 	}
 	if err := WriteHeader(h.bw, status, streamID, uint32(len(meta)), dataLen); err != nil {
@@ -157,11 +150,32 @@ func (h *connHandler) writeResponseStreaming(status byte, streamID uint32, meta 
 	// io.CopyN wraps the file in an io.LimitedReader, which
 	// (*net.TCPConn).ReadFrom unwraps, so sendfile(2) still applies — for a
 	// whole object and for a range alike.
-	if _, err := io.CopyN(h.conn, file, dataLen); err != nil {
+	if !h.throughput.Enabled() {
+		_, err := io.CopyN(h.conn, file, dataLen)
 		return err
+	}
+	// Under a throughput cap the body goes out in pieces, each paid for
+	// before it is sent. Every piece is still an io.CopyN from the file, so
+	// each one is still a sendfile(2): the cap costs more syscalls, not the
+	// zero-copy path.
+	for remaining := dataLen; remaining > 0; {
+		n := min(remaining, throttledWriteChunk)
+		if err := h.waitBytes(int(n), &deadline, h.conn.SetWriteDeadline); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(h.conn, file, n); err != nil {
+			return err
+		}
+		remaining -= n
 	}
 	return nil
 }
+
+// throttledWriteChunk is the piece of a response body paid for at a time
+// under a throughput cap. Big enough that a sendfile(2) per piece is cheap,
+// small enough that a capped token's download advances in steps a person
+// would call smooth.
+const throttledWriteChunk = 256 << 10
 
 // handleGetObjectRange is GetObject for a byte range. The response metadata is
 // the same ObjectInfo as GetObject — size is the WHOLE object's — and the
@@ -310,35 +324,41 @@ func (h *connHandler) handleDeleteObject(req *request) error {
 	return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 }
 
-// errDataTooLarge is returned by drainData when the remaining data exceeds
-// MaxDrainSize, indicating the connection must be closed.
-var errDataTooLarge = errors.New("data too large to drain, closing connection")
-
+// drainData reads out whatever the handler left unread of the request body,
+// so the next ReadHeader lands on a frame boundary. It is what lets a handler
+// answer an error and keep the connection.
+//
+// It accounts for what is actually left (req.body.N), not for dataLen: a
+// handler that failed after consuming the whole body leaves nothing to drain,
+// however large the frame was. Only when more than MaxDrainSize remains does
+// it give up on the connection, and it does so by setting req.closeAfter
+// rather than by returning an error, so the handler still writes its answer —
+// a peer refused mid-upload gets "AccessDenied" or "EntityTooLarge", not a
+// connection that silently dropped. The server closes after that answer.
+//
+// It reads req.body directly, not req.data: a drained body is not stored or
+// served, so it is not charged to the token's throughput budget.
+//
+// The returned error is a failure of the connection itself, and the caller
+// must return it without answering.
 func drainData(req *request) error {
-	if req.data == nil || req.dataLen == 0 {
+	if req.body == nil || req.body.N == 0 {
 		return nil
 	}
-	if req.dataLen > MaxDrainSize {
-		return errDataTooLarge
-	}
-	_, err := io.CopyN(io.Discard, req.data, req.dataLen)
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		// req.data is an io.LimitReader capped at dataLen over the frame
-		// body. Hitting EOF before dataLen means the handler already
-		// consumed part (or all) of the body before failing — the frame is
-		// fully consumed and the connection is still correctly framed, so
-		// this is success, not a reason to kill the connection. (A genuinely
-		// truncated connection also surfaces as EOF here, but then the
-		// subsequent response write/flush fails and closes the conn anyway.)
+	if req.body.N > MaxDrainSize {
+		req.closeAfter = true
 		return nil
 	}
+	// io.Copy treats EOF as the end, not an error. A peer that disconnected
+	// mid-body therefore "drains" short; the answer write that follows is
+	// what fails, and it closes the connection.
+	_, err := io.Copy(io.Discard, req.body)
 	return err
 }
 
-// emptyReader is used by multipart upload handling when a part carries no
-// body bytes. Kept here (not moved to objops) because the proto multipart
-// handlers still pass a raw reader to store.WritePart directly — they do not
-// route through objops yet.
+// emptyReader is the body of a multipart part that carries no bytes. It lives
+// here because the proto multipart handlers pass a raw reader to
+// store.WritePart directly instead of going through objops.
 type emptyReader struct{}
 
 func (e *emptyReader) Read(p []byte) (int, error) { return 0, io.EOF }

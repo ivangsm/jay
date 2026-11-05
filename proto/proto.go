@@ -8,15 +8,9 @@ const (
 
 	// Version is the protocol version. It travels in the handshake ONLY — the
 	// per-frame header has no version byte — so it pins the dialect for the
-	// whole connection and cannot signal a mid-connection change.
-	//
-	// The practical consequence, and the reason this comment is worth reading:
-	// changing the layout of any Encode*/Decode* pair is invisible to the
-	// handshake, so a version bump does NOT protect against wire skew. What
-	// protects against it is the golden tests in wire_golden_test.go. Add a
-	// field to an existing struct and they fail on purpose.
-	//
-	// A peer whose version is not recognised is refused rather than guessed at.
+	// whole connection. A changed Encode*/Decode* layout is invisible to it: a
+	// version bump does NOT protect against wire skew, the golden tests in
+	// wire_golden_test.go do. An unrecognised version is refused, not guessed at.
 	Version byte = 0x01
 
 	// HeaderSize is the fixed size of a request/response frame header.
@@ -34,8 +28,36 @@ const (
 	// MaxMetaSize limits metadata payload to 1MB (prevents memory exhaustion).
 	MaxMetaSize = 1 << 20
 
-	// MaxDrainSize is how much data we'll drain on auth failure before closing.
-	MaxDrainSize = 10 << 20 // 10MB
+	// MaxDrainSize is the most of a refused request body the server reads
+	// out to keep the connection. When a handler refuses a frame (access
+	// denied, no such bucket, too large…) with more than this left unread, it
+	// answers and then closes, because the stream behind the answer is no
+	// longer aligned on a frame. Contract: a client uses it to tell whether a
+	// connection survived an error answer. See the protocol reference,
+	// "Refusing a frame without reading it".
+	MaxDrainSize = 10 << 20 // 10 MiB
+
+	// RateLimitDrainSize is the same limit for a frame the rate limiter
+	// refused, held against data_len alone, as MaxDrainSize is; the metadata,
+	// already bounded by MaxMetaSize, is read on top of it. At or under it
+	// the frame is read, thrown away and answered, and the connection carries
+	// on; over it the answer goes out without any of the frame being read,
+	// and the connection closes.
+	//
+	// It is MaxDrainSize today for the clients that predate this constant
+	// (jay v0.16.0 and earlier, falco among them). They pool the connection
+	// after any error answer, and they were built against a server that
+	// drained every rate-limited body up to 10 MiB: close on one of them
+	// after a smaller refusal and it reports "broken pipe" instead of
+	// RateLimitExceeded, then fails its next request on the dead connection.
+	//
+	// It is meant to come down to MaxMetaSize: a limiter refuses under load,
+	// over and over, and draining 10 MiB per refused upload costs the server
+	// the full body every time. That may happen only once no native client
+	// older than this release is left (PND-0260). Clients from this release
+	// on already assume MaxMetaSize and no more, so they are right about
+	// either value — which is also why this must never go below MaxMetaSize.
+	RateLimitDrainSize = MaxDrainSize
 )
 
 // Op codes for request frames.
@@ -76,14 +98,10 @@ const (
 	StatusInternal   byte = 0x05
 )
 
-// Handshake status codes.
-//
-// Every one of these is a deliberate diagnosis, not a catch-all. The server
-// used to answer HandshakeVersionMismatch for ANY handshake failure — a cut
-// socket, a client that dialled the wrong port, a full server — so the one
-// thing the client reported was the one thing that was almost never true.
-// Adding a status is backward compatible: an older client falls through to
-// its default branch and reports the raw number, which still beats a lie.
+// Handshake status codes. Each one is a specific diagnosis, never a catch-all:
+// HandshakeVersionMismatch is not the answer to a cut socket or a full server.
+// Adding a status is backward compatible: an older client falls through to its
+// default branch and reports the raw number.
 const (
 	// HandshakeOK means the connection is authenticated and ready for frames.
 	HandshakeOK byte = 0x00
@@ -98,10 +116,9 @@ const (
 	// one this server does not speak. It now means ONLY that.
 	HandshakeVersionMismatch byte = 0x02
 
-	// HandshakeServerBusy means the connection limit was reached. Before this
-	// status existed the server closed the socket without writing anything, so
-	// a client at capacity saw a bare EOF — indistinguishable from a dead
-	// server or a severed network, and therefore retried the wrong way.
+	// HandshakeServerBusy means the connection limit was reached. It is written
+	// before the socket closes so a client can tell a full server from a dead
+	// one, and back off instead of failing over.
 	HandshakeServerBusy byte = 0x03
 
 	// HandshakeMalformed means the bytes were not a Jay handshake at all: bad

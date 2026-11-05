@@ -2,11 +2,8 @@
 #
 # conformance.sh — exercise jay's S3 surface with S3 clients jay did not write.
 #
-# Why this exists: the README claims S3 compatibility, and ~640 Go tests prove
-# only that jay agrees with itself. A test that builds the request with the same
-# code that parses it measures internal consistency, not compatibility. So this
-# script boots a throwaway jay and drives it with the real thing: aws-cli
-# (botocore), mc and warp (both minio-go).
+# The Go tests prove only that jay agrees with itself. This script boots a
+# throwaway jay and drives it with real clients: aws-cli (botocore).
 #
 # What it does NOT do: fix anything, or paper over a failure. Every check either
 # asserts an effect (bytes on the wire, an object present or absent, a status
@@ -26,11 +23,6 @@
 # Requirements: go, curl, openssl. The S3 clients are optional unless
 # --require-all is given:
 #   aws  — https://docs.aws.amazon.com/cli/  (botocore; the reference client)
-#   mc   — https://min.io/docs/minio/linux/reference/minio-mc.html (minio-go)
-#   warp — https://github.com/minio/warp     (minio-go, benchmark harness)
-#
-# mc and warp are looked up on PATH and in $(go env GOPATH)/bin, because
-# `go install` puts them in the latter and CI runners rarely have that on PATH.
 
 set -uo pipefail
 # Deliberately NOT `set -e`: half of the checks below run a command that is
@@ -192,7 +184,7 @@ json_str() {
 }
 
 # b64sha256 FILE — the digest exactly as S3 defines x-amz-checksum-sha256:
-# raw SHA-256, base64. Not hex. This is the shape PND-0184 got wrong.
+# raw SHA-256, base64. Not hex.
 b64sha256() { openssl dgst -sha256 -binary "$1" | openssl base64 -A; }
 
 # hexsha256 FILE — for comparing two local files byte for byte.
@@ -221,19 +213,7 @@ pick_port() {
 	die "no free TCP port found in 20000-40000"
 }
 
-TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
-# run_limited SECONDS CMD... — a hung client must not hang the whole run. When
-# neither timeout nor gtimeout exists (stock macOS), the command runs unbounded
-# rather than not running at all.
-run_limited() {
-	local secs="$1"
-	shift
-	if [ -n "$TIMEOUT_BIN" ]; then
-		"$TIMEOUT_BIN" "$secs" "$@"
-	else
-		"$@"
-	fi
-}
+
 
 # ---------------------------------------------------------------------------
 # Preflight: the tools this script cannot run without
@@ -248,34 +228,13 @@ for tool in go curl openssl; do
 done
 
 AWS_BIN="$(command -v aws || true)"
-MC_BIN="$(command -v mc || true)"
-WARP_BIN="$(command -v warp || true)"
-
-# go_installed_bin echoes the path of a tool `go install` left in GOPATH/bin,
-# or nothing.
-go_installed_bin() {
-	for candidate in "$(go env GOPATH 2>/dev/null)/bin/$1" "$HOME/go/bin/$1"; do
-		if [ -x "$candidate" ]; then
-			echo "$candidate"
-			return
-		fi
-	done
-}
-[ -n "$MC_BIN" ] || MC_BIN="$(go_installed_bin mc)"
-[ -n "$WARP_BIN" ] || WARP_BIN="$(go_installed_bin warp)"
 
 info "aws:  ${AWS_BIN:-(not found)}"
-info "mc:   ${MC_BIN:-(not found)}"
-info "warp: ${WARP_BIN:-(not found)}"
 
 if [ "$REQUIRE_ALL" -eq 1 ]; then
-	missing=""
-	[ -z "$AWS_BIN" ] && missing="$missing aws"
-	[ -z "$MC_BIN" ] && missing="$missing mc"
-	[ -z "$WARP_BIN" ] && missing="$missing warp"
-	if [ -n "$missing" ]; then
-		printf '%sfatal:%s --require-all given but these clients are missing:%s\n' \
-			"$C_FAIL" "$C_RESET" "$missing" >&2
+	if [ -z "$AWS_BIN" ]; then
+		printf '%sfatal:%s --require-all given but aws-cli is missing\n' \
+			"$C_FAIL" "$C_RESET" >&2
 		exit 3
 	fi
 fi
@@ -288,13 +247,16 @@ info "building jay from $REPO_ROOT ..."
 (cd "$REPO_ROOT" && go build -o "$WORK/jay" ./cmd/jay) || die "go build failed"
 
 # ---------------------------------------------------------------------------
-# Boot: two instances, because minio-go behaves differently on each
+# Boot: two instances, because the clients put different bytes on each wire
 #
-# minio-go signs a plain-HTTP PutObject with the SigV4 *streaming* signature
-# (aws-chunked framing), which jay refuses with 501; over TLS it sends an
-# unframed body instead. One listener cannot be both, so the harness runs two:
-# the HTTP one carries the bulk of the suite, the TLS one proves the minio-go
-# upload path that HTTP cannot reach.
+# minio-go signs a plain-HTTP upload with the SigV4 *streaming* signature: the
+# body travels in aws-chunked framing, every chunk signed, and jay decodes and
+# verifies it (PND-0188). Over TLS the same client sends an unframed body — or,
+# when asked for a checksum, the UNSIGNED-PAYLOAD-TRAILER framing, which is what
+# aws-cli sends over TLS by default too. One listener cannot be both, so the
+# harness runs two and asserts, from each client's own debug output, which
+# framing actually went over the wire: a round trip that never exercised the
+# decoder must not be counted as one that did.
 # ---------------------------------------------------------------------------
 
 S3_PORT="$(pick_port)"
@@ -385,8 +347,8 @@ info "jay is up on $S3 (admin $ADMIN) and $TLS_S3"
 #
 # Account A comes from the seed variables. Account B and the prefix-scoped
 # token come from the admin API, because the suite needs three distinct
-# authorities: a full one, one that belongs to a different account (PND-0185)
-# and one that can only reach part of a bucket (the partial batch delete).
+# authorities: a full one, one that belongs to a different account and one
+# that can only reach part of a bucket (the partial batch delete).
 # ---------------------------------------------------------------------------
 
 admin_post() {
@@ -433,11 +395,10 @@ printf 'jay conformance fixture\n' >"$FIX/small.txt"
 printf 'one\n' >"$FIX/syncdir/a.txt"
 printf 'two\n' >"$FIX/syncdir/nested/b.txt"
 # 12 MiB: above the AWS CLI's 8 MiB threshold, so the upload becomes multipart
-# and the download becomes ranged GETs. Both halves matter — the checksum
-# defect of PND-0184 only ever showed up on the way down.
+# and the download becomes ranged GETs. Both halves matter: the checksum
+# header is verified on the way down.
 dd if=/dev/urandom of="$FIX/big.bin" bs=1048576 count=12 >/dev/null 2>&1 ||
 	die "could not create the 12 MiB fixture"
-
 SMALL_B64="$(b64sha256 "$FIX/small.txt")"
 BIG_SHA="$(hexsha256 "$FIX/big.bin")"
 
@@ -479,30 +440,7 @@ object_exists() {
 	aws_a s3api head-object --bucket "$1" --key "$2" >/dev/null 2>&1
 }
 
-# bucket_state BUCKET — prints "empty", "populated" or "unreadable(<code>)",
-# asking jay over plain HTTP with the bearer form.
-#
-# Deliberately not built on aws-cli: the warp group has to run when aws-cli is
-# absent, and a listing command that fails to launch also produces no output.
-# "the bucket is empty" and "I could not look" have to be different answers, or
-# the check passes without having checked — which is the whole point of this
-# script.
-bucket_state() {
-	local body code
-	body="$(curl -sS -H "Authorization: Bearer $A_ID:$A_SECRET" \
-		-w '\n%{http_code}' "$S3/$1?list-type=2" 2>/dev/null)"
-	code="${body##*$'\n'}"
-	if [ "$code" != "200" ]; then
-		# Never "empty": a 403, a 404 or a dead connection all mean the state
-		# is unknown, and unknown must not read as "nothing was written".
-		printf 'unreadable(%s)' "$code"
-		return
-	fi
-	case "$body" in
-	*"<Contents>"*) printf 'populated' ;;
-	*) printf 'empty' ;;
-	esac
-}
+
 
 # ---------------------------------------------------------------------------
 # GROUP: aws-cli
@@ -532,9 +470,8 @@ else
 	got_len="$(aws_a s3api head-object --bucket "$BUCKET_A" --key small.txt --query ContentLength --output text 2>/dev/null)"
 	assert_eq "HeadObject reports the stored length" "$(file_size "$FIX/small.txt")" "$got_len"
 
-	# PND-0184: S3 defines every x-amz-checksum-* header as the raw digest in
-	# base64. jay stored it hex and shipped it hex, so every aws-cli download
-	# aborted on a checksum mismatch over bytes that were in fact intact.
+	# S3 defines every x-amz-checksum-* header as the raw digest in base64;
+	# aws-cli aborts a download whose header is hex, over intact bytes.
 	got_sum="$(aws_a s3api head-object --bucket "$BUCKET_A" --key small.txt --query ChecksumSHA256 --output text 2>/dev/null)"
 	assert_eq "x-amz-checksum-sha256 is base64, not hex (PND-0184)" "$SMALL_B64" "$got_sum"
 
@@ -567,11 +504,10 @@ else
 
 	# --- the algorithm the client asked for is the one it gets back --------
 	#
-	# --checksum-algorithm is the client saying "verify my bytes with THIS".
-	# jay used to ignore it and answer ChecksumSHA256 whatever was asked, which
-	# botocore tolerates and a client that checks the algorithm does not. Every
-	# algorithm S3 defines for objects is exercised, because jay implements all
-	# five and a gap would otherwise go unnoticed until someone hit it.
+	# --checksum-algorithm is the client saying "verify my bytes with THIS";
+	# answering ChecksumSHA256 whatever was asked is tolerated by botocore and
+	# not by a client that checks the algorithm. All five S3 algorithms are
+	# exercised so a gap cannot go unnoticed.
 	for alg in CRC32 CRC32C CRC64NVME SHA1 SHA256; do
 		field="Checksum$alg"
 		got_alg="$(aws_a s3api put-object --bucket "$BUCKET_A" --key "sum-$alg.txt" \
@@ -585,12 +521,12 @@ else
 			continue
 		fi
 
-		# The same promise through the other door (PND-0194). A copy has no
-		# digest to verify — the bytes never left the server — but the client can
-		# still ask for one, and jay used to answer 200 with none at all. The
-		# expected value is the digest put-object just returned for the SAME
-		# bytes, so a copy that hashed the wrong thing, or answered in hex where
-		# S3 wants base64, fails even though the response looks checksum-shaped.
+		# The same promise through the other door. A copy has no digest to
+		# verify — the bytes never left the server — but the client can still
+		# ask for one. The expected value is the digest put-object just returned
+		# for the SAME bytes, so a copy that hashed the wrong thing, or answered
+		# in hex where S3 wants base64, fails even though the response looks
+		# checksum-shaped.
 		copied_alg="$(aws_a s3api copy-object --bucket "$BUCKET_A" --key "copy-sum-$alg.txt" \
 			--copy-source "$BUCKET_A/sum-$alg.txt" --checksum-algorithm "$alg" \
 			--query "CopyObjectResult.$field" --output text 2>"$LOGS/aws-copysum-$alg.log")"
@@ -654,7 +590,7 @@ else
 		fail "rm --recursive empties the prefix" "still there: $left"
 	fi
 
-	# --- presigned URL, minted by the client (PND-0161) --------------------
+	# --- presigned URL, minted by the client ------------------------------
 	purl="$(aws_a s3 presign "s3://$BUCKET_A/small.txt" --expires-in 300 2>"$LOGS/aws-presign.log")"
 	if [ -z "$purl" ]; then
 		fail "SigV4 presigned GET (PND-0161)" "$(tail -2 "$LOGS/aws-presign.log")"
@@ -677,7 +613,7 @@ else
 		fail "an expired presigned URL is refused" "http=$ecode"
 	fi
 
-	# --- operations that answered 501 until PND-0165 -----------------------
+	# --- bucket-level operations ------------------------------------------
 	if aws_a s3api get-bucket-location --bucket "$BUCKET_A" >"$LOGS/aws-location.log" 2>&1; then
 		pass "GetBucketLocation (PND-0165)"
 	else
@@ -703,7 +639,7 @@ else
 		fi
 	fi
 
-	# --- batch delete, whole and partial (PND-0165) ------------------------
+	# --- batch delete, whole and partial ----------------------------------
 	aws_a s3 cp "$FIX/small.txt" "s3://$BUCKET_A/batch/one.txt" --quiet >/dev/null 2>&1
 	aws_a s3 cp "$FIX/small.txt" "s3://$BUCKET_A/batch/two.txt" --quiet >/dev/null 2>&1
 	aws_a s3api delete-objects --bucket "$BUCKET_A" \
@@ -757,13 +693,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# GROUP: integrity — a checksum the client declares is verified (PND-0189)
+# GROUP: integrity — a checksum the client declares is verified
 #
-# Until 2026-09-02 jay read none of them. A PUT carrying a deliberately wrong
-# x-amz-checksum-sha256 answered 200, stored the object, and echoed back the
-# digest it had computed itself — an unconditional success to the one request
-# that is explicitly about integrity. The AWS CLI declares a CRC64NVME on every
-# upload it makes, so this was not an edge case: it was every upload.
+# The AWS CLI declares a CRC64NVME on every upload it makes, so a PUT whose
+# declared digest is wrong must be refused, not stored under a 200.
 #
 # Driven with curl and the bearer form on purpose. These assertions have to run
 # even when no S3 client is installed, and they need to send a digest that is
@@ -826,9 +759,8 @@ refused_and_absent() {
 if [ "$(curl_a PUT "/$BUCKET_INT")" != "200" ]; then
 	skip "whole group" "could not create $BUCKET_INT: $(cat "$WORK/int.body" | tr -d '\n' | cut -c1-160)"
 else
-	# The one that also counts the files on disk. A rejection that leaves the
-	# object (or a temp file) behind is the failure mode this whole change is
-	# about, and the response cannot show it.
+	# The one that also counts the files on disk: a rejection that leaves the
+	# object (or a temp file) behind is invisible in the response.
 	files_before="$(data_files)"
 	refused_and_absent "a wrong x-amz-checksum-sha256 is refused" wrong-sha256.txt BadDigest \
 		-H "x-amz-checksum-sha256: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -889,13 +821,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# GROUP: cross-account (PND-0185)
+# GROUP: cross-account
 #
-# Until 2026-09-02 a token of account B could read, write and delete inside a
-# bucket of account A: only DeleteBucket, HeadBucket and GetBucketLocation
-# checked ownership. Every check here asserts the EFFECT as account A, not just
-# the error message account B received — a 403 that still wrote the object
-# would be worse than no 403 at all.
+# A token of account B must not read, write or delete inside a bucket of
+# account A. Every check here asserts the EFFECT as account A, not just the
+# error message account B received — a 403 that still wrote the object would
+# be worse than no 403 at all.
 # ---------------------------------------------------------------------------
 
 say ""
@@ -964,187 +895,68 @@ else
 	fi
 fi
 
+
+
+
+
 # ---------------------------------------------------------------------------
-# GROUP: mc over plain HTTP (minio-go)
+# GROUP: aws-cli over TLS (botocore)
+#
+# Over HTTPS botocore stops hashing the payload up front and sends every
+# upload as STREAMING-UNSIGNED-PAYLOAD-TRAILER with a CRC64NVME trailer — the
+# AWS SDK layout of the framing, where mc uses minio-go's. Before PND-0188
+# this was a 501: aws-cli could upload to jay only over plain HTTP.
 # ---------------------------------------------------------------------------
 
 say ""
-say "${C_BOLD}mc / minio-go over HTTP${C_RESET}"
-GROUP="mc-http"
+say "${C_BOLD}aws-cli over TLS${C_RESET}"
+GROUP="aws-cli-tls"
 
-export MC_CONFIG_DIR="$WORK/mc"
-mkdir -p "$MC_CONFIG_DIR"
-mc_() { "$MC_BIN" --no-color "$@"; }
-
-if [ -z "$MC_BIN" ]; then
-	skip "whole group" "mc is not installed"
-elif [ -z "$AWS_BIN" ]; then
-	skip "whole group" "the fixtures this group reads are uploaded by the aws-cli group"
+if [ -z "$AWS_BIN" ]; then
+	skip "whole group" "aws-cli is not installed"
 else
-	if mc_ alias set jayhttp "$S3" "$A_ID" "$A_SECRET" --api S3v4 >"$LOGS/mc-alias.log" 2>&1; then
-		pass "mc alias set"
-	else
-		fail "mc alias set" "$(tail -2 "$LOGS/mc-alias.log")"
-	fi
+	aws_tls() {
+		AWS_ACCESS_KEY_ID="$TLS_ID" AWS_SECRET_ACCESS_KEY="$TLS_SECRET" \
+			AWS_ENDPOINT_URL="$TLS_S3" "$AWS_BIN" --no-verify-ssl "$@"
+	}
 
-	buckets="$(mc_ ls jayhttp 2>"$LOGS/mc-lsb.log" | awk '{print $NF}' | tr -d '/' | sort | tr '\n' ' ')"
-	case "$buckets" in
-	*"$BUCKET_A"*) pass "ListBuckets" ;;
-	*) fail "ListBuckets" "got [$buckets]" ;;
-	esac
-
-	keys="$(mc_ ls jayhttp/"$BUCKET_A" 2>"$LOGS/mc-ls.log" | awk '{print $NF}' | sort | tr '\n' ' ')"
-	case "$keys" in
-	*small.txt*) pass "ListObjects" ;;
-	*) fail "ListObjects" "got [$keys]" ;;
-	esac
-
-	mc_ stat jayhttp/"$BUCKET_A"/small.txt >"$LOGS/mc-stat.log" 2>&1
-	mc_sum="$(sed -n 's/^Checksum *: *SHA256://p' "$LOGS/mc-stat.log" | tr -d ' ')"
-	assert_eq "stat reports the SHA-256 checksum minio-go can parse" "$SMALL_B64" "$mc_sum"
-
-	if mc_ get jayhttp/"$BUCKET_A"/small.txt "$WORK/mc.dl" >"$LOGS/mc-get.log" 2>&1 &&
-		cmp -s "$FIX/small.txt" "$WORK/mc.dl"; then
-		pass "GetObject round-trips"
-	else
-		fail "GetObject round-trips" "$(tail -2 "$LOGS/mc-get.log")"
-	fi
-
-	if mc_ mb jayhttp/conformance-mc >"$LOGS/mc-mb.log" 2>&1 &&
-		mc_ rb --force jayhttp/conformance-mc >>"$LOGS/mc-mb.log" 2>&1; then
-		pass "CreateBucket and DeleteBucket"
-	else
-		fail "CreateBucket and DeleteBucket" "$(tail -2 "$LOGS/mc-mb.log")"
-	fi
-
-	if mc_ rm jayhttp/"$BUCKET_A"/denied/b.txt >"$LOGS/mc-rm.log" 2>&1 &&
-		! object_exists "$BUCKET_A" denied/b.txt; then
-		pass "DeleteObject"
-	else
-		fail "DeleteObject" "$(tail -2 "$LOGS/mc-rm.log")"
-	fi
-
-	# minio-go mints a SigV4 query-string URL of its own — a second, independent
-	# implementation of the form PND-0161 added.
-	share="$(mc_ share download --expire 5m jayhttp/"$BUCKET_A"/small.txt 2>"$LOGS/mc-share.log" | sed -n 's/^Share: //p')"
-	if [ -z "$share" ]; then
-		fail "SigV4 presigned GET minted by minio-go (PND-0161)" "$(tail -2 "$LOGS/mc-share.log")"
-	else
-		scode="$(curl -sS -o "$WORK/mc-presign.dl" -w '%{http_code}' "$share" 2>/dev/null)"
-		if [ "$scode" = "200" ] && cmp -s "$FIX/small.txt" "$WORK/mc-presign.dl"; then
-			pass "SigV4 presigned GET minted by minio-go (PND-0161)"
-		else
-			fail "SigV4 presigned GET minted by minio-go (PND-0161)" "http=$scode"
+	# aws_tls_roundtrip NAME FILE KEY LOG [WIRE2] — upload with --debug, assert
+	# the trace shows the unsigned-trailer framing (and WIRE2, when given),
+	# download, compare bytes.
+	aws_tls_roundtrip() {
+		local name="$1" file="$2" key="$3" log="$4" wire2="${5:-}"
+		if ! aws_tls --debug s3 cp --checksum-algorithm CRC64NVME "$file" "s3://conformance-aws-tls/$key" >"$LOGS/$log.log" 2>&1; then
+			fail "$name" "aws s3 cp failed: $(grep -v ' - DEBUG - ' "$LOGS/$log.log" | tail -2 | tr '\n' ' ' | cut -c1-200)"
+			return
 		fi
-	fi
+		if ! grep -Eqi "(x-amz-content-sha256: *|'x-amz-content-sha256': b')STREAMING-UNSIGNED-PAYLOAD-TRAILER" "$LOGS/$log.log"; then
+			fail "$name" "aws-cli did not send STREAMING-UNSIGNED-PAYLOAD-TRAILER, so the check proves nothing about it (see $log.log)"
+			return
+		fi
+		if [ -n "$wire2" ] && ! grep -q "$wire2" "$LOGS/$log.log"; then
+			fail "$name" "the trace has no $wire2 (see $log.log)"
+			return
+		fi
+		aws_tls s3 cp "s3://conformance-aws-tls/$key" "$WORK/$log.dl" --quiet >>"$LOGS/$log.log" 2>&1
+		if cmp -s "$file" "$WORK/$log.dl"; then
+			pass "$name"
+		else
+			fail "$name" "read back $(file_size "$WORK/$log.dl" 2>/dev/null || echo 0) bytes, uploaded $(file_size "$file")"
+		fi
+	}
 
-	# KNOWN LIMIT — asserted, not tolerated.
-	#
-	# Over plain HTTP minio-go signs every PutObject with the SigV4 *streaming*
-	# signature and frames the body as aws-chunked. jay has no decoder for that
-	# framing and refuses the request with 501 rather than storing the framing
-	# as the object, which is what it used to do (PND-0186).
-	#
-	# The day the decoder lands (PND-0188) this check goes red on purpose: the
-	# upload will succeed and the assertion below will stop holding, forcing
-	# whoever implements it to come back here and to the README.
-	mc_ cp "$FIX/small.txt" jayhttp/"$BUCKET_A"/via-mc.txt >"$LOGS/mc-cp.log" 2>&1
-	mc_rc=$?
-	if [ "$mc_rc" -ne 0 ] &&
-		grep -qi "not implemented" "$LOGS/mc-cp.log" &&
-		! object_exists "$BUCKET_A" via-mc.txt; then
-		pass "known limit: an mc upload is refused with 501 and writes nothing (PND-0186/PND-0188)"
+	if aws_tls s3 mb s3://conformance-aws-tls >"$LOGS/awstls-mb.log" 2>&1; then
+		pass "CreateBucket over HTTPS"
 	else
-		fail "known limit: an mc upload is refused with 501 and writes nothing (PND-0186/PND-0188)" \
-			"rc=$mc_rc, object present=$(object_exists "$BUCKET_A" via-mc.txt && echo yes || echo no). If the aws-chunked decoder landed, update this check and the README."
+		fail "CreateBucket over HTTPS" "$(tail -2 "$LOGS/awstls-mb.log")"
 	fi
+	aws_tls_roundtrip "PutObject with a CRC64NVME trailer round-trips byte for byte (PND-0188)" \
+		"$FIX/small.txt" small.txt awstls-cp
+	aws_tls_roundtrip "multipart 12 MiB with CRC64NVME trailers round-trips byte for byte (PND-0188)" \
+		"$FIX/big.bin" big.bin awstls-cp-big partNumber=
 fi
 
-# ---------------------------------------------------------------------------
-# GROUP: mc over TLS (minio-go)
-#
-# Same client, same version, opposite outcome: minio-go only reaches for the
-# streaming signature when the connection is NOT secure, so over HTTPS it sends
-# an unframed body and jay stores it. This is why the README cannot say
-# "minio-go uploads fail" without saying over what.
-# ---------------------------------------------------------------------------
 
-say ""
-say "${C_BOLD}mc / minio-go over TLS${C_RESET}"
-GROUP="mc-tls"
-
-if [ -z "$MC_BIN" ]; then
-	skip "whole group" "mc is not installed"
-else
-	mc_tls() { "$MC_BIN" --no-color --insecure "$@"; }
-
-	if mc_tls alias set jaytls "$TLS_S3" "$TLS_ID" "$TLS_SECRET" --api S3v4 >"$LOGS/mctls-alias.log" 2>&1 &&
-		mc_tls mb jaytls/conformance-tls >"$LOGS/mctls-mb.log" 2>&1; then
-		pass "alias and CreateBucket over HTTPS"
-	else
-		fail "alias and CreateBucket over HTTPS" "$(tail -2 "$LOGS/mctls-mb.log")"
-	fi
-
-	if mc_tls cp "$FIX/small.txt" jaytls/conformance-tls/small.txt >"$LOGS/mctls-cp.log" 2>&1 &&
-		mc_tls get jaytls/conformance-tls/small.txt "$WORK/mctls.dl" >>"$LOGS/mctls-cp.log" 2>&1 &&
-		cmp -s "$FIX/small.txt" "$WORK/mctls.dl"; then
-		pass "PutObject over HTTPS round-trips (minio-go sends no aws-chunked framing here)"
-	else
-		fail "PutObject over HTTPS round-trips" "$(tail -3 "$LOGS/mctls-cp.log")"
-	fi
-
-	if mc_tls cp "$FIX/big.bin" jaytls/conformance-tls/big.bin >"$LOGS/mctls-big.log" 2>&1 &&
-		mc_tls get jaytls/conformance-tls/big.bin "$WORK/mctls-big.dl" >>"$LOGS/mctls-big.log" 2>&1; then
-		assert_eq "12 MiB upload over HTTPS round-trips byte for byte" "$BIG_SHA" "$(hexsha256 "$WORK/mctls-big.dl")"
-	else
-		fail "12 MiB upload over HTTPS round-trips byte for byte" "$(tail -3 "$LOGS/mctls-big.log")"
-	fi
-fi
-
-# ---------------------------------------------------------------------------
-# GROUP: warp (minio-go under load)
-#
-# warp exits 0 even when every single operation failed — its exit code reports
-# "the benchmark ran", not "the benchmark worked". So both checks below read the
-# report and the bucket, never the exit status.
-# ---------------------------------------------------------------------------
-
-say ""
-say "${C_BOLD}warp${C_RESET}"
-GROUP="warp"
-
-if [ -z "$WARP_BIN" ]; then
-	skip "whole group" "warp is not installed (go install github.com/minio/warp@latest)"
-else
-	# KNOWN LIMIT, same framing as mc: over plain HTTP every PUT is refused.
-	run_limited 120 "$WARP_BIN" put --host="127.0.0.1:$S3_PORT" \
-		--access-key="$A_ID" --secret-key="$A_SECRET" --bucket=warp-http \
-		--duration=3s --obj.size=1KiB --concurrent=2 --noclear --no-color \
-		--benchdata="$WORK/warp-http" >"$LOGS/warp-http.log" 2>&1
-	warp_http_state="$(bucket_state warp-http)"
-	if grep -qi "not implemented" "$LOGS/warp-http.log" && [ "$warp_http_state" = "empty" ]; then
-		pass "known limit: warp cannot upload over HTTP and leaves the bucket empty (PND-0186/PND-0188)"
-	else
-		fail "known limit: warp cannot upload over HTTP and leaves the bucket empty (PND-0186/PND-0188)" \
-			"bucket warp-http is [$warp_http_state], refusal in the log=$(grep -qi 'not implemented' "$LOGS/warp-http.log" && echo yes || echo no). If the aws-chunked decoder landed, update this check and the README."
-	fi
-
-	# And the real smoke test: the same tool, over TLS, doing PUT/GET/DELETE/STAT
-	# concurrently for ten seconds. The number it prints is the one PND-0176 can
-	# publish; the assertion is that it ran with zero errors.
-	run_limited 180 "$WARP_BIN" mixed --host="127.0.0.1:$TLS_S3_PORT" --tls --insecure \
-		--access-key="$TLS_ID" --secret-key="$TLS_SECRET" --bucket=warp-tls \
-		--duration=10s --obj.size=256KiB --concurrent=4 --no-color \
-		--benchdata="$WORK/warp-tls" >"$LOGS/warp-tls.log" 2>&1
-	warp_total="$(sed -n 's/^ \* Average: \(.*\)$/\1/p' "$LOGS/warp-tls.log" | tail -1)"
-	if grep -qi "error" "$LOGS/warp-tls.log"; then
-		fail "warp mixed over TLS runs clean" "$(grep -i error "$LOGS/warp-tls.log" | head -2)"
-	elif [ -z "$warp_total" ]; then
-		fail "warp mixed over TLS runs clean" "warp printed no report: $(tail -3 "$LOGS/warp-tls.log")"
-	else
-		pass "warp mixed over TLS runs clean — $warp_total"
-	fi
-fi
 
 # ---------------------------------------------------------------------------
 # Summary

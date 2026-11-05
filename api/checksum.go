@@ -8,30 +8,22 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/ivangsm/jay/auth"
 	"github.com/ivangsm/jay/internal/objops"
 )
 
 // checksumHeader is the S3 header carrying the SHA-256 digest of an object.
 const checksumHeader = "x-amz-checksum-sha256"
 
-// setChecksumHeader emits x-amz-checksum-sha256 for a whole object.
+// setChecksumHeader emits x-amz-checksum-sha256 for a whole object. jay stores
+// the digest hex-encoded and S3 defines the header as the raw digest in
+// base64; the hex form is what the scrubber, the native protocol and
+// `jay ls -l` use, so it is converted only on the way out. A digest that is not
+// a well-formed SHA-256 yields no header: an unverifiable checksum makes the
+// client reject correct bytes.
 //
-// jay stores the digest hex-encoded (store.WriteObject), but S3 defines every
-// x-amz-checksum-* header as the RAW digest in base64, and the AWS CLI verifies
-// it on each download: a hex value aborts the transfer with "Expected checksum
-// ... did not match calculated checksum" even though the bytes are intact.
-//
-// This is the single conversion point of the HTTP edge. The hex form is what
-// the scrubber compares, what the native protocol carries and what `jay ls -l`
-// prints, so it is never rewritten in place — only on the way out.
-//
-// A digest that is not a well-formed SHA-256 yields no header at all. An
-// unverifiable checksum is worse than none: the client would reject bytes that
-// are in fact correct.
-//
-// Only call this for a response whose body is the ENTIRE object. S3 scopes the
-// header to the bytes it returns, so a 206 must not carry the full-object
-// digest — see handleGetObject.
+// Only call this for a response whose body is the ENTIRE object: a 206 must
+// not carry the full-object digest — see handleGetObject.
 func setChecksumHeader(w http.ResponseWriter, hexDigest string) {
 	if value := checksumBase64(hexDigest); value != "" {
 		w.Header().Set(checksumHeader, value)
@@ -63,12 +55,9 @@ func checksumBase64(hexDigest string) string {
 // ── Client-declared checksums (inbound) ───────────────────────────────────
 //
 // Everything above is about the digest jay reports. Everything below is about
-// the digest the CLIENT reports, which is a different promise: sending
-// Content-MD5 or x-amz-checksum-* on a PUT is the client asking "verify that
-// what reached you is what I sent". Until PND-0189 jay read none of them and
-// answered 200 regardless — an unconditional success to a request that was
-// explicitly about integrity, in the one service whose selling point is
-// integrity.
+// the digest the CLIENT reports: sending Content-MD5 or x-amz-checksum-* on a
+// PUT is the client asking "verify that what reached you is what I sent", and
+// a 200 without that verification is a success reported on work not done.
 
 // The headers a client uses to declare a checksum. Two spellings for the
 // algorithm because S3 uses both: the SDK header on PutObject/UploadPart, the
@@ -84,7 +73,7 @@ const (
 // reserves for a malformed Content-MD5; a malformed x-amz-checksum-* is an
 // InvalidRequest, and a value that is well formed but does not describe the
 // bytes is a BadDigest in both cases (s3ErrBadDigest, declared next to
-// DeleteObjects, which had the only digest check jay used to have).
+// DeleteObjects).
 const (
 	s3ErrInvalidDigest  = "InvalidDigest"
 	s3ErrInvalidRequest = "InvalidRequest"
@@ -108,8 +97,7 @@ var checksumValueHeaders = []struct {
 
 // declaredChecksumAlgorithm returns the algorithm literal the client named and
 // the header that carried it, or ("", checksumAlgorithmHeader) when it named
-// none. The SDK spelling wins when both are present, which is the precedence
-// PutObject has always applied.
+// none. The SDK spelling wins when both are present.
 func declaredChecksumAlgorithm(r *http.Request) (value, header string) {
 	if v := strings.TrimSpace(r.Header.Get(sdkChecksumAlgorithmHeader)); v != "" {
 		return v, sdkChecksumAlgorithmHeader
@@ -129,8 +117,7 @@ func parseChecksumRequest(r *http.Request) (objops.ChecksumRequest, error) {
 	}
 
 	// Exactly one digest header, S3's rule. Two of them describe the same bytes
-	// two ways, and honouring one while ignoring the other is the same silent
-	// pass this whole file removes.
+	// two ways, and honouring one while ignoring the other is a silent pass.
 	var seen string
 	for _, candidate := range checksumValueHeaders {
 		value := strings.TrimSpace(r.Header.Get(candidate.header))
@@ -147,6 +134,26 @@ func parseChecksumRequest(r *http.Request) (objops.ChecksumRequest, error) {
 		seen = candidate.header
 		req.Algorithm = candidate.alg
 		req.Digest = value
+	}
+
+	// The digest can also come AFTER the body, in the trailer of an
+	// aws-chunked upload. It is the same promise through another door, so it
+	// obeys the same rule: one digest, and a second one anywhere is refused.
+	trailing, err := trailingChecksum(r)
+	if err != nil {
+		return objops.ChecksumRequest{}, err
+	}
+	if trailing != nil {
+		if seen != "" {
+			return objops.ChecksumRequest{}, &objops.ChecksumError{
+				Header: trailerDeclarationHeader,
+				Kind:   objops.ErrUnknownChecksumAlgorithm,
+				Detail: "expecting a single checksum, got " + seen + " as a header and " + trailing.header + " in the trailer",
+			}
+		}
+		seen = trailing.header
+		req.Algorithm = trailing.alg
+		req.Trailing = true
 	}
 
 	declared, _ := declaredChecksumAlgorithm(r)
@@ -175,10 +182,62 @@ func parseChecksumRequest(r *http.Request) (objops.ChecksumRequest, error) {
 	return req, nil
 }
 
+// trailerDeclarationHeader is where an aws-chunked upload names the headers it
+// will send after the body.
+const trailerDeclarationHeader = "x-amz-trailer"
+
+// checksumTrailer is a checksum declared in x-amz-trailer.
+type checksumTrailer struct {
+	header string
+	alg    objops.ChecksumAlgorithm
+}
+
+// trailingChecksum reads what x-amz-trailer announced for an aws-chunked body,
+// before a byte of it is read. nil means no trailer was declared.
+//
+// The only trailer S3 defines for an upload is its checksum, so that is the
+// only one accepted: exactly one, and one of the five digests jay computes. A
+// trailer jay could not verify is refused here, up front, rather than read and
+// ignored.
+func trailingChecksum(r *http.Request) (*checksumTrailer, error) {
+	cr, ok := auth.ChunkedBodyOf(r)
+	if !ok {
+		return nil, nil
+	}
+	names := cr.Trailers()
+	switch len(names) {
+	case 0:
+		return nil, nil
+	case 1:
+	default:
+		return nil, &objops.ChecksumError{
+			Header: trailerDeclarationHeader,
+			Kind:   objops.ErrUnknownChecksumAlgorithm,
+			Detail: "expecting a single trailing checksum, got " + strings.Join(names, ", "),
+		}
+	}
+	for _, candidate := range checksumValueHeaders {
+		if candidate.header == names[0] {
+			return &checksumTrailer{header: candidate.header, alg: candidate.alg}, nil
+		}
+	}
+	return nil, &objops.ChecksumError{
+		Header: trailerDeclarationHeader,
+		Kind:   objops.ErrUnknownChecksumAlgorithm,
+		Detail: "trailer " + names[0] + " is not a checksum jay can verify",
+	}
+}
+
 // checksumVerifierFor parses the request's checksum headers and builds the
 // verifier. On a bad declaration it writes the S3 error and returns false, and
 // the caller must return without reading the body: refusing here is what makes
 // a rejected upload leave nothing at all, not even a temp file.
+//
+// For a checksum that arrives in an aws-chunked trailer it also hands the
+// decoder the one function allowed to receive it: the verifier's. The decoder
+// calls it after the trailer signature verified and before it reports the end
+// of the body, so the store's pre-rename hook compares against it like against
+// any declared digest — and a trailer with nobody to receive it is refused.
 func (h *Handler) checksumVerifierFor(w http.ResponseWriter, r *http.Request, resource string) (*objops.ChecksumVerifier, bool) {
 	req, err := parseChecksumRequest(r)
 	if err != nil {
@@ -189,6 +248,22 @@ func (h *Handler) checksumVerifierFor(w http.ResponseWriter, r *http.Request, re
 	if err != nil {
 		h.writeChecksumError(w, r, err, resource)
 		return nil, false
+	}
+	if req.Trailing {
+		cr, _ := auth.ChunkedBodyOf(r)
+		want := req.Algorithm.Header()
+		cr.SetTrailerHandler(func(name, value string) error {
+			if name != want {
+				// Unreachable: the decoder admits only declared trailers and
+				// trailingChecksum admits only this one. Refused all the same.
+				return &objops.ChecksumError{
+					Header: name,
+					Kind:   objops.ErrUnknownChecksumAlgorithm,
+					Detail: "unexpected trailer " + name,
+				}
+			}
+			return v.SetTrailingDigest(value)
+		})
 	}
 	return v, true
 }
@@ -223,10 +298,8 @@ func (h *Handler) writeChecksumError(w http.ResponseWriter, r *http.Request, err
 // ── CopyObject ────────────────────────────────────────────────────────────
 //
 // A copy is the same family of promise as an upload, through another door. The
-// client cannot declare a digest — the bytes never left the server, so it has
-// nothing to hash — but it can name an algorithm, and until PND-0194 jay read
-// the header, computed nothing, and answered 200 with no checksum anywhere. The
-// request was attended halfway and reported as complete.
+// client cannot declare a digest — the bytes never left the server — but it
+// can name an algorithm, and then the response must carry that digest.
 
 // copyChecksumRequest reads the algorithm a CopyObject asked jay to compute.
 //

@@ -9,9 +9,9 @@ import (
 	"github.com/ivangsm/jay/admin"
 )
 
-// TestMountPprof_RequiresAdminToken comprueba las dos mitades del contrato de
-// pprof: que está montado de verdad (incluido el perfil goroutineleak de Go
-// 1.27) y que sin el token de admin no se llega a nada.
+// TestMountPprof_RequiresAdminToken checks both halves: the profiles (including
+// goroutineleak) are really mounted, and nothing is reachable without the
+// admin token.
 func TestMountPprof_RequiresAdminToken(t *testing.T) {
 	const token = "token-de-admin-de-prueba-con-32-chars"
 

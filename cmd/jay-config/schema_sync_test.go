@@ -10,10 +10,8 @@ import (
 )
 
 // bindingsSource is the server's canonical binding table. fieldSpecs here is a
-// hand-maintained copy of it, and the two drifted once already: backup.dir,
-// min_free_bytes and max_object_size lived in bindings() for months while
-// yaml-to-env silently dropped them, so converting a config lost the backup
-// directory. This test makes that drift a build failure instead of a warning.
+// hand-maintained copy of it; a key present in one and not the other makes
+// yaml-to-env drop a setting the server reads, so drift fails the build.
 const bindingsSource = "../jay/config_loader.go"
 
 func envKeysInBindings(t *testing.T) map[string]bool {

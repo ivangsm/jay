@@ -53,9 +53,7 @@ func WriteHandshake(w io.Writer, credentials string) error {
 }
 
 // Handshake failure sentinels. The server maps these onto the Handshake*
-// status bytes; without them every failure looked the same and got answered
-// as a version mismatch. Callers should match with errors.Is, never on the
-// message text.
+// status bytes. Callers should match with errors.Is, never on the message text.
 var (
 	// ErrHandshakeMagic means the first four bytes are not "JAY\0" — whatever
 	// connected is not speaking this protocol.

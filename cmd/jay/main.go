@@ -31,8 +31,8 @@ import (
 // minSecretLen is the minimum acceptable length (in bytes) for sensitive env
 // secrets. 32 chars of high-entropy input (e.g. `openssl rand -base64 32`)
 // leaves comfortable margin against online brute force even if the hash ever
-// leaks. The monorepo policy forbids defaults for secrets, so anything shorter
-// than this is treated as operator error and the process refuses to boot.
+// leaks. Secrets have no default: anything shorter is operator error and the
+// process refuses to boot.
 const minSecretLen = 32
 
 // Backup retention policy: keep 24 backups, prune those older than 7 days.
@@ -62,9 +62,8 @@ func main() {
 
 	log := setupLogging(cfg.LogLevel)
 
-	// version and commit come from -ldflags (see the Dockerfile). Without this
-	// log line nothing imported internal/version at all, so the injection was
-	// dead weight and there was no way to tell which binary was running.
+	// version and commit come from -ldflags (see the Dockerfile). This line is
+	// the only way to tell which binary is running.
 	log.Info("jay: starting",
 		"version", version.Version,
 		"commit", version.Commit,
@@ -73,6 +72,8 @@ func main() {
 		"admin", cfg.AdminAddr,
 		"native", nativeAddrForLog(cfg.NativeAddr),
 	)
+	announceMetricsAccess(cfg, log)
+	announceConsole(cfg, log)
 
 	// Open metadata database
 	dbPath := filepath.Join(cfg.DataDir, "meta", "jay.db")
@@ -117,7 +118,15 @@ func main() {
 		metrics.RecordMetadataDecodeFailure()
 	})
 
-	adminMux, adminHandler := buildAdminMux(cfg, db, st, au, metrics, hc, log)
+	// Building the S3 handler touches no disk, so it is safe before recovery.
+	// The console dispatches into it, which is why it exists this early.
+	s3Handler := newS3Handler(cfg, db, st, au, log, metrics)
+
+	adminMux, adminHandler, err := buildAdminMux(cfg, db, st, au, metrics, hc, log, s3Handler)
+	if err != nil {
+		log.Error("failed to build admin listener", "err", err)
+		os.Exit(1)
+	}
 	defer func() { _ = adminHandler.Close() }()
 
 	// The admin listener binds BEFORE recovery so probes get a 503 rather than
@@ -153,7 +162,7 @@ func main() {
 
 	backupDone, backupWG := startBackupLoop(db, cfg, log)
 
-	shutdownS3, shutdownNative := startDataListeners(cfg, db, st, au, log, metrics, shutdownAdmin)
+	shutdownS3, shutdownNative := startDataListeners(cfg, db, st, au, s3Handler, log, metrics, shutdownAdmin)
 
 	// All listeners are bound — mark the service as ready
 	hc.SetReady(true)
@@ -227,13 +236,15 @@ func mustLoadConfig() Config {
 	}
 
 	// Secrets are checked AFTER the load so YAML-provided ones are honoured.
-	// Monorepo rule: no sensitive environment variable has a default; if one is
-	// missing, the service must fail to start.
+	// A missing secret has no default: the service must fail to start.
 	if len(cfg.AdminToken) < minSecretLen {
 		log.Fatalf("JAY_ADMIN_TOKEN (or admin_token in YAML) must be set and at least %d chars", minSecretLen)
 	}
 	if len(cfg.SigningSecret) < minSecretLen {
 		log.Fatalf("JAY_SIGNING_SECRET (or signing_secret in YAML) must be set and at least %d chars", minSecretLen)
+	}
+	if err := checkMetricsAccess(cfg); err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	// All three seed fields or none. A partial configuration is operator error:
@@ -267,23 +278,17 @@ func setupLogging(logLevel string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 }
 
-// describeDurability answers, at startup, what this instance has a recovery
-// path for — and says the uncomfortable half out loud.
-//
-// The warning about the snapshot directory sharing a filesystem with the data
-// is the one that decides something: it is the default configuration, and it
-// means the copy dies with the original. The line about object bytes fires on
-// every boot regardless, because it is true on every boot: an operator reading
-// "metadata snapshot completed and verified" every hour and nothing else would
-// reasonably conclude their objects were covered.
+// describeDurability logs, at startup, what this instance has a recovery path
+// for. The warning about the snapshot directory sharing a filesystem with the
+// data fires only when it does (the default layout); the line about object
+// bytes having no backup fires on every boot, because it is true on every boot.
 func describeDurability(cfg Config, log *slog.Logger) Durability {
 	sameFS, err := maintenance.EnsureBackupDir(cfg.DataDir, cfg.MetadataBackupDir)
 	problem := ""
 	if err != nil {
-		// Not fatal: the snapshot loop reports its own failures, and refusing to
-		// boot over a diagnostic would be worse than serving without it. But the
-		// answer degrades to the UNSAFE side, not the comfortable one — an
-		// isolation check that could not run must never come back as "isolated".
+		// Not fatal: the snapshot loop reports its own failures. But the answer
+		// degrades to the unsafe side — an isolation check that could not run
+		// must never come back as "isolated".
 		problem = err.Error()
 		sameFS = true
 		log.Error("durability: could not determine whether the snapshot directory is isolated",
@@ -389,8 +394,18 @@ func shutdownAll(
 	log.Info("jay: stopped")
 }
 
-// buildAdminMux assembles the admin API, its health probes and pprof, all on the
-// admin port.
+// The health probes. They are declared once because two things need them: the
+// mux that serves them and the access log that keeps them at DEBUG.
+const (
+	healthPath      = "/health"
+	healthLivePath  = "/health/live"
+	healthReadyPath = "/health/ready"
+)
+
+// buildAdminMux assembles the admin API, the Prometheus endpoint, its health
+// probes and pprof, all on the admin port, and wraps the lot in the admin
+// access log (admin.Handler.Trace): every request on this listener gets a
+// request ID and a line, whichever of them answers it.
 //
 // Health lives here rather than on the S3 port on purpose: the readiness probe
 // reports internal state — bbolt responsiveness and free disk — and that is not
@@ -398,13 +413,19 @@ func shutdownAll(
 func buildAdminMux(
 	cfg Config, db *meta.DB, st *store.Store, au *auth.Auth,
 	metrics *maintenance.Metrics, hc *HealthChecker, log *slog.Logger,
-) (*http.ServeMux, *admin.Handler) {
+	s3Handler http.Handler,
+) (http.Handler, *admin.Handler, error) {
 	tlsEnabled := cfg.TLSCert != "" && cfg.TLSKey != ""
 	adminHandler := admin.NewHandler(admin.AdminConfig{
 		DB:            db,
 		Store:         st,
 		Auth:          au,
 		AdminToken:    cfg.AdminToken,
+		MetricsToken:  cfg.MetricsToken,
+		MetricsPublic: cfg.MetricsPublic,
+		ExtraMetrics: func() []maintenance.MetricFamily {
+			return append(hc.MetricFamilies(), buildInfoFamily())
+		},
 		Log:           log,
 		Metrics:       metrics,
 		SigningSecret: cfg.SigningSecret,
@@ -414,12 +435,27 @@ func buildAdminMux(
 
 	mux := http.NewServeMux()
 	mux.Handle("/_jay/", adminHandler)
+	mux.Handle("/metrics", adminHandler.PrometheusHandler())
 	mountPprof(mux, adminHandler.RequireAdmin)
-	mux.HandleFunc("/health", hc.ReadinessHandler)
-	mux.HandleFunc("/health/live", hc.LivenessHandler)
-	mux.HandleFunc("/health/ready", hc.ReadinessHandler)
+	mux.HandleFunc(healthPath, hc.ReadinessHandler)
+	mux.HandleFunc(healthLivePath, hc.LivenessHandler)
+	mux.HandleFunc(healthReadyPath, hc.ReadinessHandler)
 
-	return mux, adminHandler
+	// The web console. Disabled, it still owns /console and answers 404 with
+	// the way to turn it on; "/" is claimed only when it is enabled, so a
+	// disabled jay keeps answering 404 there as it always did.
+	consoleHandler, err := buildConsole(cfg, adminHandler, s3Handler, db, hc, log)
+	if err != nil {
+		_ = adminHandler.Close()
+		return nil, nil, fmt.Errorf("web console: %w", err)
+	}
+	mux.Handle("/console", consoleHandler)
+	mux.Handle("/console/", consoleHandler)
+	if cfg.ConsoleEnabled {
+		mux.Handle("/{$}", consoleHandler.RootRedirect())
+	}
+
+	return adminHandler.Trace(mux, healthPath, healthLivePath, healthReadyPath), adminHandler, nil
 }
 
 // startMaintenance starts the background jobs that keep the store honest:
@@ -448,6 +484,24 @@ func startMaintenance(
 	}
 }
 
+// newS3Handler builds the S3-compatible handler. It is separate from
+// startDataListeners because the web console dispatches into the same handler
+// from the admin listener.
+func newS3Handler(
+	cfg Config, db *meta.DB, st *store.Store, au *auth.Auth,
+	log *slog.Logger, metrics *maintenance.Metrics,
+) *api.Handler {
+	var rlCfg *api.RateLimiterConfig
+	if cfg.RateLimit > 0 {
+		rlCfg = &api.RateLimiterConfig{Rate: cfg.RateLimit, Burst: cfg.RateBurst}
+	}
+
+	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret, rlCfg)
+	s3Handler.SetTrustProxyHeaders(cfg.TrustProxyHeaders)
+	s3Handler.SetMaxObjectSize(cfg.MaxObjectSize)
+	return s3Handler
+}
+
 // startDataListeners binds the two surfaces that serve object traffic: the
 // S3-compatible HTTP API and the native TCP protocol.
 //
@@ -458,19 +512,10 @@ func startMaintenance(
 // before exiting: leaving it accepting probes for a process that is about to die
 // would report a service that does not exist.
 func startDataListeners(
-	cfg Config, db *meta.DB, st *store.Store, au *auth.Auth,
+	cfg Config, db *meta.DB, st *store.Store, au *auth.Auth, s3Handler *api.Handler,
 	log *slog.Logger, metrics *maintenance.Metrics,
 	shutdownAdmin func(context.Context) error,
 ) (shutdownS3 func(context.Context) error, shutdownNative func() error) {
-	var rlCfg *api.RateLimiterConfig
-	if cfg.RateLimit > 0 {
-		rlCfg = &api.RateLimiterConfig{Rate: cfg.RateLimit, Burst: cfg.RateBurst}
-	}
-
-	s3Handler := api.NewHandler(db, st, au, log, metrics, cfg.SigningSecret, rlCfg)
-	s3Handler.SetTrustProxyHeaders(cfg.TrustProxyHeaders)
-	s3Handler.SetMaxObjectSize(cfg.MaxObjectSize)
-
 	shutdownS3, err := startServer(cfg.ListenAddr, s3Handler, log, "s3", cfg.TLSCert, cfg.TLSKey)
 	if err != nil {
 		log.Error("failed to start s3 server", "err", err)
@@ -484,8 +529,13 @@ func startDataListeners(
 		return shutdownS3, nil
 	}
 
-	nativeServer := jayproto.NewServer(db, st, au, log, metrics, int(cfg.RateLimit), cfg.RateBurst)
+	// cfg.RateLimit goes in as the float it is. It used to be truncated with
+	// int(), which turned JAY_RATE_LIMIT=0.5 into 0 — no limit at all on this
+	// transport — while the S3 API applied it.
+	nativeServer := jayproto.NewServer(db, st, au, log, metrics, cfg.RateLimit, cfg.RateBurst)
 	nativeServer.SetMaxObjectSize(cfg.MaxObjectSize)
+	nativeServer.SetMaxConns(cfg.NativeMaxConns)
+	nativeServer.SetTokenBytesPerSec(cfg.NativeTokenBytesPerSec)
 
 	nativeTLS, err := nativeTLSConfig(cfg)
 	if err != nil {

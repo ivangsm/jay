@@ -54,12 +54,15 @@ do not line up. Policies and bucket visibility are installed through the
 [admin API](/jay/reference/admin-api/) instead, which is where the rest of the
 operator surface already lives.
 
-## aws-chunked bodies are refused
+## Some aws-chunked bodies are refused
 
-SigV4's streaming upload mode is answered with `501`, which means **`mc` and
-`warp` cannot upload over plain HTTP**. Over HTTPS they work completely. The
-reasoning is in
-[S3 compatibility](/jay/reference/s3-compatibility/).
+SigV4 streaming (`aws-chunked`) is decoded and verified on `PutObject` and
+`UploadPart`. What still answers `501`: SigV4a streaming
+(`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*`), framing under a bearer token or
+a presigned URL — neither has a request signature to seed the chunk chain — and
+framing on any other operation, because only those two commit on the end of the
+body, after the last chunk has verified. The reasoning is in
+[S3 compatibility](/jay/reference/s3-compatibility/#what-still-answers-501).
 
 ## No Windows build
 
@@ -72,8 +75,19 @@ SigV4 recomputes the hash of the body and compares it against the declared one,
 which means buffering. Larger uploads have to use `UNSIGNED-PAYLOAD`, multipart,
 or the [native protocol](/jay/guides/native-protocol/), which has no such limit.
 
-## The native protocol has no TLS
+## The native protocol is in the clear unless you give it a certificate
 
-The handshake carries `token_id:secret` in the clear. It is meant for an
-internal network. If you do not use it, set `JAY_NATIVE_ADDR` to empty and the
-listener never opens.
+The handshake carries `token_id:secret` as plain bytes, and TLS on this
+listener is opt-in: it takes its own pair, `JAY_NATIVE_TLS_CERT` and
+`JAY_NATIVE_TLS_KEY`, separate from the S3 one. Without them the listener is
+meant for an internal network. If you do not use it, set `JAY_NATIVE_ADDR` to
+empty and the listener never opens. See
+[the native protocol guide](/jay/guides/native-protocol/#security-boundary).
+
+## The native protocol has no flow control of its own
+
+It relies on TCP's, on purpose: one request per connection and no
+multiplexing leave nothing for a protocol-level window to do. What it has
+instead are limits — connections, requests per second and body bytes per
+second — described in
+[the protocol reference](/jay/reference/native-protocol/#back-pressure).

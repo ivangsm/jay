@@ -21,10 +21,16 @@ services:
       JAY_ADMIN_ADDR: ":9001"
       JAY_NATIVE_ADDR: ":4444"
       JAY_LOG_LEVEL: info
+      # The web console at http://localhost:9001/console/. Off unless set. The admin
+      # port is published on loopback only above; keep it that way, or put TLS in front.
+      JAY_CONSOLE_ENABLED: "true"
       # Both are required and must be at least 32 characters. Generate them
       # with `openssl rand -base64 32`; jay refuses to start without them.
       JAY_ADMIN_TOKEN: ${JAY_ADMIN_TOKEN:?JAY_ADMIN_TOKEN required}
       JAY_SIGNING_SECRET: ${JAY_SIGNING_SECRET:?JAY_SIGNING_SECRET required}
+      # Optional: a read-only bearer for Prometheus on GET /metrics, so the
+      # scraper never holds the admin token. At least 32 characters.
+      # JAY_METRICS_TOKEN: ${JAY_METRICS_TOKEN}
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9001/health/ready"]
       interval: 10s

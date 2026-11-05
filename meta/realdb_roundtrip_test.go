@@ -14,25 +14,17 @@ import (
 	"github.com/ivangsm/jay/internal/jsonx"
 )
 
-// realDBFixture es la ruta a un jay.db ESCRITO POR LA VERSIÓN ANTERIOR (la que
-// usaba encoding/json v1). Se puede sobreescribir con JAY_TEST_REAL_DB para
-// apuntar a un jay.db de producción.
+// realDBFixture is a jay.db written by a binary that used encoding/json v1.
+// JAY_TEST_REAL_DB overrides it to point at a production jay.db.
 //
-// Cómo se regenera (ver el reporte de la migración a Go 1.27):
-//
-//	git archive HEAD~1 | tar -x -C /tmp/old && (cd /tmp/old && go build -o /tmp/jay-old .)
-//	JAY_DATA_DIR=/tmp/rt ... /tmp/jay-old        # sembrar cuentas/tokens/buckets/multipart
-//	cp /tmp/rt/meta/jay.db testdata/jay.db.v1
+// To regenerate it, build a pre-json/v2 checkout, seed accounts, tokens,
+// buckets and multipart uploads through it, and copy its meta/jay.db here.
 const realDBFixture = "testdata/jay.db.v1"
 
-// TestRealDB_RoundTripByteIdentical es la verificación que los fixtures
-// sintéticos NO pueden dar: agarra un jay.db de verdad, escrito por el binario
-// anterior con encoding/json v1, lo lee con el código nuevo (json/v2 +
-// jsonx.Wire), lo vuelve a serializar y exige que los bytes sean IDÉNTICOS.
-//
-// Para jay esto no es cosmético: JSON es su formato en disco. Si los bytes
-// cambiaran, un rollback al binario anterior encontraría registros que ya no
-// entiende, y el scrubber reescribiría toda la base sin necesidad.
+// TestRealDB_RoundTripByteIdentical reads a real jay.db written with
+// encoding/json v1, re-serialises every record with json/v2 + jsonx.Wire and
+// requires identical bytes: JSON is jay's on-disk format, and a byte of drift
+// breaks a rollback to the previous binary.
 func TestRealDB_RoundTripByteIdentical(t *testing.T) {
 	path := os.Getenv("JAY_TEST_REAL_DB")
 	if path == "" {
@@ -140,8 +132,8 @@ func TestRealDB_RoundTripByteIdentical(t *testing.T) {
 		t.Logf("%d multipart uploads verificados", n)
 	})
 
-	// Y por la API pública: leer, reescribir y volver a leer tiene que dar lo
-	// mismo, con el secreto de token descifrándose igual que antes.
+	// Through the public API: read, rewrite and read again must agree, with
+	// the token secret decrypting the same way.
 	t.Run("lectura-reescritura-lectura", func(t *testing.T) {
 		tokens, err := db.ListTokens("")
 		if err != nil {
@@ -177,14 +169,10 @@ func TestRealDB_RoundTripByteIdentical(t *testing.T) {
 	})
 }
 
-// TestRealDB_LegacyJSONObjectBranch cubre la rama '{' de meta/codec.go, que es
-// la única parte del formato en disco que el fixture NO trae: los registros de
-// Object de hoy usan el envelope binario (gob), y el JSON pelado solo aparece
-// en bases anteriores al codec.
-//
-// El test inyecta un registro legacy REAL —los bytes exactos que producía
-// encoding/json v1— en el bbolt bucket de objetos del jay.db de referencia, y
-// exige que el código nuevo lo lea y lo reproduzca idéntico.
+// TestRealDB_LegacyJSONObjectBranch covers the '{' branch of meta/codec.go, the
+// one part of the on-disk format the fixture lacks (its Object records carry
+// the gob envelope). It injects a real v1-encoded record into the objects
+// bucket and requires the current code to read and reproduce it identically.
 func TestRealDB_LegacyJSONObjectBranch(t *testing.T) {
 	path := os.Getenv("JAY_TEST_REAL_DB")
 	if path == "" {

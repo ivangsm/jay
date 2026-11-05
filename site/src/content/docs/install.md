@@ -81,6 +81,32 @@ Jay listens on three ports:
 A deployment that does not use the native protocol turns its listener off with
 an empty `JAY_NATIVE_ADDR`; the startup line then reports `"native":"disabled"`.
 
+## The first token
+
+Nothing can talk to a fresh Jay until it has an account and a token.
+`jay-admin` mints both over the admin port, with the same `JAY_ADMIN_TOKEN` the
+server was started with:
+
+```bash
+export JAY_ADMIN_ADDR=http://localhost:9001
+export JAY_ADMIN_TOKEN=...   # the value the server was started with
+
+jay-admin create-account -name myapp
+# {"account_id": "ACCOUNT_ID", "name": "myapp", ...}
+
+jay-admin create-token -account ACCOUNT_ID -name deploy \
+  -actions bucket:write-meta,object:put,object:get,object:list
+# {"token_id": "...", "secret": "..."}
+```
+
+`-actions` is required: the token can do exactly what it lists and nothing
+else. The names are in [Authentication](/jay/reference/authentication/#scoping);
+`'*'` grants all of them. The secret is printed once and cannot be read back.
+
+Point any S3 client at `http://localhost:9000` with the `token_id` as the
+access key and the `secret` as the secret key, or use the same pair with
+[the command-line client](/jay/guides/cli/).
+
 ## The binary is also the client
 
 Any argument that does not start with `-` is a subcommand, and subcommands talk

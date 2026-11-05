@@ -45,6 +45,7 @@ export default defineConfig({
 						{ label: 'The native protocol', slug: 'guides/native-protocol' },
 						{ label: 'Embedding Jay in Go', slug: 'guides/embedded' },
 						{ label: 'Command-line client', slug: 'guides/cli' },
+						{ label: 'Web console', slug: 'guides/console' },
 						{ label: 'Deploying Jay', slug: 'guides/deployment' },
 						{ label: 'Backup and restore', slug: 'guides/backup-and-restore' },
 					],

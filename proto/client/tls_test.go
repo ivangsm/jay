@@ -75,8 +75,10 @@ type tlsEnv struct {
 }
 
 // startNativeServer boots a native protocol server, with TLS when serverTLS is
-// non-nil, and returns everything needed to connect to it.
-func startNativeServer(t *testing.T, serverTLS *tls.Config) *tlsEnv {
+// non-nil, and returns everything needed to connect to it. configure runs
+// before the listener opens, which is the only time the server's setters may
+// be called.
+func startNativeServer(t *testing.T, serverTLS *tls.Config, configure ...func(*proto.Server)) *tlsEnv {
 	t.Helper()
 	dir := t.TempDir()
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -118,6 +120,9 @@ func startNativeServer(t *testing.T, serverTLS *tls.Config) *tlsEnv {
 	srv := proto.NewServer(db, st, auth.New(db), log, metrics, 0, 0)
 	if serverTLS != nil {
 		srv.SetTLSConfig(serverTLS)
+	}
+	for _, fn := range configure {
+		fn(srv)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -233,13 +238,10 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
 
-// TestNativeTLS_SecretIsNotReadableOnTheWire is the test PND-0163 is actually
-// about. It asserts the property, not the setting: with TLS off the token
-// secret is sitting in the bytes on the wire, and with TLS on it is not.
-//
-// Half of it is a control. Without the plaintext case proving the proxy can
-// see a secret when one is there, the TLS case would pass just as happily
-// against a proxy that captured nothing at all.
+// TestNativeTLS_SecretIsNotReadableOnTheWire asserts the property, not the
+// setting: with TLS off the token secret is in the bytes on the wire, with TLS
+// on it is not. The plaintext case is the control: without it the TLS case
+// would pass against a proxy that captured nothing at all.
 func TestNativeTLS_SecretIsNotReadableOnTheWire(t *testing.T) {
 	t.Run("plaintext leaks the secret", func(t *testing.T) {
 		env := startNativeServer(t, nil)
@@ -319,9 +321,8 @@ func TestNativeTLS_NoSilentDowngrade(t *testing.T) {
 	})
 }
 
-// TestHandshakeErrors_AreDistinguishable covers the diagnosis half of the same
-// work: a caller has to be able to tell "retry later" from "your token is
-// wrong", and every failure used to report the same thing.
+// TestHandshakeErrors_AreDistinguishable: a caller has to be able to tell
+// "retry later" from "your token is wrong".
 func TestHandshakeErrors_AreDistinguishable(t *testing.T) {
 	env := startNativeServer(t, nil)
 
@@ -388,14 +389,10 @@ func TestDialWithOptions_ZeroPoolSizeDefaults(t *testing.T) {
 	}
 }
 
-// TestLastModified_SameFormatOnEveryPath fixes a divergence found while writing
-// the protocol spec: ListObjects formatted last_modified with the literal
-// layout "2006-01-02T15:04:05Z" while HeadObject and GetObject used
-// time.RFC3339. That literal is not a timezone specifier — it stamps a "Z" on
-// whatever zone the value happens to carry — so the two paths agreed only
-// because meta stores UTC. One object reported its mtime two ways depending on
-// how you asked for it, and the ListObjects form would have claimed UTC while
-// printing local time.
+// TestLastModified_SameFormatOnEveryPath: ListObjects, HeadObject and GetObject
+// must format last_modified identically (RFC 3339 in UTC). The literal layout
+// "2006-01-02T15:04:05Z" is not a timezone specifier: it stamps a "Z" on
+// whatever zone the value carries.
 func TestLastModified_SameFormatOnEveryPath(t *testing.T) {
 	env := startNativeServer(t, nil)
 

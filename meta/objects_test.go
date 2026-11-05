@@ -294,9 +294,9 @@ func TestListObjectsPaginatedSemantics_EmptyBucket(t *testing.T) {
 }
 
 func TestListObjectsPaginatedSemantics_BatchBoundaryTruncation(t *testing.T) {
-	// Regression guard: the refactor reads in batches of 100. Ensure that when
-	// the request asks for exactly a batch-aligned number of keys and more
-	// exist, IsTruncated is correctly set (requires cross-batch lookahead).
+	// bbolt is read in batches of listBatchSize. A request for exactly a
+	// batch-aligned number of keys, with more behind, must still set
+	// IsTruncated, which needs a cross-batch lookahead.
 	db := openObjectsTestDB(t)
 	bkt := &Bucket{ID: uuid.New().String(), Name: "batch", Visibility: "private", Status: "active"}
 	if err := db.CreateBucket(bkt); err != nil {

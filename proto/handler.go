@@ -1,7 +1,5 @@
 package proto
 
-import "io"
-
 func (h *connHandler) dispatch(req *request) error {
 	switch req.op {
 	case OpCreateBucket:
@@ -39,9 +37,12 @@ func (h *connHandler) dispatch(req *request) error {
 	case OpPing:
 		return h.writeResponse(StatusOK, req.streamID, nil, nil, 0)
 	default:
-		// Drain any data (bounded by dataLen to prevent unbounded reads)
-		if req.dataLen > 0 && req.data != nil {
-			_, _ = io.CopyN(io.Discard, req.data, req.dataLen)
+		// Same rule as every other refused body: drained up to MaxDrainSize,
+		// answered and closed past it. A newer client probing an opcode this
+		// server lacks keeps its connection; a 5 GiB body behind one does not
+		// get read to be thrown away.
+		if err := drainData(req); err != nil {
+			return err
 		}
 		return h.writeError(StatusBadRequest, req.streamID, "unknown operation", "UnknownOp")
 	}

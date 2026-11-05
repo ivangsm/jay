@@ -18,9 +18,18 @@ type Metrics struct {
 	CreateBucketTotal atomic.Int64
 	DeleteBucketTotal atomic.Int64
 
-	AuthFailures     atomic.Int64
-	ChecksumFailures atomic.Int64
-	FsyncFailures    atomic.Int64
+	// AuthFailures counts requests the S3 API refused for their credentials.
+	AuthFailures atomic.Int64
+	// AdminAuthFailures counts requests the admin listener's bearer gate
+	// refused — /_jay, pprof and /metrics alike, including those refused
+	// because the source address is locked out. It is its own counter rather
+	// than a share of AuthFailures because the two mean different things: a
+	// few S3 refusals are routine (an expired presigned URL, an anonymous probe
+	// of a private bucket), while the admin listener sits on a private network
+	// and any refusal there is somebody holding the wrong credential.
+	AdminAuthFailures atomic.Int64
+	ChecksumFailures  atomic.Int64
+	FsyncFailures     atomic.Int64
 
 	ObjectsQuarantined atomic.Int64
 
@@ -65,6 +74,15 @@ func (m *Metrics) RecordMetadataDecodeFailure() {
 	m.MetadataDecodeFailures.Add(1)
 }
 
+// RecordAdminAuthFailure bumps the admin-surface auth failure counter.
+// Nil-safe: the admin handler runs in fixtures with no metrics.
+func (m *Metrics) RecordAdminAuthFailure() {
+	if m == nil {
+		return
+	}
+	m.AdminAuthFailures.Add(1)
+}
+
 // RecordPanicRecovered bumps the recovered-panic counter. Nil-safe: the
 // recovery paths that call it run in handlers that may hold no metrics at all
 // (fixtures, the client-side harnesses), and a nil check there would be one
@@ -79,6 +97,7 @@ func (m *Metrics) RecordPanicRecovered() {
 // Snapshot returns a JSON-serializable snapshot of all metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
+		StartedAt:          m.startedAt,
 		UptimeSeconds:      int64(time.Since(m.startedAt).Seconds()),
 		PutObjectTotal:     m.PutObjectTotal.Load(),
 		GetObjectTotal:     m.GetObjectTotal.Load(),
@@ -88,6 +107,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		CreateBucketTotal:  m.CreateBucketTotal.Load(),
 		DeleteBucketTotal:  m.DeleteBucketTotal.Load(),
 		AuthFailures:       m.AuthFailures.Load(),
+		AdminAuthFailures:  m.AdminAuthFailures.Load(),
 		ChecksumFailures:   m.ChecksumFailures.Load(),
 		FsyncFailures:      m.FsyncFailures.Load(),
 		ObjectsQuarantined: m.ObjectsQuarantined.Load(),
@@ -100,7 +120,17 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 }
 
 // MetricsSnapshot is a JSON-serializable point-in-time copy of metrics.
+//
+// It feeds both exports: GET /_jay/metrics serialises it as JSON, and
+// GET /metrics renders it in the Prometheus text format through
+// PrometheusFamilies. A counter added here has to be added there too, and a
+// test fails until it is.
 type MetricsSnapshot struct {
+	// StartedAt is when the process started counting. It is not in the JSON,
+	// which has always carried uptime_seconds instead; the Prometheus export
+	// uses it for jay_start_time_seconds, the form Prometheus expects.
+	StartedAt time.Time `json:"-"`
+
 	UptimeSeconds      int64 `json:"uptime_seconds"`
 	PutObjectTotal     int64 `json:"put_object_total"`
 	GetObjectTotal     int64 `json:"get_object_total"`
@@ -110,6 +140,7 @@ type MetricsSnapshot struct {
 	CreateBucketTotal  int64 `json:"create_bucket_total"`
 	DeleteBucketTotal  int64 `json:"delete_bucket_total"`
 	AuthFailures       int64 `json:"auth_failures"`
+	AdminAuthFailures  int64 `json:"admin_auth_failures"`
 	ChecksumFailures   int64 `json:"checksum_failures"`
 	FsyncFailures      int64 `json:"fsync_failures"`
 	ObjectsQuarantined int64 `json:"objects_quarantined"`

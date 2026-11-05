@@ -13,19 +13,14 @@ import (
 	"github.com/ivangsm/jay/internal/jsonx"
 )
 
-// TestJSONWireCompatV1V2 es la red de seguridad del cambio de encoding/json v1
-// a encoding/json/v2: para jay, JSON *es* el formato en disco (registros bbolt
-// de cuentas, tokens, buckets y multipart, más los registros de objeto con el
-// envelope legacy). Si v2 + jsonx.Wire emitiera un solo byte distinto al de v1,
-// un jay.db escrito con la versión nueva dejaría de ser legible por la vieja y
-// al revés.
+// TestJSONWireCompatV1V2: for jay, JSON *is* the on-disk format (bbolt records
+// of accounts, tokens, buckets and multipart, plus legacy-envelope objects), so
+// v2 + jsonx.Wire must emit byte for byte what encoding/json v1 emits. The v1
+// import is deliberate: it is the reference for those bytes.
 //
-// Por eso este test importa encoding/json v1 a propósito y lo deja importado:
-// es la única referencia confiable de "cómo se veían los bytes antes".
-//
-// El corpus cubre, por cada tipo persistido: valor cero, slice nil y slice
-// vacío, mapa nil y mapa vacío, string vacío, no-ASCII, los caracteres que v1
-// escapa por omisión (`&`, `<`, `>`, U+2028/U+2029) y campos time.Time.
+// The corpus covers, per persisted type: zero value, nil and empty slice, nil
+// and empty map, empty string, non-ASCII, the characters v1 escapes by default
+// (`&`, `<`, `>`, U+2028/U+2029) and time.Time fields.
 func TestJSONWireCompatV1V2(t *testing.T) {
 	ts := time.Date(2026, 8, 21, 15, 4, 5, 123456789, time.UTC)
 	tsLocal := time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("MX", -6*3600))
@@ -101,14 +96,11 @@ func TestJSONWireCompatV1V2(t *testing.T) {
 	}
 }
 
-// TestJSONWireRoundTripV1V2 comprueba la otra dirección: lo que escribió v1 lo
-// tiene que poder leer v2 y viceversa, incluido el envelope legacy JSON de
-// meta/codec.go (registros de Object escritos antes del codec binario).
-// TestBucketPolicyEmptyIsRejected fija el único estado de PolicyJSON donde v1
-// y v2 discrepaban: un jsontext.Value vacío-pero-no-nil no es JSON válido.
-// Con `omitzero` los dos codificadores lo rechazan igual (con omitempty, v1 lo
-// omitía en silencio y v2 reventaba a mitad del documento), y UpdateBucketPolicy
-// lo corta antes de abrir la transacción para que el error sea atribuible.
+// TestBucketPolicyEmptyIsRejected pins the one PolicyJSON state where v1 and
+// v2 disagree: an empty-but-non-nil jsontext.Value is not valid JSON. With
+// `omitzero` both encoders reject it alike (with omitempty, v1 omits it and v2
+// fails mid-document), and UpdateBucketPolicy refuses it before opening the
+// transaction so the error is attributable.
 func TestBucketPolicyEmptyIsRejected(t *testing.T) {
 	empty := jsontext.Value{}
 
@@ -139,6 +131,8 @@ func TestBucketPolicyEmptyIsRejected(t *testing.T) {
 	}
 }
 
+// TestJSONWireRoundTripV1V2 checks the other direction: what v1 wrote, v2 must
+// read and vice versa, including the legacy JSON envelope of meta/codec.go.
 func TestJSONWireRoundTripV1V2(t *testing.T) {
 	ts := time.Date(2026, 8, 21, 15, 4, 5, 123456789, time.UTC)
 	obj := &Object{
@@ -157,7 +151,7 @@ func TestJSONWireRoundTripV1V2(t *testing.T) {
 		t.Fatalf("el registro legacy debe empezar con '{', empieza con 0x%02x", legacy[0])
 	}
 
-	// decodeObject toma la rama '{' de meta/codec.go, que ahora usa v2.
+	// decodeObject takes the '{' branch of meta/codec.go.
 	var viaCodec Object
 	if err := decodeObject(legacy, &viaCodec); err != nil {
 		t.Fatalf("decodeObject sobre registro legacy: %v", err)

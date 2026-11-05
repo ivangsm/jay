@@ -1,18 +1,15 @@
 package admin
 
-// PND-0187: bucket policies and visibility were implemented and unreachable.
-// The evaluator was real and tested; installing one required stopping jay and
-// writing the bucket record into bbolt with a purpose-built program.
-//
-// So no test here asserts that the endpoint answered 200. Every one of them
-// asks the S3 handler the SAME question before and after the admin call and
-// requires the ANSWER to change — a request that was refused and is now served
-// with the right bytes, or the reverse. A 200 from the admin API proves the
-// route exists; only the flipped decision proves the policy is installed.
+// No test here asserts that the endpoint answered 200. Every one of them asks
+// the S3 handler the SAME question before and after the admin call and
+// requires the ANSWER to change: a 200 from the admin API proves the route
+// exists; only the flipped decision proves the policy is installed.
 
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -213,8 +210,7 @@ func TestPutBucketPolicy_AllowOpensACrossAccountRead(t *testing.T) {
 	f := newPolicyFixture(t)
 	stranger := bearer(strangerTokenID, strangerSecret)
 
-	// Before: the widest possible token of another account is refused, which is
-	// the behaviour PND-0185 established and this must not change.
+	// Before: the widest possible token of another account is refused.
 	if code, body := f.get(t, stranger); code == http.StatusOK || body == policyBody {
 		t.Fatalf("the stranger could already read the object (%d, %q) — the test "+
 			"would prove nothing", code, body)
@@ -224,8 +220,8 @@ func TestPutBucketPolicy_AllowOpensACrossAccountRead(t *testing.T) {
 		t.Fatalf("install policy: want 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// After: the SAME request now succeeds and returns the object's bytes. This
-	// is the assertion the pendiente is about — the endpoint changed a decision.
+	// After: the SAME request succeeds and returns the object's bytes — the
+	// endpoint changed a decision.
 	code, body := f.get(t, stranger)
 	if code != http.StatusOK {
 		t.Fatalf("after installing the allow the stranger still gets %d: %s", code, body)
@@ -474,4 +470,255 @@ func TestGetBucket_ReportsWhatWasInstalled(t *testing.T) {
 	if len(installed.Statements) != 1 || installed.Statements[0].Effect != "allow" {
 		t.Fatalf("the reported policy is not the one installed: %s", resp.Policy)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Listing, creating and deleting buckets
+// ---------------------------------------------------------------------------
+
+type listedBucket struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	OwnerAccountID string `json:"owner_account_id"`
+	Visibility     string `json:"visibility"`
+	Status         string `json:"status"`
+	HasPolicy      bool   `json:"has_policy"`
+	ObjectCount    int64  `json:"object_count"`
+	TotalSizeBytes int64  `json:"total_size_bytes"`
+}
+
+func (f *controlFixture) listBuckets(t *testing.T, query string) []listedBucket {
+	t.Helper()
+	w := f.as(t, http.MethodGet, "/_jay/buckets"+query, "")
+	requireStatus(t, w, http.StatusOK)
+	var out []listedBucket
+	if err := jsonv2.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("not a JSON array of buckets: %q: %v", w.Body.String(), err)
+	}
+	return out
+}
+
+// s3Put writes key into bucket as the fixture's wildcard token and requires it
+// to have landed.
+func (f *controlFixture) s3Put(t *testing.T, bucket, key, body string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "http://jay.test/"+bucket+"/"+key, strings.NewReader(body))
+	req.Header.Set("Authorization", bearer(ctlTokenID, ctlTokenSecret))
+	w := httptest.NewRecorder()
+	f.s3.ServeHTTP(w, req)
+	requireStatus(t, w, http.StatusOK)
+}
+
+// The counters are the ones the objects wrote, not zeros: a PUT of known size
+// into a fresh bucket moves exactly them. The rows come back by name, the
+// owner filter narrows, and has_policy follows the installed policy.
+func TestListBuckets_ReportsRealStatsOrderingFilterAndPolicy(t *testing.T) {
+	f := newControlFixture(t)
+	other := createAccountForTest(t, f.db, "someone-else")
+	for _, name := range []string{"zeta-bucket", "alpha-bucket"} {
+		requireStatus(t, f.as(t, http.MethodPost, "/_jay/buckets",
+			`{"name":"`+name+`","owner_account_id":"`+f.account.AccountID+`"}`), http.StatusCreated)
+	}
+	requireStatus(t, f.as(t, http.MethodPost, "/_jay/buckets",
+		`{"name":"theirs-bucket","owner_account_id":"`+other.AccountID+`"}`), http.StatusCreated)
+
+	f.s3Put(t, "alpha-bucket", "a", "12345")
+	f.s3Put(t, "alpha-bucket", "b", "1234567")
+	f.s3Put(t, "alpha-bucket", "a", "123") // overwrite: 2 objects, 3+7 bytes
+	requireStatus(t, f.as(t, http.MethodPut, "/_jay/buckets/alpha-bucket/policy",
+		`{"statements":[{"effect":"deny","actions":["object:delete"],"subjects":["*"]}]}`), http.StatusOK)
+
+	all := f.listBuckets(t, "")
+	var names []string
+	for _, b := range all {
+		names = append(names, b.Name)
+	}
+	wantNames := []string{"alpha-bucket", ctlBucket, ctlEmptyBucket, "theirs-bucket", "zeta-bucket"}
+	if strings.Join(names, ",") != strings.Join(wantNames, ",") {
+		t.Fatalf("names = %v, want %v (sorted by name)", names, wantNames)
+	}
+
+	byName := map[string]listedBucket{}
+	for _, b := range all {
+		byName[b.Name] = b
+	}
+	alpha := byName["alpha-bucket"]
+	if alpha.ObjectCount != 2 || alpha.TotalSizeBytes != 10 || !alpha.HasPolicy ||
+		alpha.OwnerAccountID != f.account.AccountID || alpha.Visibility != "private" ||
+		alpha.Status != "active" || alpha.ID == "" {
+		t.Fatalf("alpha row = %+v, want 2 objects, 10 bytes, a policy, private, active, owned by the fixture account", alpha)
+	}
+	if empty := byName["zeta-bucket"]; empty.ObjectCount != 0 || empty.TotalSizeBytes != 0 || empty.HasPolicy {
+		t.Fatalf("an untouched bucket reports %+v", empty)
+	}
+
+	mine := f.listBuckets(t, "?owner_account_id="+other.AccountID)
+	if len(mine) != 1 || mine[0].Name != "theirs-bucket" || mine[0].OwnerAccountID != other.AccountID {
+		t.Fatalf("owner filter returned %+v", mine)
+	}
+	if none := f.listBuckets(t, "?owner_account_id=no-such-account"); none == nil || len(none) != 0 {
+		t.Fatalf("a filter that matches nothing returned %#v, want an empty array", none)
+	}
+}
+
+func TestListBuckets_ADatabaseFailureIsNotAnEmptyList(t *testing.T) {
+	f := newControlFixture(t)
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w := f.as(t, http.MethodGet, "/_jay/buckets", "")
+	requireStatus(t, w, http.StatusInternalServerError)
+	if msg := errorMessage(t, w); msg != "internal error" {
+		t.Fatalf("error = %q", msg)
+	}
+}
+
+// 201 is checked where it lands: the record in bbolt, the id the response
+// reported, the counter, and a token of the owner that can really write to it.
+func TestCreateBucket_LandsInMetaOwnedByTheAccountAndIsUsable(t *testing.T) {
+	f := newControlFixture(t)
+	before := f.metrics.Snapshot().CreateBucketTotal
+
+	w := f.as(t, http.MethodPost, "/_jay/buckets",
+		`{"name":"made-by-admin","owner_account_id":"`+f.account.AccountID+`"}`)
+	requireStatus(t, w, http.StatusCreated)
+	var resp struct {
+		ID             string `json:"id"`
+		Name           string `json:"name"`
+		OwnerAccountID string `json:"owner_account_id"`
+		Visibility     string `json:"visibility"`
+		Status         string `json:"status"`
+	}
+	if err := jsonv2.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := f.db.GetBucket("made-by-admin")
+	if err != nil {
+		t.Fatalf("201 but the bucket is not in meta: %v", err)
+	}
+	if stored.ID != resp.ID || resp.ID == "" || stored.OwnerAccountID != f.account.AccountID ||
+		resp.OwnerAccountID != f.account.AccountID || stored.Visibility != meta.VisibilityPrivate ||
+		stored.Status != "active" || resp.Name != "made-by-admin" {
+		t.Fatalf("stored %+v, response %+v", stored, resp)
+	}
+	if got := f.metrics.Snapshot().CreateBucketTotal; got != before+1 {
+		t.Fatalf("create_bucket_total = %d, want %d", got, before+1)
+	}
+	f.s3Put(t, "made-by-admin", "hello", "world") // the owner's token reaches it
+}
+
+func TestCreateBucket_RefusalsChangeNothing(t *testing.T) {
+	f := newControlFixture(t)
+	owner := f.account.AccountID
+	before := f.dbDigest(t)
+
+	for _, c := range []struct {
+		name, body string
+		status     int
+		message    string
+	}{
+		{"not JSON", `nope`, 400, "invalid request body"},
+		{"unknown field", `{"name":"valid-name","owner_account_id":"` + owner + `","x":1}`, 400, "invalid request body"},
+		{"no owner", `{"name":"valid-name"}`, 400, "owner_account_id is required"},
+		{"unknown owner", `{"name":"valid-name","owner_account_id":"ghost"}`, 400, "account not found"},
+		{"invalid name", `{"name":"Not_Valid","owner_account_id":"` + owner + `"}`, 400, "bucket name is invalid"},
+		{"empty name", `{"name":"","owner_account_id":"` + owner + `"}`, 400, "bucket name is invalid"},
+		{"name taken", `{"name":"` + ctlBucket + `","owner_account_id":"` + owner + `"}`, 409, "bucket already exists"},
+	} {
+		w := f.as(t, http.MethodPost, "/_jay/buckets", c.body)
+		requireStatus(t, w, c.status)
+		if msg := errorMessage(t, w); !strings.HasPrefix(msg, c.message) {
+			t.Fatalf("%s: error = %q, want prefix %q", c.name, msg, c.message)
+		}
+	}
+	f.requireUnchanged(t, before, "a refused bucket create")
+}
+
+func TestCreateBucket_AccountOverTheLimitIsRefused(t *testing.T) {
+	f := newControlFixture(t)
+	acc := createAccountForTest(t, f.db, "hoarder")
+	for i := range meta.MaxBucketsPerAccount {
+		if err := f.db.CreateBucket(&meta.Bucket{
+			ID: uuid.New().String(), Name: fmt.Sprintf("hoard-%04d", i), OwnerAccountID: acc.AccountID,
+			Visibility: meta.VisibilityPrivate, Status: "active",
+		}); err != nil {
+			t.Fatalf("seed bucket %d: %v", i, err)
+		}
+	}
+	before := f.dbDigest(t)
+
+	w := f.as(t, http.MethodPost, "/_jay/buckets", `{"name":"one-too-many","owner_account_id":"`+acc.AccountID+`"}`)
+	requireStatus(t, w, http.StatusConflict)
+	if msg := errorMessage(t, w); msg != "account bucket limit exceeded (1000)" {
+		t.Fatalf("error = %q", msg)
+	}
+	f.requireUnchanged(t, before, "a create over the limit")
+	if _, err := f.db.GetBucket("one-too-many"); err == nil {
+		t.Fatal("the bucket over the limit exists")
+	}
+}
+
+func TestDeleteBucket_AnEmptyBucketIsGoneAndCounted(t *testing.T) {
+	f := newControlFixture(t)
+	before := f.metrics.Snapshot().DeleteBucketTotal
+
+	requireStatus(t, f.as(t, http.MethodDelete, "/_jay/buckets/"+ctlEmptyBucket, ""), http.StatusNoContent)
+
+	if _, err := f.db.GetBucket(ctlEmptyBucket); !errors.Is(err, meta.ErrBucketNotFound) {
+		t.Fatalf("204 but the bucket is still in meta: %v", err)
+	}
+	if got := f.metrics.Snapshot().DeleteBucketTotal; got != before+1 {
+		t.Fatalf("delete_bucket_total = %d, want %d", got, before+1)
+	}
+	// The name is free again.
+	requireStatus(t, f.as(t, http.MethodPost, "/_jay/buckets",
+		`{"name":"`+ctlEmptyBucket+`","owner_account_id":"`+f.account.AccountID+`"}`), http.StatusCreated)
+}
+
+// A bucket holding data is never deleted, and the refusal leaves the bucket,
+// its object records and its files exactly where they were. A quarantined
+// object counts: it is evidence, not nothing.
+func TestDeleteBucket_ABucketWithObjectsIsRefusedAndKeepsThem(t *testing.T) {
+	f := newControlFixture(t)
+	requireStatus(t, f.as(t, http.MethodPost, "/_jay/buckets",
+		`{"name":"only-quarantined","owner_account_id":"`+f.account.AccountID+`"}`), http.StatusCreated)
+	f.s3Put(t, "only-quarantined", "k", "bytes")
+	b, err := f.db.GetBucket("only-quarantined")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.QuarantineObject(b.ID, "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{ctlBucket, "only-quarantined"} {
+		before := f.dbDigest(t)
+		w := f.as(t, http.MethodDelete, "/_jay/buckets/"+name, "")
+		requireStatus(t, w, http.StatusConflict)
+		if msg := errorMessage(t, w); msg != "bucket is not empty: delete its objects, including any in quarantine, first" {
+			t.Fatalf("%s: error = %q", name, msg)
+		}
+		f.requireUnchanged(t, before, "a refused bucket delete")
+		if _, err := f.db.GetBucket(name); err != nil {
+			t.Fatalf("%s: the refused delete removed the bucket: %v", name, err)
+		}
+	}
+	if code, body := f.s3Get(t, healthyKey); code != http.StatusOK || body != healthyBody {
+		t.Fatalf("the refused delete damaged an object: %d %q", code, body)
+	}
+	if f.objectState(t, sickKey) != "quarantined" {
+		t.Fatal("the refused delete touched the quarantined object")
+	}
+}
+
+func TestDeleteBucket_AMissingBucketIs404(t *testing.T) {
+	f := newControlFixture(t)
+	before := f.dbDigest(t)
+	w := f.as(t, http.MethodDelete, "/_jay/buckets/never-existed", "")
+	requireStatus(t, w, http.StatusNotFound)
+	if msg := errorMessage(t, w); msg != "bucket not found" {
+		t.Fatalf("error = %q", msg)
+	}
+	f.requireUnchanged(t, before, "deleting a bucket that does not exist")
 }

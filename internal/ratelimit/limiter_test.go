@@ -119,10 +119,8 @@ func TestAllow_KeysDoNotInterfere(t *testing.T) {
 }
 
 func TestAllow_TokensRefillOverTime(t *testing.T) {
-	// Con testing/synctest el reloj es falso y determinístico: antes esto era
-	// un time.Sleep(5 ms) real, o sea una carrera con el planificador que en
-	// una máquina cargada podía dormir de más (o de menos) y decidir el
-	// resultado. Acá el tiempo avanza exactamente lo que se pide.
+	// testing/synctest: the clock is fake, so time advances exactly what is
+	// asked for. A real time.Sleep would race the scheduler on a loaded host.
 	synctest.Test(t, func(t *testing.T) {
 		// 1 r/s → un token por segundo; burst=1.
 		l := New(Config{Rate: 1, Burst: 1})
@@ -149,9 +147,8 @@ func TestAllow_TokensRefillOverTime(t *testing.T) {
 	})
 }
 
-// TestCleanupLoop_EvictsIdleBuckets cubre el loop de limpieza, que hasta ahora
-// era intesteable: corre cada 5 min y desaloja los buckets sin uso por más de
-// 1 h. Con el reloj falso de synctest se prueba en milisegundos.
+// TestCleanupLoop_EvictsIdleBuckets covers the cleanup loop (every 5 min,
+// evicts buckets idle for over 1 h) under synctest's fake clock.
 func TestCleanupLoop_EvictsIdleBuckets(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		l := New(Config{Rate: 10, Burst: 10})

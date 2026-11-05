@@ -66,12 +66,9 @@ func assertIntact(t *testing.T, h *Handler, auth, original, what string) {
 // ── writes: nothing unrecognised may reach a destructive handler ───────────
 
 // A write carrying a sub-resource jay does not implement must not reach the
-// object's PUT or DELETE handler.
-//
-// It used to: `PUT /bucket/key?tagging` reached handlePutObject and overwrote
-// the photo with the `<Tagging>` XML; `DELETE /bucket/key?tagging` deleted it
-// outright. Both answered success. The bbolt backup only holds metadata, so the
-// bytes did not come back.
+// object's PUT or DELETE handler: `PUT /bucket/key?tagging` would overwrite
+// the object with the `<Tagging>` XML and `DELETE /bucket/key?tagging` would
+// delete it, both under a success code.
 func TestWrite_UnimplementedSubresource_DoesNotDestroyObject(t *testing.T) {
 	const original = "the-original-photo-bytes"
 
@@ -102,7 +99,8 @@ func TestWrite_UnimplementedSubresource_DoesNotDestroyObject(t *testing.T) {
 // with a name jay does recognise. `PUT /bucket/key?uploads` is not
 // CreateMultipartUpload (that is a POST) — it is a PUT that overwrites the
 // object. `DELETE /bucket/key?uploadId=` carries an empty value, so the
-// multipart branch declines it and the plain DELETE handler wiped the object.
+// multipart branch declines it and the plain DELETE handler would wipe the
+// object.
 func TestWrite_MultipartParamOnWrongMethod_DoesNotDestroyObject(t *testing.T) {
 	const original = "the-original-photo-bytes"
 

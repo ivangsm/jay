@@ -38,6 +38,14 @@ type testEnv struct {
 
 func setup(t *testing.T) *testEnv {
 	t.Helper()
+	return setupWith(t, 0, 0, nil)
+}
+
+// setupWith is setup with the request rate limit NewServer takes, and a hook
+// that configures the server before it starts listening, which is the only
+// time its setters may be called.
+func setupWith(t *testing.T, rateLimit float64, rateBurst int, configure func(*proto.Server)) *testEnv {
+	t.Helper()
 	dir := t.TempDir()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
@@ -78,7 +86,10 @@ func setup(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 
-	srv := proto.NewServer(db, st, au, log, nil, 0, 0)
+	srv := proto.NewServer(db, st, au, log, nil, rateLimit, rateBurst)
+	if configure != nil {
+		configure(srv)
+	}
 
 	// Use random port
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -746,13 +757,12 @@ func TestEncoder_CollectionTooLarge(t *testing.T) {
 	}
 }
 
-// DecodePutObjectRequest must accept a message encoded before skipETag
-// existed on the wire — the trailing field is optional, not required, so an
-// older client's request cannot start failing on a newer server.
+// DecodePutObjectRequest must accept a message without the trailing skipETag
+// byte: the field is optional, so a v1 client's request cannot fail on a newer
+// server.
 func TestDecodePutObjectRequest_PreSkipETagWireFormat(t *testing.T) {
-	// Hand-build a request the same way EncodePutObjectRequest did before the
-	// skipETag field was added: bucket, key, contentType, metadata, and
-	// nothing else.
+	// Hand-built without the trailing field: bucket, key, contentType,
+	// metadata, and nothing else.
 	e := proto.NewEncoder(nil)
 	e.String("bucket")
 	e.String("key")

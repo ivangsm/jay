@@ -3,6 +3,7 @@ package proto
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -10,10 +11,8 @@ import (
 	"time"
 )
 
-// Tests for the handshake's diagnosis, which used to be a single lie: every
-// failure — a cut socket, a wrong port, a full server — was answered as
-// "protocol version mismatch", so the one thing a client reported was the one
-// thing that was almost never true.
+// Tests for the handshake's diagnosis: a cut socket, a wrong port and a full
+// server each get their own status, never a blanket "version mismatch".
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -114,18 +113,24 @@ func TestReadHandshake_ClassifiesFailures(t *testing.T) {
 	})
 }
 
-// TestServer_RejectsWithServerBusy covers the status that did not exist: at
-// the connection limit the server used to close without writing anything, so
-// a client saw a bare EOF and could not tell a full server from a dead one.
-func TestServer_RejectsWithServerBusy(t *testing.T) {
-	// maxConns of zero rejects every connection in the accept loop, before
-	// anything touches the database — which is why this test needs no store.
-	s := &Server{
-		log:      discardLogger(),
-		quit:     make(chan struct{}),
-		maxConns: 0,
-		conns:    make(map[net.Conn]struct{}),
+// newFullServer is a server whose every connection is over the limit: a
+// maxConns of zero rejects in the accept loop, before anything touches the
+// database — which is why these tests need no store. SetMaxConns refuses zero,
+// so the literal is the only way to build one.
+func newFullServer() *Server {
+	return &Server{
+		log:       discardLogger(),
+		quit:      make(chan struct{}),
+		maxConns:  0,
+		conns:     make(map[net.Conn]struct{}),
+		busySlots: make(chan struct{}, maxBusyRejections),
 	}
+}
+
+// TestServer_RejectsWithServerBusy: at the connection limit the server writes
+// a status before closing, so a client can tell a full server from a dead one.
+func TestServer_RejectsWithServerBusy(t *testing.T) {
+	s := newFullServer()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -154,16 +159,11 @@ func TestServer_RejectsWithServerBusy(t *testing.T) {
 	}
 }
 
-// TestServer_BusyRejectionDoesNotBlockAccepts guards the decision to write the
-// rejection inline on the accept loop: a client that never reads its response
-// must not stall the acceptance of other connections.
+// TestServer_BusyRejectionDoesNotBlockAccepts: a client that never reads its
+// response, and never hangs up, must not stall the acceptance of other
+// connections.
 func TestServer_BusyRejectionDoesNotBlockAccepts(t *testing.T) {
-	s := &Server{
-		log:      discardLogger(),
-		quit:     make(chan struct{}),
-		maxConns: 0,
-		conns:    make(map[net.Conn]struct{}),
-	}
+	s := newFullServer()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -205,5 +205,124 @@ func TestServer_BusyRejectionDoesNotBlockAccepts(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the accept loop stalled behind unread busy rejections")
+	}
+}
+
+// TestServer_BusyRejectionClosesWithoutReset is the worst case for the busy
+// status: the client's handshake is already sitting unread in the server's
+// receive buffer when the server answers. Closing a socket with unread data
+// makes the kernel send a reset, and a TCP stack that discards received data
+// on a reset loses the status. The server must instead half-close, read the
+// handshake out and let the client hang up first — so the client reads the
+// status and then a clean EOF, never ECONNRESET.
+//
+// The client reads only after a pause, so the server has long finished with
+// the connection by then: a reset, if one was sent, has already arrived.
+func TestServer_BusyRejectionClosesWithoutReset(t *testing.T) {
+	s := newFullServer()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.listener = ln
+	go s.acceptLoop()
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// Below maxBusyRejections, so every connection gets a slot and the
+	// saturation fallback (a bare close, on purpose) never kicks in.
+	const clients = maxBusyRejections / 2
+	results := make(chan error, clients)
+	for range clients {
+		go func() {
+			results <- func() error {
+				c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = c.Close() }()
+				if err := WriteHandshake(c, "tok:sec"); err != nil {
+					return err
+				}
+				time.Sleep(100 * time.Millisecond)
+				if err := c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+					return err
+				}
+				status, err := ReadHandshakeResponse(c)
+				if err != nil {
+					return fmt.Errorf("read status: %w", err)
+				}
+				if status != HandshakeServerBusy {
+					return fmt.Errorf("status = 0x%02X, want HandshakeServerBusy", status)
+				}
+				var one [1]byte
+				if _, err := c.Read(one[:]); !errors.Is(err, io.EOF) {
+					return fmt.Errorf("after the status: got %v, want a clean EOF (a reset means the close raced the unread handshake)", err)
+				}
+				return nil
+			}()
+		}()
+	}
+	for range clients {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// TestServer_BusyRefusalsAreBounded pins the documented degradation: with
+// maxBusyRejections refusals already in flight — here, peers that neither
+// read nor hang up, so each holds its slot for busyRejectTimeout — the next
+// over-limit connection is closed without a status. And the bound is a bound
+// in time too: once those refusals time out, statuses come back.
+func TestServer_BusyRefusalsAreBounded(t *testing.T) {
+	s := newFullServer()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.listener = ln
+	go s.acceptLoop()
+	t.Cleanup(func() { _ = ln.Close() })
+	addr := ln.Addr().String()
+
+	for range maxBusyRejections {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+	}
+	// Let the accept loop hand every one of them a slot.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(s.busySlots) < maxBusyRejections && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(s.busySlots) != maxBusyRejections {
+		t.Fatalf("%d refusals in flight, want %d", len(s.busySlots), maxBusyRejections)
+	}
+
+	extra, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = extra.Close() }()
+	_ = extra.SetReadDeadline(time.Now().Add(busyRejectTimeout / 2))
+	if _, err := ReadHandshakeResponse(extra); !errors.Is(err, io.EOF) {
+		t.Fatalf("past the refusal bound: got %v, want a bare close (EOF) before the slots free up", err)
+	}
+
+	// After busyRejectTimeout the silent peers are cut loose and the slots
+	// come back.
+	time.Sleep(busyRejectTimeout + 200*time.Millisecond)
+	later, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = later.Close() }()
+	_ = later.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if status, err := ReadHandshakeResponse(later); err != nil || status != HandshakeServerBusy {
+		t.Fatalf("after the bound drained: status 0x%02X, err %v; want ServerBusy", status, err)
 	}
 }

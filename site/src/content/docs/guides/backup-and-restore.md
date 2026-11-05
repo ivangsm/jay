@@ -147,7 +147,8 @@ the restore's report card:
 
 A mismatch in either direction is recoverable, because nothing was deleted.
 Once the missing files are back in place, `POST /_jay/quarantine/revalidate`
-re-checks a quarantined record and restores it if it now verifies —
+(`jay-admin quarantine-revalidate -bucket-id ID -key KEY`) re-checks a
+quarantined record and restores it if it now verifies —
 `jay-admin quarantine-list` shows what is waiting. Files quarantined as orphans
 sit intact in `quarantine/`, named after their original location with the
 slashes flattened, so the object ID in the filename is what ties one back to a

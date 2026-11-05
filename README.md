@@ -100,10 +100,19 @@ valid for the other. [The guide](https://ivangsm.github.io/jay/guides/embedded/)
 | Port | Purpose | Exposure |
 |---|---|---|
 | `:9000` | S3-compatible API | The only one meant for untrusted networks |
-| `:9001` | Admin API and health probes | Internal — it creates accounts and tokens |
+| `:9001` | Admin API, health probes and, when enabled, the web console | Internal — it creates accounts and tokens |
 | `:4444` | Native binary protocol | Internal by default — the token secret travels in the clear unless `JAY_NATIVE_TLS_CERT`/`_KEY` are set |
 
 Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
+
+## Web console
+
+Jay ships a small browser UI for the admin port: accounts, tokens, buckets and
+policies, quarantine, and an object browser. It is **off by default**; turn it
+on with `JAY_CONSOLE_ENABLED=true` (`console.enabled` in YAML) and open
+`http://localhost:9001/console/`. You sign in with `JAY_ADMIN_TOKEN`, and
+objects are browsed as one of your tokens. Keep the admin port off untrusted
+networks. [The guide](https://ivangsm.github.io/jay/guides/console/).
 
 ## Documentation
 
@@ -121,21 +130,25 @@ Set `JAY_NATIVE_ADDR` to empty to disable the native listener entirely.
 | [Architecture](https://ivangsm.github.io/jay/internals/architecture/) | The write path, recovery, scrubbing, GC, snapshots |
 | [Limits](https://ivangsm.github.io/jay/internals/limits/) | No versioning, no object-byte backup, no replication, no events |
 
-## One compatibility caveat
+## Client compatibility
 
-minio-go clients (`mc`, `warp`) **cannot upload over plain HTTP**. They sign
-non-TLS uploads with SigV4's streaming mode, which frames the body in
-`aws-chunked`, and Jay refuses that framing with `501` rather than storing the
-frames as if they were your file. Over HTTPS the same clients work completely.
+aws-cli, the AWS SDKs and boto3 upload and download over both plain HTTP and HTTPS.
+Jay's own Go client and library use the native protocol.
 
-aws-cli, the AWS SDKs and boto3 work over both.
-[The full explanation](https://ivangsm.github.io/jay/reference/s3-compatibility/).
+**MinIO's clients (`mc`, `warp`, minio-go) are not supported.** Jay does not
+test against them.
+
+aws-cli frames HTTPS uploads with a trailing checksum in `aws-chunked` framing.
+Jay decodes it and verifies every chunk signature and every trailing checksum
+**before** it commits the object, so a tampered or truncated upload writes nothing.
+What still answers `501`: SigV4a streaming and framing under a bearer token or a presigned URL.
+[The full explanation](https://ivangsm.github.io/jay/reference/s3-compatibility/#aws-chunked-streaming-uploads).
 
 ## Development
 
 ```bash
 make check        # fmt + vet + lint + test + build — the commit gate
-make conformance  # S3 conformance against real aws-cli, mc and warp
+make conformance  # S3 conformance against the real aws-cli
 ```
 
 `make check` proves Jay agrees with itself. `make conformance` proves it agrees

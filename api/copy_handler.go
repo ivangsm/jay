@@ -69,11 +69,10 @@ func (h *Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBu
 		return
 	}
 
-	// The requested digest has to exist before the copy is committed. Answering
-	// 200 without it is the defect PND-0194 names; answering 500 after the
-	// metadata is in bbolt would report a failure for a copy that landed. The
-	// hook runs between the write and the commit, so a refusal here removes one
-	// temp file and nothing else.
+	// The requested digest has to exist before the copy is committed: a 200
+	// without it reports work not done, and a 500 after the metadata is in
+	// bbolt reports a failure for a copy that landed. The hook runs between
+	// the write and the commit, so a refusal here removes one temp file only.
 	var checksumValue string
 	beforeCommit := func(sha256Hex string) error {
 		v, err := copyChecksumValue(digester, checksumReq.Algorithm, sha256Hex)

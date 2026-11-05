@@ -332,9 +332,9 @@ func (db *DB) RebuildBucketStats(bucketID string) error {
 		if objBk != nil {
 			if err := objBk.ForEach(func(k, v []byte) error {
 				var obj Object
-				// decodeObject understands both the current binary (gob)
-				// envelope and legacy JSON records. Using json.Unmarshal here
-				// silently skipped every gob record and rebuilt stats as (0,0).
+				// decodeObject, never json.Unmarshal: it understands both the
+				// gob envelope and legacy JSON records, and a JSON-only decode
+				// would skip every gob record and rebuild stats as (0,0).
 				if err := decodeObject(v, &obj); err != nil {
 					return nil // skip corrupt entries
 				}
@@ -398,10 +398,9 @@ func (db *DB) RebuildAllBucketStatsIfMissing() error {
 
 // UpdateBucketPolicy updates the policy JSON for a bucket.
 //
-// A non-nil policy has to be syntactically valid JSON. An empty-but-non-nil
-// policy used to be persisted silently as "no policy" while the call returned
-// success; now it is rejected at the boundary, which is where the
-// error es atribuible a quien lo mandó.
+// A non-nil policy has to be syntactically valid JSON; an empty-but-non-nil
+// one is rejected here, before the transaction, so the error is attributable to
+// the caller instead of being persisted as "no policy".
 func (db *DB) UpdateBucketPolicy(name string, policy jsontext.Value) error {
 	if policy != nil && !policy.IsValid() {
 		return fmt.Errorf("meta: %w", ErrInvalidBucketPolicy)
