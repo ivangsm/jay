@@ -6,10 +6,19 @@ human writes, and the release workflow refuses to publish a tag that has no
 section here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versions are [SemVer](https://semver.org/) and jay is pre-1.0: a breaking
-change bumps the minor version and is called out as such below.
+Versions are [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.0.0] - 2026-11-05
+
+### Highlights
+
+- **First major production release (v1.0.0).** Jay achieves full API and storage
+  stability for single-node object storage with S3 and native binary protocols.
+- **Strict S3 compliance.** Conformance verified with 50/50 tests driving the
+  official AWS CLI over HTTP and TLS, including `aws-chunked` SigV4 streaming
+  uploads and checksum trailers.
+- **Removed legacy MinIO clients.** Standardized exclusively on AWS S3 clients
+  (AWS CLI, AWS SDKs, boto3) and Jay's native Go protocol.
 
 ### Removed
 
@@ -403,7 +412,8 @@ the handshake, which carries the token secret, stops travelling in the clear.
 - If you set `JAY_BACKUP_DIR`, rename it to `JAY_METADATA_BACKUP_DIR` at your
   convenience; the old name keeps working.
 
-[Unreleased]: https://github.com/ivangsm/jay/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/ivangsm/jay/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ivangsm/jay/compare/v0.19.0...v1.0.0
 [0.19.0]: https://github.com/ivangsm/jay/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/ivangsm/jay/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/ivangsm/jay/compare/v0.17.0...v0.17.1
