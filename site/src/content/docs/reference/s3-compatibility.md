@@ -70,9 +70,9 @@ byte is committed:
 
 | `x-amz-content-sha256` | What Jay verifies | Who sends it |
 |---|---|---|
-| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | Every chunk signature, chained from the request signature, the final empty chunk included | minio-go (`mc`, `warp`) over plain HTTP |
-| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` | The same, plus the trailer's own signature and the checksum it carries | `warp --checksum` over plain HTTP |
-| `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | The request signature, and the trailing checksum against the bytes | The AWS CLI and SDKs over HTTPS; `mc --checksum` |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | Every chunk signature, chained from the request signature, the final empty chunk included | SigV4 streaming clients over plain HTTP |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` | The same, plus the trailer's own signature and the checksum it carries | SigV4 streaming clients with trailing checksum |
+| `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | The request signature, and the trailing checksum against the bytes | The AWS CLI and SDKs over HTTPS |
 
 What holds in every mode:
 
@@ -135,10 +135,8 @@ verified.
 | Client | Status |
 |---|---|
 | **AWS CLI**, AWS SDKs, boto3 over HTTP | Fully working. They send a real payload hash, no framing |
-| **AWS CLI** over HTTPS | Fully working. Uploads travel as `STREAMING-UNSIGNED-PAYLOAD-TRAILER` with a CRC64NVME trailer, which is decoded and verified. (Until the decoder existed, these uploads answered `501`.) |
-| **minio-go over plain HTTP** — `mc`, `warp` | Fully working, uploads included, single-part and multipart. Signed streaming, every chunk verified |
-| **minio-go over HTTPS** — same clients | Fully working. Unframed bodies; with `--checksum`, the unsigned-trailer framing |
-| **`mc cp --checksum` of a file above the part size** | Parts are accepted and verified, but `CompleteMultipartUpload` carries a whole-object checksum and answers `501` — see [Checksums](#checksums). `mc` aborts the upload and nothing is left |
+| **AWS CLI** over HTTPS | Fully working. Uploads travel as `STREAMING-UNSIGNED-PAYLOAD-TRAILER` with a CRC64NVME trailer, which is decoded and verified. |
+| **MinIO clients** — `mc`, `warp`, minio-go | **Not supported.** Jay does not test them and makes no promise about them |
 | **Presigned URLs**, both styles | Working. A presigned `PUT` that adds framing answers `501` |
 | **Jay's CLI and native protocol** | Unaffected. The native protocol has no SigV4 and no framing |
 
@@ -239,10 +237,7 @@ not write.
 | **aws-cli** (botocore) | `mb`/`rb --force`, `cp` up and down, `sync`, `rm --recursive`, `ListObjectsV2` with prefix and delimiter, multipart upload and ranged download of a 12 MiB object, `presign` including an expired URL, `GetBucketLocation`, `ListMultipartUploads`, `DeleteObjects` whole and partial, a `501` sub-resource, and that `--checksum-algorithm` answers with the algorithm it asked for — all five, on `put-object` and on `copy-object`, the copy compared against the digest the upload returned for the same bytes |
 | **curl** | That a deliberately wrong digest is refused and writes nothing. No correct client would ever send one, so it has to be forged by hand |
 | **aws-cli, second account** | That a token of account B can neither list, read, write, delete nor batch-delete inside a bucket of account A — each asserted against A's own view of the bucket, not against B's error message |
-| **mc** (minio-go) over HTTP | Listing, `stat`, `get`, bucket create/delete, `rm`, a presigned URL minted by minio-go, and `aws-chunked` uploads — small, 20 MiB multipart and with a CRC32C trailer — each read back and compared byte for byte |
-| **mc** over HTTPS | Unframed uploads, small and 12 MiB, byte for byte; an unsigned-trailer upload; and that a multipart upload with `--checksum` is refused at `CompleteMultipartUpload` leaving no object |
 | **aws-cli** over HTTPS | Small and 12 MiB multipart uploads in the unsigned-trailer framing, byte for byte |
-| **warp** (minio-go) | `warp put` and `warp get` over HTTP with zero errors (the second checks the size of every download), signed-trailer uploads with `--checksum`, and `warp mixed` over TLS with zero errors |
 
 Three things about how it reports:
 
@@ -257,7 +252,3 @@ Three things about how it reports:
   client's own debug trace has to show the `STREAMING-*` literal it sent, or the
   check fails: a round trip that never reached the decoder must not be counted
   as one that did.
-- **The known limitations are asserted, not tolerated.** The `mc --checksum`
-  multipart refusal is a check that passes *because* the answer is `501` and no
-  object is left. The day whole-object checksums land, it goes red on purpose,
-  so nobody can ship that without updating this page.

@@ -11,6 +11,12 @@ change bumps the minor version and is called out as such below.
 
 ## [Unreleased]
 
+### Removed
+
+- MinIO's clients (`mc`, `warp`, minio-go) are no longer supported or tested. The
+  conformance test suite and CI no longer drive or install them. Supported S3
+  clients are the AWS CLI, the AWS SDKs, and boto3.
+
 ## [0.19.0] - 2026-10-08
 
 ### Highlights

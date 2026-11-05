@@ -132,24 +132,23 @@ networks. [The guide](https://ivangsm.github.io/jay/guides/console/).
 
 ## Client compatibility
 
-aws-cli, the AWS SDKs, boto3 and minio-go clients (`mc`, `warp`) upload and
-download over both plain HTTP and HTTPS.
+aws-cli, the AWS SDKs and boto3 upload and download over both plain HTTP and HTTPS.
+Jay's own Go client and library use the native protocol.
 
-Some of them never send the body as-is: minio-go signs every plain-HTTP upload
-with SigV4's streaming mode, and aws-cli frames its HTTPS uploads with a
-trailing checksum — both in `aws-chunked` framing. Jay decodes it and verifies
-every chunk signature and every trailing checksum **before** it commits the
-object, so a tampered or truncated upload writes nothing. What still answers
-`501`: SigV4a streaming, framing under a bearer token or a presigned URL, and
-`mc cp --checksum` of a file big enough to go multipart (Jay does not verify
-whole-object checksums on `CompleteMultipartUpload`).
+**MinIO's clients (`mc`, `warp`, minio-go) are not supported.** Jay does not
+test against them.
+
+aws-cli frames HTTPS uploads with a trailing checksum in `aws-chunked` framing.
+Jay decodes it and verifies every chunk signature and every trailing checksum
+**before** it commits the object, so a tampered or truncated upload writes nothing.
+What still answers `501`: SigV4a streaming and framing under a bearer token or a presigned URL.
 [The full explanation](https://ivangsm.github.io/jay/reference/s3-compatibility/#aws-chunked-streaming-uploads).
 
 ## Development
 
 ```bash
 make check        # fmt + vet + lint + test + build — the commit gate
-make conformance  # S3 conformance against real aws-cli, mc and warp
+make conformance  # S3 conformance against the real aws-cli
 ```
 
 `make check` proves Jay agrees with itself. `make conformance` proves it agrees

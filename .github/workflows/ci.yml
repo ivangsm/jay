@@ -96,27 +96,6 @@ jobs:
       - name: Verify aws-cli
         run: aws --version
 
-      # Built from source like warp: dl.min.io stopped serving the prebuilt
-      # binary (410 Gone) on 2026-09-12 and took this job down with it. mc has
-      # no semver tags, so @latest resolves to the head of its default branch —
-      # which is the point: track what a current minio-go client does. It lands
-      # in $(go env GOPATH)/bin, which conformance.sh looks in.
-      - name: Install mc (minio-go)
-        run: |
-          set -euo pipefail
-          go install github.com/minio/mc@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      # GITHUB_PATH only affects later steps, so the version check is its own.
-      - name: Verify mc
-        run: mc --version
-
-      # warp lands in $(go env GOPATH)/bin, which conformance.sh looks in.
-      # Unpinned on purpose: the point is to track what a current minio-go
-      # client does, not to freeze one.
-      - name: Install warp
-        run: go install github.com/minio/warp@latest
-
       - name: Run the conformance suite
         run: scripts/conformance.sh --require-all
 

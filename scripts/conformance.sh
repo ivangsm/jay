@@ -3,8 +3,7 @@
 # conformance.sh — exercise jay's S3 surface with S3 clients jay did not write.
 #
 # The Go tests prove only that jay agrees with itself. This script boots a
-# throwaway jay and drives it with real clients: aws-cli (botocore), mc and
-# warp (both minio-go).
+# throwaway jay and drives it with real clients: aws-cli (botocore).
 #
 # What it does NOT do: fix anything, or paper over a failure. Every check either
 # asserts an effect (bytes on the wire, an object present or absent, a status
@@ -24,11 +23,6 @@
 # Requirements: go, curl, openssl. The S3 clients are optional unless
 # --require-all is given:
 #   aws  — https://docs.aws.amazon.com/cli/  (botocore; the reference client)
-#   mc   — https://min.io/docs/minio/linux/reference/minio-mc.html (minio-go)
-#   warp — https://github.com/minio/warp     (minio-go, benchmark harness)
-#
-# mc and warp are looked up on PATH and in $(go env GOPATH)/bin, because
-# `go install` puts them in the latter and CI runners rarely have that on PATH.
 
 set -uo pipefail
 # Deliberately NOT `set -e`: half of the checks below run a command that is
@@ -219,19 +213,7 @@ pick_port() {
 	die "no free TCP port found in 20000-40000"
 }
 
-TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
-# run_limited SECONDS CMD... — a hung client must not hang the whole run. When
-# neither timeout nor gtimeout exists (stock macOS), the command runs unbounded
-# rather than not running at all.
-run_limited() {
-	local secs="$1"
-	shift
-	if [ -n "$TIMEOUT_BIN" ]; then
-		"$TIMEOUT_BIN" "$secs" "$@"
-	else
-		"$@"
-	fi
-}
+
 
 # ---------------------------------------------------------------------------
 # Preflight: the tools this script cannot run without
@@ -246,34 +228,13 @@ for tool in go curl openssl; do
 done
 
 AWS_BIN="$(command -v aws || true)"
-MC_BIN="$(command -v mc || true)"
-WARP_BIN="$(command -v warp || true)"
-
-# go_installed_bin echoes the path of a tool `go install` left in GOPATH/bin,
-# or nothing.
-go_installed_bin() {
-	for candidate in "$(go env GOPATH 2>/dev/null)/bin/$1" "$HOME/go/bin/$1"; do
-		if [ -x "$candidate" ]; then
-			echo "$candidate"
-			return
-		fi
-	done
-}
-[ -n "$MC_BIN" ] || MC_BIN="$(go_installed_bin mc)"
-[ -n "$WARP_BIN" ] || WARP_BIN="$(go_installed_bin warp)"
 
 info "aws:  ${AWS_BIN:-(not found)}"
-info "mc:   ${MC_BIN:-(not found)}"
-info "warp: ${WARP_BIN:-(not found)}"
 
 if [ "$REQUIRE_ALL" -eq 1 ]; then
-	missing=""
-	[ -z "$AWS_BIN" ] && missing="$missing aws"
-	[ -z "$MC_BIN" ] && missing="$missing mc"
-	[ -z "$WARP_BIN" ] && missing="$missing warp"
-	if [ -n "$missing" ]; then
-		printf '%sfatal:%s --require-all given but these clients are missing:%s\n' \
-			"$C_FAIL" "$C_RESET" "$missing" >&2
+	if [ -z "$AWS_BIN" ]; then
+		printf '%sfatal:%s --require-all given but aws-cli is missing\n' \
+			"$C_FAIL" "$C_RESET" >&2
 		exit 3
 	fi
 fi
@@ -438,11 +399,6 @@ printf 'two\n' >"$FIX/syncdir/nested/b.txt"
 # header is verified on the way down.
 dd if=/dev/urandom of="$FIX/big.bin" bs=1048576 count=12 >/dev/null 2>&1 ||
 	die "could not create the 12 MiB fixture"
-# 20 MiB: above mc's 16 MiB default part size, so mc splits it into framed
-# UploadPart requests — minio-go frames parts exactly like whole objects.
-dd if=/dev/urandom of="$FIX/huge.bin" bs=1048576 count=20 >/dev/null 2>&1 ||
-	die "could not create the 20 MiB fixture"
-
 SMALL_B64="$(b64sha256 "$FIX/small.txt")"
 BIG_SHA="$(hexsha256 "$FIX/big.bin")"
 
@@ -484,30 +440,7 @@ object_exists() {
 	aws_a s3api head-object --bucket "$1" --key "$2" >/dev/null 2>&1
 }
 
-# bucket_state BUCKET — prints "empty", "populated" or "unreadable(<code>)",
-# asking jay over plain HTTP with the bearer form.
-#
-# Deliberately not built on aws-cli: the warp group has to run when aws-cli is
-# absent, and a listing command that fails to launch also produces no output.
-# "the bucket is empty" and "I could not look" have to be different answers, or
-# the check passes without having checked — which is the whole point of this
-# script.
-bucket_state() {
-	local body code
-	body="$(curl -sS -H "Authorization: Bearer $A_ID:$A_SECRET" \
-		-w '\n%{http_code}' "$S3/$1?list-type=2" 2>/dev/null)"
-	code="${body##*$'\n'}"
-	if [ "$code" != "200" ]; then
-		# Never "empty": a 403, a 404 or a dead connection all mean the state
-		# is unknown, and unknown must not read as "nothing was written".
-		printf 'unreadable(%s)' "$code"
-		return
-	fi
-	case "$body" in
-	*"<Contents>"*) printf 'populated' ;;
-	*) printf 'empty' ;;
-	esac
-}
+
 
 # ---------------------------------------------------------------------------
 # GROUP: aws-cli
@@ -962,234 +895,9 @@ else
 	fi
 fi
 
-# ---------------------------------------------------------------------------
-# GROUP: mc over plain HTTP (minio-go)
-# ---------------------------------------------------------------------------
 
-say ""
-say "${C_BOLD}mc / minio-go over HTTP${C_RESET}"
-GROUP="mc-http"
 
-export MC_CONFIG_DIR="$WORK/mc"
-mkdir -p "$MC_CONFIG_DIR"
-mc_() { "$MC_BIN" --no-color "$@"; }
 
-# mc_roundtrip_expect_refusal NAME FILE TARGET LOG MESSAGE [-- MC CP FLAGS...]
-#
-# For a known limitation: the upload must FAIL, mc must report MESSAGE (the
-# server's own words, so the check cannot pass on an unrelated failure), and
-# the target must not exist afterwards.
-mc_roundtrip_expect_refusal() {
-	local name="$1" file="$2" target="$3" log="$4" message="$5"
-	shift 5
-	[ $# -gt 0 ] && [ "$1" = "--" ] && shift
-	local runner="${MC_RT:-mc_}"
-
-	"$runner" --debug cp "$@" "$file" "$target" >"$LOGS/$log.log" 2>&1
-	local rc=$?
-	if [ "$rc" -eq 0 ]; then
-		fail "$name" "the upload succeeded; if the limitation was lifted, update this check and the README"
-		return
-	fi
-	if ! grep -qF "$message" "$LOGS/$log.log"; then
-		fail "$name" "mc failed for another reason: $(grep -iv '^mc: <debug>' "$LOGS/$log.log" | tail -2 | tr '\n' ' ' | cut -c1-200)"
-		return
-	fi
-	if "$runner" stat "$target" >/dev/null 2>&1; then
-		fail "$name" "the refused upload left an object behind"
-		return
-	fi
-	pass "$name"
-}
-
-# mc_roundtrip NAME FILE TARGET LOG WIRE [WIRE2] [-- MC CP FLAGS...]
-#
-# Uploads FILE to TARGET with `mc --debug cp`, reads it back with `mc cat`, and
-# passes only if (1) the debug trace shows the x-amz-content-sha256 literal
-# WIRE — and WIRE2, when given, e.g. partNumber= for multipart — so the check
-# cannot pass on a path that never framed the body; (2) the upload exited 0;
-# and (3) the bytes read back are identical to FILE. The mc binary and its
-# flags (--insecure for TLS) come from $MC_RT, defaulting to plain mc_.
-mc_roundtrip() {
-	local name="$1" file="$2" target="$3" log="$4" wire="$5"
-	shift 5
-	local wire2=""
-	if [ $# -gt 0 ] && [ "$1" != "--" ]; then
-		wire2="$1"
-		shift
-	fi
-	[ $# -gt 0 ] && [ "$1" = "--" ] && shift
-	local runner="${MC_RT:-mc_}"
-
-	"$runner" --debug cp "$@" "$file" "$target" >"$LOGS/$log.log" 2>&1
-	local rc=$?
-	if [ "$rc" -ne 0 ]; then
-		fail "$name" "mc cp exited $rc: $(grep -iv '^mc: <debug>' "$LOGS/$log.log" | tail -2 | tr '\n' ' ' | cut -c1-200)"
-		return
-	fi
-	# Anchored on what follows the literal, because the plain mode is a
-	# prefix of its -TRAILER sibling.
-	if ! grep -Eqi "X-Amz-Content-Sha256: ${wire}([^-a-z0-9]|\$)" "$LOGS/$log.log"; then
-		fail "$name" "mc did not send $wire, so the check proves nothing about it (see $log.log)"
-		return
-	fi
-	if [ -n "$wire2" ] && ! grep -q "$wire2" "$LOGS/$log.log"; then
-		fail "$name" "the trace has no $wire2 (see $log.log)"
-		return
-	fi
-	"$runner" cat "$target" >"$WORK/$log.dl" 2>>"$LOGS/$log.log"
-	if cmp -s "$file" "$WORK/$log.dl"; then
-		pass "$name"
-	else
-		fail "$name" "read back $(file_size "$WORK/$log.dl") bytes, uploaded $(file_size "$file"): the stored object is not the file"
-	fi
-}
-
-if [ -z "$MC_BIN" ]; then
-	skip "whole group" "mc is not installed"
-elif [ -z "$AWS_BIN" ]; then
-	skip "whole group" "the fixtures this group reads are uploaded by the aws-cli group"
-else
-	if mc_ alias set jayhttp "$S3" "$A_ID" "$A_SECRET" --api S3v4 >"$LOGS/mc-alias.log" 2>&1; then
-		pass "mc alias set"
-	else
-		fail "mc alias set" "$(tail -2 "$LOGS/mc-alias.log")"
-	fi
-
-	buckets="$(mc_ ls jayhttp 2>"$LOGS/mc-lsb.log" | awk '{print $NF}' | tr -d '/' | sort | tr '\n' ' ')"
-	case "$buckets" in
-	*"$BUCKET_A"*) pass "ListBuckets" ;;
-	*) fail "ListBuckets" "got [$buckets]" ;;
-	esac
-
-	keys="$(mc_ ls jayhttp/"$BUCKET_A" 2>"$LOGS/mc-ls.log" | awk '{print $NF}' | sort | tr '\n' ' ')"
-	case "$keys" in
-	*small.txt*) pass "ListObjects" ;;
-	*) fail "ListObjects" "got [$keys]" ;;
-	esac
-
-	mc_ stat jayhttp/"$BUCKET_A"/small.txt >"$LOGS/mc-stat.log" 2>&1
-	mc_sum="$(sed -n 's/^Checksum *: *SHA256://p' "$LOGS/mc-stat.log" | tr -d ' ')"
-	assert_eq "stat reports the SHA-256 checksum minio-go can parse" "$SMALL_B64" "$mc_sum"
-
-	if mc_ get jayhttp/"$BUCKET_A"/small.txt "$WORK/mc.dl" >"$LOGS/mc-get.log" 2>&1 &&
-		cmp -s "$FIX/small.txt" "$WORK/mc.dl"; then
-		pass "GetObject round-trips"
-	else
-		fail "GetObject round-trips" "$(tail -2 "$LOGS/mc-get.log")"
-	fi
-
-	if mc_ mb jayhttp/conformance-mc >"$LOGS/mc-mb.log" 2>&1 &&
-		mc_ rb --force jayhttp/conformance-mc >>"$LOGS/mc-mb.log" 2>&1; then
-		pass "CreateBucket and DeleteBucket"
-	else
-		fail "CreateBucket and DeleteBucket" "$(tail -2 "$LOGS/mc-mb.log")"
-	fi
-
-	if mc_ rm jayhttp/"$BUCKET_A"/denied/b.txt >"$LOGS/mc-rm.log" 2>&1 &&
-		! object_exists "$BUCKET_A" denied/b.txt; then
-		pass "DeleteObject"
-	else
-		fail "DeleteObject" "$(tail -2 "$LOGS/mc-rm.log")"
-	fi
-
-	# minio-go mints a SigV4 query-string URL of its own — a second, independent
-	# implementation of the presigned form.
-	share="$(mc_ share download --expire 5m jayhttp/"$BUCKET_A"/small.txt 2>"$LOGS/mc-share.log" | sed -n 's/^Share: //p')"
-	if [ -z "$share" ]; then
-		fail "SigV4 presigned GET minted by minio-go (PND-0161)" "$(tail -2 "$LOGS/mc-share.log")"
-	else
-		scode="$(curl -sS -o "$WORK/mc-presign.dl" -w '%{http_code}' "$share" 2>/dev/null)"
-		if [ "$scode" = "200" ] && cmp -s "$FIX/small.txt" "$WORK/mc-presign.dl"; then
-			pass "SigV4 presigned GET minted by minio-go (PND-0161)"
-		else
-			fail "SigV4 presigned GET minted by minio-go (PND-0161)" "http=$scode"
-		fi
-	fi
-
-	# Uploads over plain HTTP: every one of them travels as aws-chunked, which
-	# jay decodes and verifies chunk by chunk (PND-0188). Until then this was a
-	# 501, and before THAT the framing itself was stored as the object (a
-	# 15-byte file became 187 bytes). So each check asserts three things: that
-	# mc's own debug trace shows the streaming literal it sent — otherwise the
-	# decoder was not exercised at all — that the upload succeeded, and that
-	# the bytes read back are the bytes of the file, compared with cmp.
-	mc_roundtrip "PutObject over HTTP round-trips byte for byte (aws-chunked, PND-0188)" \
-		"$FIX/small.txt" "jayhttp/$BUCKET_A/via-mc.txt" mc-cp STREAMING-AWS4-HMAC-SHA256-PAYLOAD
-
-	# 20 MiB is above mc's 16 MiB part size: two framed UploadPart requests
-	# and a CompleteMultipartUpload.
-	mc_roundtrip "multipart upload of 20 MiB over HTTP round-trips byte for byte (framed parts, PND-0188)" \
-		"$FIX/huge.bin" "jayhttp/$BUCKET_A/via-mc-huge.bin" mc-cp-huge STREAMING-AWS4-HMAC-SHA256-PAYLOAD partNumber=
-
-	# --checksum moves the digest into a trailer after the last chunk. mc then
-	# stops signing the chunks (it disables the payload SHA-256), so this is the
-	# UNSIGNED-PAYLOAD-TRAILER framing even over HTTP: jay verifies the CRC32C
-	# against the bytes before committing. The SIGNED trailer variant is what
-	# warp sends; see the warp group.
-	mc_roundtrip "PutObject with a CRC32C trailer round-trips (PND-0188)" \
-		"$FIX/small.txt" "jayhttp/$BUCKET_A/via-mc-crc.txt" mc-cp-crc STREAMING-UNSIGNED-PAYLOAD-TRAILER \
-		-- --checksum CRC32C
-fi
-
-# ---------------------------------------------------------------------------
-# GROUP: mc over TLS (minio-go)
-#
-# Same client, different wire: minio-go only reaches for the SIGNED streaming
-# mode when the connection is not secure, so over HTTPS it sends an unframed
-# body — and, when asked for a checksum, the STREAMING-UNSIGNED-PAYLOAD-TRAILER
-# framing, whose trailer jay verifies before committing.
-# ---------------------------------------------------------------------------
-
-say ""
-say "${C_BOLD}mc / minio-go over TLS${C_RESET}"
-GROUP="mc-tls"
-
-if [ -z "$MC_BIN" ]; then
-	skip "whole group" "mc is not installed"
-else
-	mc_tls() { "$MC_BIN" --no-color --insecure "$@"; }
-
-	if mc_tls alias set jaytls "$TLS_S3" "$TLS_ID" "$TLS_SECRET" --api S3v4 >"$LOGS/mctls-alias.log" 2>&1 &&
-		mc_tls mb jaytls/conformance-tls >"$LOGS/mctls-mb.log" 2>&1; then
-		pass "alias and CreateBucket over HTTPS"
-	else
-		fail "alias and CreateBucket over HTTPS" "$(tail -2 "$LOGS/mctls-mb.log")"
-	fi
-
-	if mc_tls cp "$FIX/small.txt" jaytls/conformance-tls/small.txt >"$LOGS/mctls-cp.log" 2>&1 &&
-		mc_tls get jaytls/conformance-tls/small.txt "$WORK/mctls.dl" >>"$LOGS/mctls-cp.log" 2>&1 &&
-		cmp -s "$FIX/small.txt" "$WORK/mctls.dl"; then
-		pass "PutObject over HTTPS round-trips (minio-go sends no aws-chunked framing here)"
-	else
-		fail "PutObject over HTTPS round-trips" "$(tail -3 "$LOGS/mctls-cp.log")"
-	fi
-
-	if mc_tls cp "$FIX/big.bin" jaytls/conformance-tls/big.bin >"$LOGS/mctls-big.log" 2>&1 &&
-		mc_tls get jaytls/conformance-tls/big.bin "$WORK/mctls-big.dl" >>"$LOGS/mctls-big.log" 2>&1; then
-		assert_eq "12 MiB upload over HTTPS round-trips byte for byte" "$BIG_SHA" "$(hexsha256 "$WORK/mctls-big.dl")"
-	else
-		fail "12 MiB upload over HTTPS round-trips byte for byte" "$(tail -3 "$LOGS/mctls-big.log")"
-	fi
-
-	# The unsigned-trailer framing: unsigned chunks, a CRC32C trailer. Before
-	# PND-0188 this was a 501 even over TLS.
-	MC_RT=mc_tls mc_roundtrip "PutObject with an unsigned CRC32C trailer over HTTPS round-trips (PND-0188)" \
-		"$FIX/small.txt" "jaytls/conformance-tls/via-mc-crc.txt" mctls-cp-crc STREAMING-UNSIGNED-PAYLOAD-TRAILER \
-		-- --checksum CRC32C
-
-	# KNOWN LIMIT — asserted, not tolerated. With --checksum, mc sends every
-	# part with a trailing CRC32C (decoded and verified, the parts answer 200)
-	# and then a whole-object x-amz-checksum-crc32c on
-	# CompleteMultipartUpload. jay does not compose part checksums into a
-	# whole-object one, so that last step answers 501 and mc aborts the
-	# upload. What must hold: mc fails, says why, and no object is left.
-	MC_RT=mc_tls mc_roundtrip_expect_refusal \
-		"known limit: mc multipart with --checksum is refused at CompleteMultipartUpload and leaves no object" \
-		"$FIX/huge.bin" "jaytls/conformance-tls/via-mc-crc-huge.bin" mctls-cp-crc-huge \
-		"Whole-object checksum verification on CompleteMultipartUpload is not implemented" \
-		-- --checksum CRC32C
-fi
 
 # ---------------------------------------------------------------------------
 # GROUP: aws-cli over TLS (botocore)
@@ -1217,11 +925,11 @@ else
 	# download, compare bytes.
 	aws_tls_roundtrip() {
 		local name="$1" file="$2" key="$3" log="$4" wire2="${5:-}"
-		if ! aws_tls --debug s3 cp "$file" "s3://conformance-aws-tls/$key" >"$LOGS/$log.log" 2>&1; then
+		if ! aws_tls --debug s3 cp --checksum-algorithm CRC64NVME "$file" "s3://conformance-aws-tls/$key" >"$LOGS/$log.log" 2>&1; then
 			fail "$name" "aws s3 cp failed: $(grep -v ' - DEBUG - ' "$LOGS/$log.log" | tail -2 | tr '\n' ' ' | cut -c1-200)"
 			return
 		fi
-		if ! grep -Eqi "'x-amz-content-sha256': b'STREAMING-UNSIGNED-PAYLOAD-TRAILER'" "$LOGS/$log.log"; then
+		if ! grep -Eqi "(x-amz-content-sha256: *|'x-amz-content-sha256': b')STREAMING-UNSIGNED-PAYLOAD-TRAILER" "$LOGS/$log.log"; then
 			fail "$name" "aws-cli did not send STREAMING-UNSIGNED-PAYLOAD-TRAILER, so the check proves nothing about it (see $log.log)"
 			return
 		fi
@@ -1248,102 +956,7 @@ else
 		"$FIX/big.bin" big.bin awstls-cp-big partNumber=
 fi
 
-# ---------------------------------------------------------------------------
-# GROUP: warp (minio-go under load)
-#
-# warp exits 0 even when every single operation failed — its exit code reports
-# "the benchmark ran", not "the benchmark worked". So both checks below read the
-# report and the bucket, never the exit status.
-# ---------------------------------------------------------------------------
 
-say ""
-say "${C_BOLD}warp${C_RESET}"
-GROUP="warp"
-
-# warp_check NAME LOG [BUCKET] — passes only if the report exists, mentions no
-# error, and (when BUCKET is given) the bucket really holds objects: a
-# benchmark whose every PUT failed still prints a report.
-warp_check() {
-	local name="$1" log="$2" bucket="${3:-}"
-	local total state
-	total="$(sed -n 's/^ \* Average: \(.*\)$/\1/p' "$log" | tail -1)"
-	if grep -qi "error" "$log"; then
-		fail "$name" "$(grep -i error "$log" | head -2 | tr '\n' ' ' | cut -c1-220)"
-		return
-	fi
-	if [ -z "$total" ]; then
-		fail "$name" "warp printed no report: $(tail -3 "$log" | tr '\n' ' ')"
-		return
-	fi
-	if [ -n "$bucket" ]; then
-		state="$(bucket_state "$bucket")"
-		if [ "$state" != "populated" ]; then
-			fail "$name" "bucket $bucket is [$state] after the run"
-			return
-		fi
-	fi
-	pass "$name — $total"
-}
-
-if [ -z "$WARP_BIN" ]; then
-	skip "whole group" "warp is not installed (go install github.com/minio/warp@latest)"
-else
-	# Over plain HTTP every warp PUT is aws-chunked. Before PND-0188 it was a
-	# 501, and before PND-0186 it stored the framing: `warp get` then failed
-	# every download with "unexpected download size. want:65536, got:65712".
-	# So both halves run: put fills a bucket, get uploads its own objects and
-	# checks the size of every download. The assertion is zero errors in the
-	# report and a bucket that really holds objects afterwards.
-	run_limited 120 "$WARP_BIN" put --host="127.0.0.1:$S3_PORT" \
-		--access-key="$A_ID" --secret-key="$A_SECRET" --bucket=warp-http \
-		--duration=5s --obj.size=256KiB --concurrent=4 --noclear --no-color \
-		--benchdata="$WORK/warp-http-put" >"$LOGS/warp-http-put.log" 2>&1
-	warp_check "warp put over HTTP runs clean and stores objects (aws-chunked, PND-0188)" \
-		"$LOGS/warp-http-put.log" warp-http
-
-	run_limited 180 "$WARP_BIN" get --host="127.0.0.1:$S3_PORT" \
-		--access-key="$A_ID" --secret-key="$A_SECRET" --bucket=warp-http-get \
-		--duration=5s --obj.size=64KiB --objects=50 --concurrent=4 --noclear --no-color \
-		--benchdata="$WORK/warp-http-get" >"$LOGS/warp-http-get.log" 2>&1
-	warp_check "warp get over HTTP downloads exactly what it uploaded (PND-0186/PND-0188)" \
-		"$LOGS/warp-http-get.log" warp-http-get
-
-	# --checksum over plain HTTP is the one client path that sends the SIGNED
-	# trailer variant: signed chunks, then a CRC32C trailer with its own
-	# signature. A 200 here means jay verified the chain, the trailer signature
-	# and the CRC32C of the bytes it was about to commit. The --debug trace is
-	# what proves the variant; warp's report cannot be read from it (the trace
-	# echoes the server's expected probe errors), so every traced PUT in that
-	# variant must have been answered 200.
-	run_limited 120 "$WARP_BIN" put --debug --host="127.0.0.1:$S3_PORT" \
-		--access-key="$A_ID" --secret-key="$A_SECRET" --bucket=warp-http-crc \
-		--duration=3s --obj.size=100KiB --concurrent=2 --noclear --no-color --checksum CRC32C \
-		--benchdata="$WORK/warp-http-crc" >"$LOGS/warp-http-crc.log" 2>&1
-	crc_counts="$(tr -d '\r' <"$LOGS/warp-http-crc.log" | awk '
-		/---------START-HTTP---------/ { hit = 0; status = ""; next }
-		/^X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER$/ { hit = 1 }
-		/^HTTP\/1\.1 / { status = $2 }
-		/---------END-HTTP---------/ { if (hit) { n++; if (status != "200") bad++ } }
-		END { printf "%d %d", n, bad }')"
-	crc_sent="${crc_counts% *}"
-	crc_bad="${crc_counts#* }"
-	crc_state="$(bucket_state warp-http-crc)"
-	if [ "$crc_sent" -gt 0 ] && [ "$crc_bad" -eq 0 ] && [ "$crc_state" = "populated" ]; then
-		pass "warp put --checksum over HTTP: $crc_sent signed-trailer uploads, all verified and stored (PND-0188)"
-	else
-		fail "warp put --checksum over HTTP: signed-trailer uploads verified and stored (PND-0188)" \
-			"signed-trailer PUTs traced=$crc_sent, not 200=$crc_bad, bucket=[$crc_state]"
-	fi
-
-	# And the mixed smoke test over TLS: PUT/GET/DELETE/STAT concurrently for
-	# ten seconds. The number it prints is informational; the assertion is that
-	# it ran with zero errors.
-	run_limited 180 "$WARP_BIN" mixed --host="127.0.0.1:$TLS_S3_PORT" --tls --insecure \
-		--access-key="$TLS_ID" --secret-key="$TLS_SECRET" --bucket=warp-tls \
-		--duration=10s --obj.size=256KiB --concurrent=4 --no-color \
-		--benchdata="$WORK/warp-tls" >"$LOGS/warp-tls.log" 2>&1
-	warp_check "warp mixed over TLS runs clean" "$LOGS/warp-tls.log"
-fi
 
 # ---------------------------------------------------------------------------
 # Summary

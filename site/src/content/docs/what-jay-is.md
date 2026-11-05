@@ -56,15 +56,11 @@ versioning, or any of the S3 features listed above. Those are not on the
 roadmap; Jay would rather be honest about the surface it has than grow a
 half-working version of a big one.
 
-## The one compatibility caveat to know upfront
+## Which clients are supported
 
-**`mc cp --checksum` of a file large enough to go multipart fails.** The parts
-are accepted and verified, but `CompleteMultipartUpload` carries a whole-object
-checksum that Jay does not compose from the parts, and it answers `501` rather
-than accept a digest it never checked. mc aborts and no object is left behind.
-The full explanation is in [S3 compatibility](/jay/reference/s3-compatibility/).
+aws-cli, the AWS SDKs and boto3, over plain HTTP and over HTTPS, plus Jay's own
+Go client and library.
 
-Everything else — aws-cli, the AWS SDKs, boto3, `mc` and `warp` — works over
-plain HTTP and HTTPS, uploads included. SigV4's streaming mode (`aws-chunked`),
-which minio-go uses for every plaintext upload and aws-cli for every HTTPS one,
-is decoded and verified chunk by chunk before anything is committed.
+**MinIO's clients — `mc`, `warp` and minio-go — are not supported.** Jay does
+not test against them. The full explanation is in
+[S3 compatibility](/jay/reference/s3-compatibility/).

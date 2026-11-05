@@ -1,6 +1,6 @@
 ---
 title: The S3 API
-description: Using Jay with the AWS CLI, boto3, the AWS SDKs and minio-go clients.
+description: Using Jay with the AWS CLI, boto3 and the AWS SDKs.
 ---
 
 Jay's S3 API is an HTTP endpoint your existing tooling can point at. There is no
@@ -66,21 +66,16 @@ url = s3.generate_presigned_url(
 | Client | Status |
 |---|---|
 | AWS CLI (`aws s3`, `aws s3api`), AWS SDKs, boto3 | Fully working over HTTP and HTTPS, up and down, single-part and multipart, with or without `--checksum-algorithm` |
-| minio-go — `mc`, `warp` — over HTTP or HTTPS | Fully working, uploads included |
 | Presigned URLs, both styles | Working |
+| MinIO clients (`mc`, `warp`, minio-go) | Not supported |
 
-Several of these do not send the body as-is. minio-go signs every plain-HTTP
-upload with SigV4's *streaming* mode, which wraps the body in `aws-chunked`
-framing with a signature per chunk; the AWS CLI does the same over HTTPS, with
-unsigned chunks and a trailing CRC64NVME checksum. Jay decodes the framing and
-verifies every chunk signature and every trailing checksum before it commits
-the object, so a tampered or truncated upload is refused and writes nothing.
+The AWS CLI over HTTPS frames uploads with unsigned chunks and a trailing
+CRC64NVME checksum in `aws-chunked` framing. Jay decodes the framing and
+verifies every trailing checksum before it commits the object, so a tampered
+or truncated upload is refused and writes nothing.
 
-One combination still fails: `mc cp --checksum` of a file large enough to go
-multipart. The parts are accepted, but `mc` then asks Jay to verify a
-whole-object checksum on `CompleteMultipartUpload`, which Jay does not
-implement, and the upload is aborted. The details, and what answers `501`, are
-in [S3 compatibility](/jay/reference/s3-compatibility/#aws-chunked-streaming-uploads).
+The details, and what answers `501`, are in
+[S3 compatibility](/jay/reference/s3-compatibility/#aws-chunked-streaming-uploads).
 
 ## Checksums are verified, not decorated
 
